@@ -17,6 +17,41 @@ The [documentation index](README.md) separates current contracts from historical
 records. [Reliability testing](RELIABILITY_TESTING.md) defines environments and
 evidence requirements; [Release process](RELEASE.md) defines publication.
 
+## Source changes prepared for v0.3.1
+
+Since the v0.3.0 tag, source adds [DIRECT/REJECT/PROXY rules and Ads](ROUTING.md),
+migrates legacy bypass targets, and applies Allow local network across outputs.
+The [H3 startup and PMTU fixes](h3-client-reliability.md#pmtu-and-fragmentation)
+retain ordinary traffic during discovery and oversized-probe rejection.
+These are source behaviors, not measured throughput or external leak results.
+
+[WARP DNS](WARP_DNS.md) and [Direct DNS](encrypted-direct-dns.md) now use complete
+DoH URL fields and editable Cloudflare defaults for new encrypted drafts.
+Local proxy DNS controls have been removed while saved settings remain active
+internally; HTTP/SOCKS5 chain DNS choices remain in Add proxy. Settings are
+organized by topic and VPN Gate uses only the shared chain-proxy editor.
+Android tile recovery and hidden-UI observation have changed; adaptive icons use
+an opaque brand-orange background. [GUI development](../apps/usque_gui/README.md)
+describes the current components and layout.
+
+The current source retains v0.3.0's WARP encrypted DNS, confirmed experimental
+Zero Trust endpoint editing, native Windows setup/removal, tray controls,
+desktop shortcuts and established Android protection-failure recovery. They
+are not newly introduced v0.3.1 features. TLS, endpoint pins and distinct WARP,
+direct and final-chain DNS policies remain in force.
+
+Configuration schema advances from v0.3.0's 23 to 24: legacy domains and CIDRs
+migrate to DIRECT and countries are retained. Custom CIDRs now route inside the
+application data plane. Recovery journal 5, Agent protocol 3 and sanitized
+recovery export 2 remain unchanged. A v0.3.0 or older engine rejects schema 24;
+see [upgrade compatibility](INSTALLATION.md#configuration-compatibility-when-upgrading).
+
+v0.3.1 is the preparation target. Executable version metadata and the tag
+workflow now target v0.3.1 / 0.3.1+25; this does not establish publication.
+Use [release preparation](RELEASE.md#preparing-v031) and the
+[v0.3.1 readiness review](RELEASE_V0.3.1_READINESS.md) for open requirements;
+this checklist is not candidate-bound execution evidence.
+
 ## Architecture
 
 ### Network-quality implementation
@@ -75,7 +110,7 @@ Desktop UI and engine remain unprivileged. The desktop agent accepts only versio
 - [x] Model strict endpoint-pin requirements and structured failures.
 - [x] Implement IP.SB dual-stack and geo-location probing interfaces.
 - [x] Add log redaction for secret fields and values.
-- [x] Implement Consumer WARP and WARP License Key registration; retain Secret parsing for stored identities with zeroized temporary buffers. New Secret import is removed from the UI and rejected by the provisioning API.
+- [x] Implement Consumer WARP® and WARP License Key registration; retain Secret parsing for stored identities with zeroized temporary buffers. New Secret import is removed from the UI and rejected by the provisioning API.
 - [x] Add experimental Zero Trust Access callback exchange, secure provider metadata plus a non-secret profile binding, registered endpoint discovery, and rollback-safe profile commits.
 - [x] Port the Abobo7 P-256 Endpoint Pin semantics and authenticated one-shot refresh.
 - [x] Implement bounded RFC 9484 ADDRESS_ASSIGN, ADDRESS_REQUEST, and ROUTE_ADVERTISEMENT codecs.
@@ -167,10 +202,10 @@ Desktop UI and engine remain unprivileged. The desktop agent accepts only versio
 
 - [x] Responsive Home, Accounts, Proxy, Settings, Advanced, and Diagnostics/About pages.
 - [x] Four-step permissions, terms, and Consumer WARP or experimental Zero Trust identity onboarding.
-- [x] White/orange visual system, dark mode, and Lucide-only interface icons.
+- [x] White/orange visual system, dark mode, Lucide controls and bundled protocol, flag and brand assets.
 - [x] Exact default endpoints, SNI, MTU, DNS, listener addresses, and reset action.
 - [x] Composable VPN/SOCKS5/HTTP outputs, Windows system-proxy dependency, and non-loopback listener warning.
-- [x] Remote/custom/system Proxy DNS selection with dedicated IPv4/IPv6 servers and an explicit local-DNS leak warning.
+- [x] Proxy DNS through the current exit by default. The Proxy page DNS selector was removed; saved custom/system/proxy-server modes remain supported, with the local-DNS leak warning.
 - [x] Exit location, IPv4, IPv6, protocol, family, duration, and traffic UI.
 - [x] Twenty-one string catalogs, including English and three Chinese regional catalogs.
 - [x] Adaptive desktop/mobile navigation and focusable Material controls.
@@ -178,16 +213,17 @@ Desktop UI and engine remain unprivileged. The desktop agent accepts only versio
 - [x] Make versioned Rust configuration the authoritative Profile store on Windows and Android, then remove the migrated Flutter draft.
 - [x] Connect desktop and Android identity provisioning to their platform vaults.
 - [x] Add Windows manual Zero Trust callback entry and an Android process-local, same-team, single-consumption protocol callback.
-- [x] Add Windows clipboard fill, live Access-callback validation, optional current-user HKCU protocol association, and single-instance URI forwarding.
+- [x] Add Windows clipboard fill, live Access-callback validation, login-scoped current-user HKCU protocol association with automatic restoration, and single-instance URI forwarding.
+- [x] Add a Windows tray status badge, tray TUN/system-proxy items, background connection notifications, restored window placement and desktop keyboard shortcuts.
 - [x] Keep identity plaintext hidden while supporting explicit, confirmed Secret export to a user-selected destination.
 - [x] Add shared network-output toggles across accounts, runtime-aware frontend status chips, shared-session totals, WARP License Key management, and platform quick actions.
 - [x] Validate and explicitly apply proxy drafts, report local save outcomes, guard unapplied advanced edits, and keep apply actions visible while scrolling.
 - [x] Apply online output changes through a rollback-capable desktop reconnect or one controlled Android reconnect.
-- [x] Keep the MASQUE session across SOCKS/HTTP listener changes, Windows system-proxy lease changes, and VPN attach/detach when GEO routing is disabled; reconnect when a mode-dependent GEO gateway must be rebuilt; advertise `hot_reconfigure`.
+- [x] Keep the MASQUE session across supported SOCKS/HTTP listener and Windows system-proxy lease changes; classify VPN attach/detach with the [core reconfiguration rules](../crates/usque-core/src/reconfigure.rs). Reconnect for mode-dependent routing, DNS or protection changes; advertise `hot_reconfigure`.
 - [x] Surface real Kill Switch / Always-on / Lockdown state on Home and wire Retry to the existing control retry path.
 - [x] Honor profile `auto_connect` once at process start (and Android boot when start-on-boot is also on).
-- [x] Replace controlled reconnects with true no-drop frontend hot mutation while retaining the same MASQUE channel.
-- [x] Fetch fixed-version `flag-icons` SVG through the active tunnel, validate it, cache it, and return SVG bytes to Flutter.
+- [x] Apply supported frontend changes while retaining the same MASQUE channel. Replaced SOCKS/HTTP listeners close their existing client flows; retaining the underlay does not guarantee uninterrupted application traffic.
+- [x] Render bundled Flagpedia PNG flags by country code in Home, VPN Gate and Geo direct settings. Exit probes fetch only IP and location data; legacy flag wire fields remain compatible. See [country flag resources](COUNTRY_FLAGS.md).
 - [x] Add diagnostics content review plus Windows and Android native save pickers; exported bundles contain bounded sanitized summaries and logs.
 - [x] Add manual and rate-limited automatic GitHub release checks without automatic installation.
 - [x] Add the direct-country rule download/update/search panel, cached-state gating, partial-result feedback, and accessible enable controls.
@@ -213,11 +249,17 @@ and attestations for the exact candidate. A local binary cannot replace a
 failed GitHub Actions artifact.
 
 Protected Windows, Android, network-observer, and performance runs are opt-in
-supplemental validation, not publication prerequisites. Missing infrastructure
-or a `failed`/`not_run` result never becomes a pass and does not block
-publication. Any report presented as evidence must still pass exact-candidate,
-isolation, integrity, and completeness checks; forged or mismatched evidence
-is rejected. Broader per-artifact clean-machine coverage and numeric
-Go-oracle comparison targets remain outstanding.
+supplemental validation, not publication prerequisites. They run only in a
+private repository with `RUN_PROTECTED_RELEASE_VALIDATION` set to `true`; the
+public repository always skips them, and a skipped run counts as `not_run`.
+Missing infrastructure or a `failed`/`not_run` result never becomes a pass and
+does not block publication. Any report presented as evidence must still pass
+exact-candidate, isolation, integrity, and completeness checks; forged or
+mismatched evidence is rejected. Broader per-artifact clean-machine coverage
+and numeric Go-oracle comparison targets remain outstanding.
 
 How the current stable tag is built and published is in [RELEASE.md](RELEASE.md).
+
+---
+
+WARP is a trademark and/or registered trademark of Cloudflare, Inc. in the United States and other jurisdictions.

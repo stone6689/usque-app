@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 
@@ -9,6 +10,7 @@ import 'screens/shell_screen.dart';
 import 'services/engine_client.dart';
 import 'services/engine_client_factory.dart';
 import 'services/platform_shell_bridge.dart';
+import 'services/update_downloader.dart';
 import 'state/app_controller.dart';
 import 'state/window_frame.dart';
 import 'widgets/controller_selector.dart';
@@ -24,28 +26,60 @@ typedef _BootstrapView = ({
 });
 
 class UsqueBootstrap extends StatefulWidget {
-  const UsqueBootstrap({super.key, this.engine});
+  const UsqueBootstrap({
+    super.key,
+    this.engine,
+    this.updateDownloader,
+    this.builder,
+  });
 
   final EngineClient? engine;
+  final UpdateDownloader? updateDownloader;
+  final TransitionBuilder? builder;
 
   @override
   State<UsqueBootstrap> createState() => _UsqueBootstrapState();
 }
 
-class _UsqueBootstrapState extends State<UsqueBootstrap> {
+class _UsqueBootstrapState extends State<UsqueBootstrap>
+    with WidgetsBindingObserver {
   late final AppController controller;
   late final PlatformShellBridge shellBridge;
 
   @override
   void initState() {
     super.initState();
-    controller = AppController(widget.engine ?? createDefaultEngineClient());
+    controller = AppController(
+      widget.engine ?? createDefaultEngineClient(),
+      updateDownloader: widget.updateDownloader,
+    );
+    WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    if (lifecycle != null) didChangeAppLifecycleState(lifecycle);
     shellBridge = PlatformShellBridge(controller);
     controller.initialize();
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Desktop tray sessions keep observing while their window is hidden.
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    switch (state) {
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        controller.setObservationVisible(false);
+      case AppLifecycleState.resumed:
+        controller.setObservationVisible(true);
+      case AppLifecycleState.inactive:
+        // Focus loss (including permission dialogs) can leave the UI visible.
+        break;
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     shellBridge.dispose();
     controller.dispose();
     super.dispose();
@@ -133,11 +167,16 @@ class _UsqueBootstrapState extends State<UsqueBootstrap> {
             GlobalWidgetsLocalizations.delegate,
             GlobalCupertinoLocalizations.delegate,
           ],
-          builder: WindowFrame.instance.enabled
-              ? (context, child) => _WindowChrome(
-                  controller: controller,
-                  child: child ?? const SizedBox.shrink(),
-                )
+          builder: WindowFrame.instance.enabled || widget.builder != null
+              ? (context, child) {
+                  final content = WindowFrame.instance.enabled
+                      ? _WindowChrome(
+                          controller: controller,
+                          child: child ?? const SizedBox.shrink(),
+                        )
+                      : child ?? const SizedBox.shrink();
+                  return widget.builder?.call(context, content) ?? content;
+                }
               : null,
           home: !view.initialized
               ? const _LoadingScreen()

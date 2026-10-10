@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:usque/core/connection_presentation.dart';
 import 'package:usque/core/usque_theme.dart';
 import 'package:usque/models/app_models.dart';
@@ -364,6 +365,175 @@ void main() {
     });
   });
 
+  group('ContentHeading', () {
+    testWidgets('a trailing status leaves the heading the rest of the row', (
+      tester,
+    ) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(880, 400);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+      const subtitle =
+          'Block traffic while connecting or reconnecting, or if the '
+          'connection service fails.';
+      await tester.pumpWidget(
+        _host(
+          const Align(
+            alignment: Alignment.topLeft,
+            child: ContentHeading(
+              title: 'Kill Switch',
+              subtitle: subtitle,
+              trailing: InlineStatus(label: 'On', tone: StatusTone.success),
+            ),
+          ),
+        ),
+      );
+      // A flexible trailing slot used to take half the row and wrap this
+      // line long before the status needed the space.
+      expect(tester.getSize(find.text(subtitle)).width, greaterThan(600));
+      expect(tester.getTopRight(find.text('On')).dx, closeTo(880, 1));
+    });
+  });
+
+  group('FieldDropdown', () {
+    for (final scale in [1.0, 1.3, 2.0]) {
+      testWidgets('matches a text field height at ${scale}x', (tester) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: UsqueTheme.light(),
+            builder: (context, child) => MediaQuery(
+              data: MediaQuery.of(
+                context,
+              ).copyWith(textScaler: TextScaler.linear(scale)),
+              child: child!,
+            ),
+            home: Scaffold(
+              body: Builder(
+                builder: (context) => Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: DropdownButtonFormField<int>(
+                        key: const ValueKey('picker'),
+                        initialValue: 1,
+                        isExpanded: true,
+                        style: FieldDropdown.valueStyle(context),
+                        iconSize: FieldDropdown.iconSize,
+                        decoration: FieldDropdown.decoration(
+                          context,
+                          labelText: 'Picker',
+                        ),
+                        items: const [
+                          DropdownMenuItem(value: 1, child: Text('One')),
+                        ],
+                        onChanged: (_) {},
+                      ),
+                    ),
+                    const Expanded(
+                      child: TextField(
+                        key: ValueKey('field'),
+                        decoration: InputDecoration(labelText: 'Field'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.enterText(find.byKey(const ValueKey('field')), '1280');
+        await tester.pump();
+        expect(
+          tester.getSize(find.byKey(const ValueKey('picker'))).height,
+          closeTo(
+            tester.getSize(find.byKey(const ValueKey('field'))).height,
+            0.5,
+          ),
+        );
+      });
+    }
+  });
+
+  group('LinkRow', () {
+    Future<void> pumpRow(
+      WidgetTester tester,
+      double width, {
+      double scale = 1,
+      VoidCallback? onTap,
+    }) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = Size(width, 600);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: UsqueTheme.light(),
+          builder: (context, child) => MediaQuery(
+            data: MediaQuery.of(
+              context,
+            ).copyWith(textScaler: TextScaler.linear(scale)),
+            child: child!,
+          ),
+          home: Scaffold(
+            body: Align(
+              alignment: Alignment.topLeft,
+              child: LinkRow(
+                icon: Icons.shield,
+                title: 'Kill Switch',
+                subtitle: 'Blocks traffic while connecting.',
+                value: 'On',
+                valueKey: const ValueKey('value'),
+                onTap: onTap ?? () {},
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    for (final (width, scale, stacked) in [
+      (880.0, 1.0, false),
+      (343.0, 1.0, true),
+      (343.0, 2.0, true),
+    ]) {
+      testWidgets('keeps the chevron trailing: $width@${scale}x', (
+        tester,
+      ) async {
+        await pumpRow(tester, width, scale: scale);
+        final row = tester.getRect(find.byType(LinkRow));
+        final chevron = tester.getRect(
+          find.byIcon(LucideIcons.chevronRightDir),
+        );
+        final title = tester.getRect(find.text('Kill Switch'));
+        final value = tester.getRect(find.byKey(const ValueKey('value')));
+        expect(chevron.right, closeTo(row.right - 8, 1));
+        // The chevron stays beside the text block, never on a line below it.
+        expect(chevron.top, lessThan(value.bottom));
+        expect(chevron.left, greaterThan(title.right));
+        if (stacked) {
+          expect(value.left, title.left);
+          expect(value.top, greaterThan(title.bottom));
+        } else {
+          expect(value.right, lessThan(chevron.left));
+          expect(value.left, greaterThan(title.right));
+        }
+        expect(tester.takeException(), isNull);
+      });
+    }
+
+    testWidgets('activates from the keyboard like an action row', (
+      tester,
+    ) async {
+      var taps = 0;
+      await pumpRow(tester, 880, onTap: () => taps++);
+      await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pump();
+      expect(taps, 1);
+    });
+  });
+
   group('Panel', () {
     testWidgets('interactive panels support material and keyboard activation', (
       tester,
@@ -493,5 +663,59 @@ void main() {
         }
       });
     }
+  });
+
+  group('Data colours and machine text', () {
+    for (final dark in <bool>[false, true]) {
+      testWidgets('upload trace stays apart from the accent: dark=$dark', (
+        tester,
+      ) async {
+        late UsqueTokens tokens;
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: dark ? UsqueTheme.dark() : UsqueTheme.light(),
+            home: Builder(
+              builder: (context) {
+                tokens = UsqueTokens.of(context);
+                return const SizedBox.shrink();
+              },
+            ),
+          ),
+        );
+        double hue(Color color) => HSVColor.fromColor(color).hue;
+        double distance(double a, double b) {
+          final double raw = (a - b).abs();
+          return raw > 180 ? 360 - raw : raw;
+        }
+
+        // Orange marks what can be pressed; traffic must not read as action.
+        expect(
+          distance(hue(tokens.outbound), hue(tokens.brand)),
+          greaterThan(90),
+        );
+        expect(
+          distance(hue(tokens.outbound), hue(tokens.inbound)),
+          greaterThan(60),
+        );
+        expect(
+          _contrastRatio(tokens.outbound, tokens.canvas),
+          greaterThan(4.5),
+        );
+      });
+    }
+
+    testWidgets('addresses use the body face with tabular figures', (
+      tester,
+    ) async {
+      await tester.pumpWidget(_host(const MonoValue(value: '127.0.0.1:8080')));
+      final SelectableText text = tester.widget<SelectableText>(
+        find.descendant(
+          of: find.byType(MonoValue),
+          matching: find.byType(SelectableText),
+        ),
+      );
+      expect(text.style?.fontFamily, UsqueFonts.body);
+      expect(text.style?.fontFeatures, UsqueTheme.tabularFigures);
+    });
   });
 }

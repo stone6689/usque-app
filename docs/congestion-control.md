@@ -4,7 +4,7 @@ Advanced settings exposes the device-wide `cubic`, `reno`, `bbr` and `bbr3`
 selection. CUBIC remains the default. `bbr` uses quiche's existing BBRv2;
 `bbr3` is an independent, experimental BBRv3 implementation. This is a sender
 setting for the client's HTTP/3 MASQUE connection, not a request to change
-Cloudflare's sender, system TCP, proxy listeners, or application TCP stacks.
+Cloudflare, Inc.'s sender, system TCP, proxy listeners, or application TCP stacks.
 HTTP/2 remains controlled by the operating system.
 
 The selector sits below SNI. Its display order is `cubic`, `BBRv2`, `BBRv3`,
@@ -21,6 +21,13 @@ its confirmed recovery profile. The current session retains its captured value t
 reconnection, QUIC migration, H3/H2 switching, hot frontend updates and internal
 reconnections caused by other settings. Merely reopening the GUI is not a new
 engine session. An active H2 connection reports that H3 control is not applied.
+
+The selector is disabled while a save is in progress, when the Engine advertises
+no H3 algorithms (hint: "Update Usque in Settings to use this option."), and
+when the draft uses CONNECT-IP with the HTTP/2 transport (hint: "This option
+only affects HTTP/3 connections."). The HTTP/2 hint also appears, with the
+selector still enabled, when the live connection uses HTTP/2. Algorithms that
+the Engine does not advertise stay listed but cannot be chosen.
 
 The selector shows the saved preference or unsaved draft, not a claim about the
 live connection. A mismatch with the internal session snapshot is pending until
@@ -91,3 +98,7 @@ The change adds no privileged networking operation, system-proxy mutation,
 TLS bypass, credential field, diagnostic upload or telemetry. Existing cleanup,
 generation ownership, certificate pinning, queue limits and fallback safety
 rules remain in force. No installers or release APKs are installed for testing.
+
+---
+
+Cloudflare is a trademark and/or registered trademark of Cloudflare, Inc. in the United States and other jurisdictions.

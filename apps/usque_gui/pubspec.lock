@@ -168,11 +168,10 @@ packages:
   lucide_icons_flutter:
     dependency: "direct main"
     description:
-      name: lucide_icons_flutter
-      sha256: "234155b10641b8ef7bab8a077b93ea6c92fe849c06740cf89dcd86dcf350934f"
-      url: "https://pub.dev"
-    source: hosted
-    version: "3.1.15"
+      path: "../../third_party/lucide_icons_flutter-3.1.19"
+      relative: true
+    source: path
+    version: "3.1.19"
   matcher:
     dependency: transitive
     description:
@@ -294,7 +293,7 @@ packages:
     source: hosted
     version: "2.4.1"
   shared_preferences_platform_interface:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: shared_preferences_platform_interface
       sha256: "649dc798a33931919ea356c4305c2d1f81619ea6e92244070b520187b5140ef9"
@@ -446,10 +445,10 @@ packages:
     dependency: transitive
     description:
       name: vector_graphics
-      sha256: "2306c03da2ba81724afeb589c351ebbc0aa7d86005925be8f8735856dbe5e42d"
+      sha256: "9d0e3b9cb16542ad660daee871e726a10d13a93b7b5391677c3160e8f5e83935"
       url: "https://pub.dev"
     source: hosted
-    version: "1.2.2"
+    version: "1.2.3"
   vector_graphics_codec:
     dependency: transitive
     description:

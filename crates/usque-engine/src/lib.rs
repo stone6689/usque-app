@@ -28,8 +28,9 @@ use usque_core::{
     KillSwitchState, LockdownState, ManagedEndpointIps, MasqueKeyPair, OperatingMode,
     PendingIdentityReplacement, Profile, ProxyAuthCredentials, ProxyDnsMode, ProxySettings,
     RegistrationError, RegistrationOptions, SHARED_NETWORK_SECRET_ID, SharedNetworkSettings,
-    StateMachine, Statistics, Transport, TransportFailure, TransportPolicy, WarpIdentity,
-    download_geo_rules, list_geo_rules, normalize_zero_trust_team,
+    StateMachine, Statistics, Transport, TransportFailure, TransportPolicy,
+    WarpDnsMode as ConfigWarpDnsMode, WarpDnsSettings, WarpIdentity, download_geo_rules,
+    list_geo_rules, normalize_zero_trust_team,
     storage::{ConfigStore, StoreError},
     update_all_geo_rules, validate_proxy_password, validate_proxy_username,
 };
@@ -46,6 +47,10 @@ use usque_transport::{
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+#[cfg(all(test, windows))]
+mod chain_dns_live_tests;
+mod chain_exit;
+mod connection_evidence;
 pub mod diagnostics;
 #[cfg(any(windows, test))]
 mod event_stream;
@@ -55,18 +60,29 @@ pub mod logging;
 mod maintenance;
 mod network_quality;
 mod network_settings;
+mod protected_chain;
+#[cfg(test)]
+mod protected_chain_tests;
+mod routing;
 mod sensitive_output;
+mod vpngate;
+#[cfg(test)]
+mod vpngate_connection_tests;
+mod warp_wireguard;
 
 mod active_runtime;
+mod initial_identity;
 mod reconfigure;
 
 use active_runtime::{ActiveDataPlane, ActiveProxyRuntime, ActiveRuntime};
 
+mod recovery_diagnostics;
 #[cfg(windows)]
 mod windows_agent;
 
 mod congestion;
 mod data_plane;
+mod disconnect_cleanup;
 
 #[cfg(target_os = "macos")]
 pub mod macos_ipc;
@@ -99,11 +115,22 @@ pub struct ControlServiceState {
     vault: Arc<dyn SecretVault>,
     pub(crate) data_plane: Arc<Mutex<Option<ActiveDataPlane>>>,
     disconnect_cleanup: Mutex<Option<tokio::task::JoinHandle<Result<(), ControlServiceError>>>>,
+    disconnect_owners: Arc<Mutex<std::collections::VecDeque<disconnect_cleanup::ShutdownOwner>>>,
+    disconnect_cleanup_failed: std::sync::atomic::AtomicBool,
     exit_probe_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     maintenance: maintenance::Maintenance,
     diagnostics: diagnostics::DiagnosticsManager,
+    retained_connection_evidence: Arc<Mutex<Option<connection_evidence::ConnectionEvidence>>>,
+    diagnostics_lifecycle: Mutex<()>,
     cache_dir: PathBuf,
     geo_progress_tx: tokio::sync::broadcast::Sender<v1::GeoRulesProgress>,
+    gate_directory: usque_core::vpngate::DirectoryDownloader,
+    gate_fetch_task: Mutex<Option<vpngate::FetchTask>>,
+    #[cfg(all(windows, feature = "wireguard"))]
+    warp_generator: Arc<usque_transport::warp_wireguard::Manager>,
+    gate_status: watch::Sender<usque_core::vpngate::GateStatus>,
+    gate_supervisor: Mutex<Option<AbortOnDropHandle<()>>>,
+    gate_startup_cancel: Mutex<tokio_util::sync::CancellationToken>,
     network_quality_tx: watch::Sender<usque_transport::NetworkQualitySnapshot>,
     network_quality_relay: Mutex<Option<AbortOnDropHandle<()>>>,
     session_generation: AtomicU64,
@@ -115,12 +142,17 @@ pub struct ControlServiceState {
     settings_intent: AtomicU64,
     settings_submission: Mutex<()>,
     settings_applying: std::sync::atomic::AtomicBool,
+    system_proxy_applications: Mutex<network_settings::SystemProxyApplications>,
     #[cfg(windows)]
     windows_recovery: Mutex<WindowsRecoveryRuntime>,
+    #[cfg(windows)]
+    windows_device: windows_agent::WindowsDeviceOwner,
     #[cfg(windows)]
     windows_recovery_notify: tokio::sync::Notify,
     #[cfg(windows)]
     windows_recovery_stopping: std::sync::atomic::AtomicBool,
+    #[cfg(all(test, windows))]
+    test_windows_agent: Mutex<Option<windows_agent::WindowsAgentClient>>,
     #[cfg(any(windows, test))]
     event_sequence: AtomicU64,
     #[cfg(test)]
@@ -393,6 +425,14 @@ impl ControlService {
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
+        let retained: Vec<_> = config
+            .network
+            .vpn_gate
+            .selection
+            .clone()
+            .into_iter()
+            .collect();
+        let _ = usque_core::vpngate::CatalogueStore::new(&cache_dir).recover_references(&retained);
         let (geo_progress_tx, _) = tokio::sync::broadcast::channel(16);
         let (network_quality_tx, _) = watch::channel(network_quality::disconnected_snapshot());
         let (settings_tx, _) = watch::channel(0);
@@ -400,6 +440,13 @@ impl ControlService {
             inner: Arc::new(ControlServiceState {
                 maintenance: maintenance::Maintenance::new(store.path()),
                 diagnostics: diagnostics::DiagnosticsManager::new(),
+                retained_connection_evidence: Arc::new(Mutex::new(None)),
+                diagnostics_lifecycle: Mutex::new(()),
+                #[cfg(all(windows, feature = "wireguard"))]
+                warp_generator: Arc::new(usque_transport::warp_wireguard::Manager::new(
+                    store.path().to_path_buf(),
+                    Arc::new(usque_core::chain_exit::store::WindowsProfileCipher),
+                )),
                 store,
                 config: RwLock::new(config),
                 state: Arc::new(Mutex::new(StateMachine::default())),
@@ -407,7 +454,16 @@ impl ControlService {
                 vault,
                 data_plane: Arc::new(Mutex::new(None)),
                 disconnect_cleanup: Mutex::new(None),
+                disconnect_owners: Arc::default(),
+                disconnect_cleanup_failed: std::sync::atomic::AtomicBool::new(false),
                 exit_probe_task: Mutex::new(None),
+                gate_directory: usque_core::vpngate::DirectoryDownloader::new(
+                    usque_core::vpngate::CatalogueStore::new(&cache_dir),
+                ),
+                gate_fetch_task: Mutex::new(None),
+                gate_status: watch::channel(Default::default()).0,
+                gate_supervisor: Mutex::new(None),
+                gate_startup_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
                 cache_dir,
                 geo_progress_tx,
                 network_quality_tx,
@@ -420,12 +476,17 @@ impl ControlService {
                 settings_intent: AtomicU64::new(0),
                 settings_submission: Mutex::new(()),
                 settings_applying: std::sync::atomic::AtomicBool::new(false),
+                system_proxy_applications: Mutex::new(Default::default()),
                 #[cfg(windows)]
                 windows_recovery: Mutex::new(WindowsRecoveryRuntime::default()),
+                #[cfg(windows)]
+                windows_device: windows_agent::WindowsDeviceOwner::default(),
                 #[cfg(windows)]
                 windows_recovery_notify: tokio::sync::Notify::new(),
                 #[cfg(windows)]
                 windows_recovery_stopping: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(all(test, windows))]
+                test_windows_agent: Mutex::new(None),
                 #[cfg(any(windows, test))]
                 event_sequence: AtomicU64::new(0),
                 #[cfg(test)]
@@ -496,6 +557,11 @@ impl ControlService {
     ) -> v1::ConnectionSnapshot {
         let mut proto = snapshot_to_proto(snapshot);
         proto.network_quality = self.network_quality_payload().map(Box::new);
+        let chain_status = self.gate_status.borrow();
+        proto.vpn_gate = Some(vpngate::status_to_proto(&chain_status, None));
+        proto.chain_exit = Some(v1::ChainExitStatus {
+            metadata_json: serde_json::to_string(&*chain_status).unwrap_or_default(),
+        });
         proto
     }
 
@@ -522,21 +588,34 @@ impl ControlService {
             Some(value) => value.is_empty(),
         };
         if missing_shared {
+            let mut candidate: Option<Zeroizing<Vec<u8>>> = None;
             for profile_id in &account_ids {
-                let password = self
+                if let Some(password) = self
                     .vault
                     .get(*profile_id, SecretRecord::ProxyPassword)
-                    .await?;
-                if let Some(password) = password.filter(|value| !value.is_empty()) {
-                    self.vault
-                        .put(
-                            SHARED_NETWORK_SECRET_ID,
-                            SecretRecord::ProxyPassword,
-                            &password,
-                        )
-                        .await?;
-                    break;
+                    .await?
+                    .filter(|value| !value.is_empty())
+                {
+                    if candidate
+                        .as_ref()
+                        .is_some_and(|saved| saved.as_slice() != password.as_slice())
+                    {
+                        return Err(ControlServiceError::InvalidProxyAuth(
+                            "conflicting legacy proxy passwords; save a new shared credential"
+                                .into(),
+                        ));
+                    }
+                    candidate = Some(password);
                 }
+            }
+            if let Some(password) = candidate {
+                self.vault
+                    .put(
+                        SHARED_NETWORK_SECRET_ID,
+                        SecretRecord::ProxyPassword,
+                        &password,
+                    )
+                    .await?;
             }
         }
         let mut first_error = None;
@@ -585,10 +664,8 @@ impl ControlService {
             state.update_runtime_metadata(reconnect_count, Vec::new(), Vec::new());
             state.update_session_congestion_control(Some(applied.congestion_control));
         }
-        let runtime = ActiveRuntime::Harness(active_runtime::HarnessRuntime::from_profile(
-            &applied,
-            vpn,
-            reconnect_count,
+        let runtime = ActiveRuntime::Harness(Box::new(
+            active_runtime::HarnessRuntime::from_profile(&applied, vpn, reconnect_count),
         ));
         let quality_source = runtime.subscribe_network_quality();
         let frontends = applied.frontends;
@@ -646,18 +723,36 @@ impl ControlService {
     /// Stops forwarding immediately, then waits for privileged platform state
     /// to be restored before the Engine process is allowed to exit.
     pub async fn shutdown(&self) -> Result<(), ControlServiceError> {
+        self.gate_startup_cancel.lock().await.cancel();
+        self.cancel_warp_jobs().await?;
+        self.cancel_gate_refresh().await;
         self.settings_intent.fetch_add(1, Ordering::SeqCst);
         #[cfg(windows)]
         self.clear_windows_connection_intent().await;
         let _mutation = self.mutation_lock.lock().await;
-        self.disconnect_locked().await?;
-        self.await_disconnect_cleanup().await
+        let retry_cleanup = self.data_plane.lock().await.is_none();
+        let disconnect = self.disconnect_locked().await;
+        if retry_cleanup {
+            self.retry_disconnect_cleanup().await;
+        }
+        let cleanup = self.await_disconnect_cleanup().await;
+        #[cfg(windows)]
+        let release = self
+            .windows_device
+            .shutdown()
+            .await
+            .map_err(map_windows_vpn_error);
+        let result = disconnect.and(cleanup);
+        #[cfg(windows)]
+        let result = result.and(release);
+        result
     }
 
     /// Retries secure-record deletion left pending by a previous crash or
     /// platform-vault failure. Non-secret profile deletion is committed first,
     /// so a removed profile can never be resurrected by this cleanup step.
     pub async fn reap_pending_identity_deletions(&self) -> Result<(), ControlServiceError> {
+        let _identity_lease = self.identity_execution_lease().await?;
         let _mutation = self.mutation_lock.lock().await;
         self.recover_pending_identity_replacements_locked().await?;
         self.reap_pending_identity_deletions_locked().await
@@ -668,7 +763,8 @@ impl ControlService {
     pub async fn handle(&self, request: ControlRequest) -> ControlResponse {
         let request_id = request.request_id;
         let result = match request.payload {
-            Some(payload) => self.handle_payload(payload).await,
+            // Keep the growing protocol dispatch future off the caller's stack.
+            Some(payload) => Box::pin(self.handle_payload(payload)).await,
             None => Err(ControlServiceError::InvalidRequest(
                 "control request payload is missing".to_owned(),
             )),
@@ -680,15 +776,11 @@ impl ControlService {
                 error: None,
                 payload: Some(payload),
             },
-            Err(error) => {
-                #[cfg(windows)]
-                windows_agent::log_recovery_error(&error);
-                ControlResponse {
-                    request_id,
-                    error: Some(error.as_structured_error()),
-                    payload: None,
-                }
-            }
+            Err(error) => ControlResponse {
+                request_id,
+                error: Some(error.as_structured_error()),
+                payload: None,
+            },
         }
     }
 
@@ -696,7 +788,47 @@ impl ControlService {
         &self,
         payload: control_request::Payload,
     ) -> Result<control_response::Payload, ControlServiceError> {
+        if matches!(
+            &payload,
+            control_request::Payload::Connect(_)
+                | control_request::Payload::Disconnect(_)
+                | control_request::Payload::Retry(_)
+                | control_request::Payload::SetActiveProfile(_)
+                | control_request::Payload::DeleteProfile(_)
+                | control_request::Payload::ResetProfile(_)
+                | control_request::Payload::ClearAllData(_)
+                | control_request::Payload::SaveNetworkSettings(_)
+                | control_request::Payload::ReconfigureActiveProfile(_)
+                | control_request::Payload::ProvisionIdentity(_)
+                | control_request::Payload::UpsertProfile(_)
+                | control_request::Payload::CreateProfileWithIdentity(_)
+        ) {
+            self.cancel_warp_jobs().await?;
+            self.cancel_gate_refresh().await;
+        }
         match payload {
+            control_request::Payload::WarpWireguard(request) => {
+                Ok(control_response::Payload::WarpWireguard(
+                    Box::pin(self.warp_wireguard_command(request)).await?,
+                ))
+            }
+            control_request::Payload::VpnGateNode(request) => {
+                self.vpn_gate_node(request).await?;
+                Ok(control_response::Payload::Empty(v1::Empty {}))
+            }
+            control_request::Payload::ListVpnGate(request) => {
+                Ok(control_response::Payload::VpnGateDirectory(Box::new(
+                    self.list_vpn_gate(request).await?,
+                )))
+            }
+            control_request::Payload::RefreshVpnGate(request) => {
+                if request.cancel {
+                    self.cancel_gate_refresh().await;
+                } else {
+                    self.refresh_vpn_gate().await?;
+                }
+                Ok(control_response::Payload::Empty(v1::Empty {}))
+            }
             control_request::Payload::SaveNetworkSettings(request) => {
                 let state = self.save_network_settings(*request).await?;
                 Ok(control_response::Payload::NetworkSettings(Box::new(state)))
@@ -718,6 +850,11 @@ impl ControlService {
             control_request::Payload::GetCapabilities(_) => Ok(
                 control_response::Payload::Capabilities(current_capabilities()),
             ),
+            control_request::Payload::ChainProfile(request) => {
+                Ok(control_response::Payload::ChainProfiles(
+                    self.chain_profile_command(*request).await?,
+                ))
+            }
             control_request::Payload::ImportLegacyProfiles(request) => {
                 self.import_legacy_profiles(request).await?;
                 Ok(control_response::Payload::ProfileList(
@@ -725,18 +862,30 @@ impl ControlService {
                 ))
             }
             control_request::Payload::UpsertProfile(request) => {
-                let profile = request
-                    .profile
-                    .ok_or_else(|| {
-                        ControlServiceError::InvalidRequest(
-                            "upsert profile payload is missing".to_owned(),
-                        )
-                    })
-                    .and_then(profile_from_proto)?;
-                let stored = self.upsert_profile(profile).await?;
+                let source = request.profile.ok_or_else(|| {
+                    ControlServiceError::InvalidRequest("upsert profile payload is missing".into())
+                })?;
+                let _mutation = self.mutation_lock.lock().await;
+                self.validate_client_routing(&source).await?;
+                let routing_present = source.routing.is_some();
+                let stored = self
+                    .upsert_client_profile_locked(profile_from_proto(source)?, routing_present)
+                    .await?;
                 Ok(control_response::Payload::Profile(Box::new(
                     profile_to_proto(&stored),
                 )))
+            }
+            control_request::Payload::RenameProfile(request) => {
+                let id = parse_profile_id(&request.profile_id)?;
+                let _mutation = self.mutation_lock.lock().await;
+                self.update_config(move |latest| {
+                    latest
+                        .rename_account(id, request.name)
+                        .map_err(ControlServiceError::configuration)?;
+                    Ok(())
+                })
+                .await?;
+                Ok(control_response::Payload::Empty(v1::Empty {}))
             }
             control_request::Payload::DeleteProfile(request) => {
                 let id = parse_profile_id(&request.profile_id)?;
@@ -772,6 +921,15 @@ impl ControlService {
                 self.provision_identity(request).await?;
                 Ok(control_response::Payload::Empty(v1::Empty {}))
             }
+            control_request::Payload::InitialIdentity(request) => {
+                let state = self.initial_identity(request).await?;
+                Ok(control_response::Payload::InitialIdentityState(state))
+            }
+            control_request::Payload::GetInitialIdentityState(request) => {
+                let profile_id = parse_profile_id(&request.profile_id)?;
+                let state = self.get_initial_identity_state(profile_id).await?;
+                Ok(control_response::Payload::InitialIdentityState(state))
+            }
             control_request::Payload::CreateProfileWithIdentity(request) => {
                 let profile = request
                     .profile
@@ -792,15 +950,20 @@ impl ControlService {
                 ))
             }
             control_request::Payload::ReconfigureActiveProfile(request) => {
-                let profile = request
-                    .profile
-                    .ok_or_else(|| {
-                        ControlServiceError::InvalidRequest(
-                            "reconfigure profile payload is missing".to_owned(),
-                        )
-                    })
-                    .and_then(profile_from_proto)?;
-                let result = self.reconfigure_active_profile(profile).await?;
+                let source = request.profile.ok_or_else(|| {
+                    ControlServiceError::InvalidRequest(
+                        "reconfigure profile payload is missing".into(),
+                    )
+                })?;
+                let routing_present = source.routing.is_some();
+                if !source.split_exclusions.is_empty() || !source.bypass_domains.is_empty() {
+                    return Err(ControlServiceError::configuration(
+                        ConfigError::RoutingUpgradeRequired,
+                    ));
+                }
+                let result = self
+                    .reconfigure_client_profile(profile_from_proto(source)?, routing_present)
+                    .await?;
                 Ok(control_response::Payload::Reconfigure(Box::new(result)))
             }
             control_request::Payload::CopyLicenseKey(request) => {
@@ -867,7 +1030,7 @@ impl ControlService {
                     ));
                 }
                 let config = self.config.read().await.clone();
-                let snapshot = self.status_snapshot().await;
+                let evidence = self.capture_connection_evidence().await;
                 let diagnostic_session = self.diagnostics.get().await;
                 if !request.diagnostic_session_id.trim().is_empty()
                     && diagnostic_session.as_ref().is_none_or(|session| {
@@ -878,22 +1041,39 @@ impl ControlService {
                         "the requested diagnostic session is unavailable".to_owned(),
                     ));
                 }
-                let timeline = self.connection_timeline_snapshot().await;
+                #[cfg(windows)]
+                let platform_state = Some(recovery_diagnostics::capture().await);
+                #[cfg(not(windows))]
+                let platform_state = None;
+                let stable = self.evidence_capture_is_current(&evidence).await;
+                let platform_state = platform_state.filter(|_| stable);
+                let current = self.state.lock().await.snapshot().clone();
+                let capture = evidence.capture_metadata(&current, stable, platform_state.is_some());
+                let socket_receive = evidence
+                    .quality
+                    .as_ref()
+                    .and_then(|quality| quality.socket_receive.clone());
                 self.maintenance
                     .export_diagnostics(
                         destination.into(),
                         config,
-                        snapshot,
+                        evidence.connection,
                         diagnostic_session,
                         maintenance::DiagnosticTransportContext {
-                            timeline,
-                            socket_receive: self.network_quality_snapshot().socket_receive,
+                            timeline: evidence.timeline,
+                            network_quality: evidence.quality,
+                            socket_receive,
+                            platform_state,
+                            capture: Some(capture),
                         },
                     )
                     .await?;
                 Ok(control_response::Payload::Empty(v1::Empty {}))
             }
             control_request::Payload::StartDiagnostics(request) => {
+                // Keep capture and publication on the same side of a data
+                // reset. This guard is separate from Deep's mutation lease.
+                let _diagnostics_lifecycle = self.diagnostics_lifecycle.lock().await;
                 let mode = match v1::DiagnosticMode::try_from(request.mode) {
                     Ok(v1::DiagnosticMode::Standard) => usque_core::DiagnosticMode::Standard,
                     Ok(v1::DiagnosticMode::Deep) => usque_core::DiagnosticMode::Deep,
@@ -934,9 +1114,40 @@ impl ControlService {
                 Ok(control_response::Payload::Diagnostics(session))
             }
             control_request::Payload::GetConnectionTimeline(_) => {
-                let timeline = self.connection_timeline_snapshot().await;
+                let captured = self.capture_connection_evidence().await;
+                let mut timeline = diagnostics::timeline_to_proto(&captured.timeline);
+                timeline.retained = captured.retained;
+                timeline.session_generation = captured.session_generation;
+                if captured.session_generation != 0 {
+                    timeline.observation = Some(v1::DiagnosticObservation {
+                        source: "runtime".into(),
+                        availability: "observed".into(),
+                        age_milliseconds: captured
+                            .captured_at
+                            .elapsed()
+                            .unwrap_or_default()
+                            .as_millis()
+                            .min(u128::from(u64::MAX))
+                            as u64,
+                        connection_instance_id: captured
+                            .quality
+                            .as_ref()
+                            .and_then(|quality| quality.connection_id)
+                            .map(|id| id.0.to_string())
+                            .unwrap_or_default(),
+                        network_generation: 0,
+                    });
+                } else {
+                    timeline.metrics = None;
+                }
+                timeline.connection_instance_id = captured
+                    .quality
+                    .as_ref()
+                    .and_then(|quality| quality.connection_id)
+                    .map(|id| id.0.to_string())
+                    .unwrap_or_default();
                 Ok(control_response::Payload::ConnectionTimeline(Box::new(
-                    diagnostics::timeline_to_proto(&timeline),
+                    timeline,
                 )))
             }
             control_request::Payload::GetNetworkQuality(_) => {
@@ -971,6 +1182,8 @@ impl ControlService {
         let mut data_plane = self.data_plane.lock().await;
         let mut state = self.state.lock().await;
         if let Some(active) = data_plane.as_mut() {
+            let gate = active.runtime.gate_status();
+            self.gate_status.send_replace(gate.clone());
             state.update_data_plane(active.profile.data_plane, active.runtime.l4_snapshot());
             if !platform_recovery_pending {
                 match active.runtime.health() {
@@ -981,13 +1194,20 @@ impl ControlService {
                                 | ConnectionPhase::Degraded
                                 | ConnectionPhase::Reconnecting
                         ) && (state.snapshot().phase == ConnectionPhase::Reconnecting
-                            || runtime_path_changed(state.snapshot(), path)) =>
+                            || runtime_path_changed(state.snapshot(), path)
+                            || state.snapshot().phase
+                                != ConnectionPhase::connected_tunnel(
+                                    path.ipv4_available,
+                                    path.ipv6_available,
+                                    Some(&gate),
+                                )) =>
                     {
-                        if let Err(error) = state.mark_connected(
+                        if let Err(error) = state.mark_connected_with_gate(
                             path.transport,
                             path.endpoint_family,
                             path.ipv4_available,
                             path.ipv6_available,
+                            Some(&gate),
                         ) {
                             state.mark_error(ConnectionError {
                                 code: ErrorCode::Internal,
@@ -1013,7 +1233,7 @@ impl ControlService {
                     }
                     RuntimeHealth::Failed {
                         message, failure, ..
-                    } => {
+                    } if !active.runtime.failure_retained() => {
                         state.mark_failure(failure, message);
                     }
                     _ => {}
@@ -1097,15 +1317,6 @@ impl ControlService {
         self.diagnostics.subscribe()
     }
 
-    async fn connection_timeline_snapshot(&self) -> usque_transport::ConnectionTimelineSnapshot {
-        self.data_plane
-            .lock()
-            .await
-            .as_ref()
-            .map(|active| active.runtime.connection_timeline())
-            .unwrap_or_default()
-    }
-
     async fn diagnostic_context(
         &self,
         mode: usque_core::DiagnosticMode,
@@ -1113,18 +1324,17 @@ impl ControlService {
         let captured_at = tokio::time::Instant::now();
         // Unlike status polling, diagnostics must not reconcile or mutate the
         // runtime state machine as a side effect of a read-only Standard run.
-        let connection = self.state.lock().await.snapshot().clone();
+        let captured = self.capture_connection_evidence().await;
+        let connection = if captured.retained {
+            self.state.lock().await.snapshot().clone()
+        } else {
+            captured.connection.clone()
+        };
         let config = self.config.read().await.clone();
         let active_profile = config.active_profile();
         #[cfg(windows)]
         let platform_state = if mode == usque_core::DiagnosticMode::Deep {
-            tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                windows_agent::inspect_platform_state_if_running(),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
+            Some(recovery_diagnostics::capture().await)
         } else {
             None
         };
@@ -1135,28 +1345,44 @@ impl ControlService {
         } else {
             None
         };
+        let stable = self.evidence_capture_is_current(&captured).await;
+        let platform_state = platform_state.filter(|_| stable);
         diagnostics::DiagnosticContext {
-            connection,
+            connection: if stable {
+                connection
+            } else {
+                ConnectionSnapshot::default()
+            },
             configuration_valid: config.validate().is_ok(),
             secure_storage_available: current_capabilities().secure_storage,
             kill_switch_expected: active_profile
                 .as_ref()
                 .is_some_and(|profile| profile.kill_switch),
-            tunnel_dns_expected: active_profile
-                .as_ref()
-                .is_some_and(|profile| profile.dns_mode == DnsMode::Tunnel),
+            tunnel_dns_expected: active_profile.as_ref().is_some_and(|profile| {
+                profile.dns_mode == DnsMode::Tunnel || profile.uses_encrypted_warp_dns()
+            }),
             system_proxy_expected: active_profile
                 .as_ref()
                 .is_some_and(|profile| profile.proxy.system_proxy),
             operating_system: std::env::consts::OS.to_owned(),
-            timeline: self.connection_timeline_snapshot().await,
+            timeline: if captured.retained || !stable {
+                Default::default()
+            } else {
+                captured.timeline
+            },
             platform_state,
-            quality: self.network_quality_snapshot(),
+            quality: if captured.retained || !stable {
+                network_quality::disconnected_snapshot()
+            } else {
+                captured
+                    .quality
+                    .unwrap_or_else(network_quality::disconnected_snapshot)
+            },
             direct_dns: active_profile
                 .as_ref()
                 .map(|profile| profile.direct_dns.clone())
                 .unwrap_or_default(),
-            probes,
+            probes: probes.filter(|_| stable),
             captured_at,
         }
     }
@@ -1184,6 +1410,7 @@ impl ControlService {
         if self.data_plane.try_lock().ok()?.is_some()
             || self.state.try_lock().ok()?.snapshot().phase != ConnectionPhase::Disconnected
             || self.disconnect_cleanup.try_lock().ok()?.is_some()
+            || !self.disconnect_owners.try_lock().ok()?.is_empty()
         {
             return None;
         }
@@ -1271,6 +1498,10 @@ impl ControlService {
             last_successful_update_unix_milliseconds,
             has_global_geosite,
             global_geosite_updated_unix_milliseconds,
+            has_ads: usque_geo::AdsRules::load(&self.cache_dir).is_ok(),
+            ads_revision: usque_geo::AdsRules::load(&self.cache_dir)
+                .map(|ads| ads.revision().to_owned())
+                .unwrap_or_default(),
         })
     }
 
@@ -1701,14 +1932,28 @@ impl ControlService {
     }
 
     async fn connect(&self, profile_id: Uuid) -> Result<ConnectionSnapshot, ControlServiceError> {
+        let startup_cancel = self.gate_connection_request().await;
         let _mutation = self.mutation_lock.lock().await;
+        if startup_cancel.is_cancelled() {
+            return Ok(self.state.lock().await.snapshot().clone());
+        }
+        self.stop_failed_gate_locked().await?;
+        #[cfg(windows)]
+        if let Some(snapshot) = self
+            .retry_protected_target(profile_id, &startup_cancel, false)
+            .await?
+        {
+            return Ok(snapshot);
+        }
         if self.data_plane.lock().await.is_none() {
             *self.session_congestion_control.lock().await = None;
             *self.session_profile.lock().await = None;
         }
         #[cfg(windows)]
         let intent_generation = self.begin_windows_connection_intent(profile_id).await;
-        let result = self.connect_locked(profile_id).await;
+        let result = self
+            .connect_with_cancellation_locked(profile_id, startup_cancel, true)
+            .await;
         #[cfg(windows)]
         if result.is_err() {
             self.clear_windows_connection_intent_if(intent_generation)
@@ -1721,13 +1966,92 @@ impl ControlService {
         &self,
         profile_id: Uuid,
     ) -> Result<ConnectionSnapshot, ControlServiceError> {
-        self.await_disconnect_cleanup().await?;
+        let startup_cancel = self.gate_startup_cancel.lock().await.clone();
+        self.connect_with_cancellation_locked(profile_id, startup_cancel, false)
+            .await
+    }
+
+    #[cfg(windows)]
+    async fn connection_recovery_preflight(
+        &self,
+        restart_exhausted: bool,
+    ) -> Result<Option<windows_agent::AutomaticRecoveryObservation>, windows_agent::WindowsVpnError>
+    {
+        #[cfg(test)]
+        if let Some(client) = self.test_windows_agent.lock().await.clone() {
+            return client.recovery_preflight(restart_exhausted).await;
+        }
+        windows_agent::automatic_recovery_preflight(restart_exhausted).await
+    }
+
+    async fn connect_with_cancellation_locked(
+        &self,
+        profile_id: Uuid,
+        startup_cancel: tokio_util::sync::CancellationToken,
+        restart_exhausted_recovery: bool,
+    ) -> Result<ConnectionSnapshot, ControlServiceError> {
+        if startup_cancel.is_cancelled() {
+            return Ok(self.state.lock().await.snapshot().clone());
+        }
+        let connection_started = tokio::time::Instant::now();
+        self.ensure_gate_supervisor().await;
+        let cleanup_result = tokio::select! {
+            biased;
+            _ = startup_cancel.cancelled() => {
+                return Ok(self.state.lock().await.snapshot().clone());
+            }
+            result = self.await_disconnect_cleanup() => result,
+        };
+        if let Err(error) = cleanup_result {
+            if startup_cancel.is_cancelled() {
+                return Ok(self.state.lock().await.snapshot().clone());
+            }
+            #[cfg(windows)]
+            if let ControlServiceError::PlatformRecoveryPending {
+                operation_id,
+                journal_generation,
+            } = error
+            {
+                return self
+                    .enter_windows_automatic_recovery(profile_id, operation_id, journal_generation)
+                    .await;
+            }
+            #[cfg(windows)]
+            let inspect_current_recovery = restart_exhausted_recovery
+                && matches!(
+                    &error,
+                    ControlServiceError::PlatformRecovery {
+                        code: "WINDOWS_RECOVERY_EXHAUSTED"
+                            | "WINDOWS_RECOVERY_BLOCKED"
+                            | "WINDOWS_RECOVERY_TIMEOUT",
+                        ..
+                    }
+                )
+                && self
+                    .config
+                    .read()
+                    .await
+                    .runtime_profile(profile_id)
+                    .is_some_and(|profile| {
+                        profile.frontends.tunnel
+                            || (profile.frontends.http && profile.proxy.system_proxy)
+                    });
+            #[cfg(not(windows))]
+            let inspect_current_recovery = false;
+            if !inspect_current_recovery {
+                self.mark_connection_error(&error).await;
+                return Err(error);
+            }
+        }
+        if startup_cancel.is_cancelled() {
+            return Ok(self.state.lock().await.snapshot().clone());
+        }
         {
             let data_plane = self.data_plane.lock().await;
             if let Some(active) = data_plane.as_ref() {
                 if active.profile_id == profile_id {
                     drop(data_plane);
-                    return Ok(self.state.lock().await.snapshot().clone());
+                    return Ok(self.status_snapshot().await);
                 }
                 return Err(ControlServiceError::AlreadyConnected(active.profile_id));
             }
@@ -1752,6 +2076,9 @@ impl ControlService {
             profile = session.clone();
         }
         self.attach_proxy_auth(&mut profile).await?;
+        let connection_deadline =
+            connection_started + usque_core::endpoint_connection_budget(&profile);
+        self.gate_status.send_replace(Default::default());
         {
             let mut session = self.session_congestion_control.lock().await;
             let algorithm = match *session {
@@ -1772,6 +2099,11 @@ impl ControlService {
         {
             return Err(ControlServiceError::FeatureUnavailable(
                 "encrypted direct DNS is unavailable in this build",
+            ));
+        }
+        if !usque_transport::ENCRYPTED_DIRECT_DNS_ENABLED && profile.warp_dns.is_encrypted() {
+            return Err(ControlServiceError::FeatureUnavailable(
+                "encrypted WARP DNS is unavailable in this build",
             ));
         }
         if profile.frontends.tunnel && !cfg!(windows) {
@@ -1797,12 +2129,74 @@ impl ControlService {
                 return Err(error);
             }
         };
+        #[cfg(not(windows))]
+        let _ = restart_exhausted_recovery;
+        #[cfg(windows)]
+        if profile.frontends.tunnel || (profile.frontends.http && profile.proxy.system_proxy) {
+            let recovery = tokio::select! {
+                biased;
+                () = startup_cancel.cancelled() => return Ok(self.state.lock().await.snapshot().clone()),
+                result = self.connection_recovery_preflight(restart_exhausted_recovery) => result,
+            };
+            // Cleanup may finish after cancellation, but the old intent must
+            // never install a reconnect watch or create another transaction.
+            if startup_cancel.is_cancelled() {
+                return Ok(self.state.lock().await.snapshot().clone());
+            }
+            match recovery {
+                Ok(Some(windows_agent::AutomaticRecoveryObservation::Pending {
+                    operation_id,
+                    journal_generation,
+                })) => {
+                    return self
+                        .enter_windows_automatic_recovery(
+                            profile_id,
+                            operation_id,
+                            journal_generation,
+                        )
+                        .await;
+                }
+                Ok(Some(windows_agent::AutomaticRecoveryObservation::Exhausted(failure))) => {
+                    let error = map_windows_vpn_error(
+                        windows_agent::WindowsVpnError::AutomaticRecoveryExhausted {
+                            message: failure.message,
+                        },
+                    );
+                    self.mark_connection_error(&error).await;
+                    return Err(error);
+                }
+                Ok(Some(windows_agent::AutomaticRecoveryObservation::Blocked(failure))) => {
+                    let error = map_windows_vpn_error(
+                        windows_agent::WindowsVpnError::AutomaticRecoveryBlocked {
+                            message: failure.message,
+                        },
+                    );
+                    self.mark_connection_error(&error).await;
+                    return Err(error);
+                }
+                Err(error) => {
+                    let error = map_windows_vpn_error(error);
+                    self.mark_connection_error(&error).await;
+                    return Err(error);
+                }
+                Ok(Some(windows_agent::AutomaticRecoveryObservation::Clean)) | Ok(None) => {}
+            }
+        }
         let pin_refresher: Arc<dyn EndpointPinRefresher> = Arc::new(VaultEndpointPinRefresher {
             profile_id,
             vault: Arc::clone(&self.vault),
             identity: Mutex::new(warp_identity),
         });
-        let geo_policy = load_geo_direct_policy(&profile, &self.cache_dir);
+        let geo_policy = match load_geo_direct_policy(&profile, &self.cache_dir) {
+            Ok(policy) => policy,
+            Err(error) => {
+                self.mark_connection_error(&error).await;
+                return Err(error);
+            }
+        };
+        let ads_rule_revision = geo_policy.ads_revision().unwrap_or_default().to_owned();
+        let ads_unavailable = profile.routing.ads_enabled && geo_policy.ads_revision().is_none();
+        let selected_gate = self.prepare_gate_selection(&profile)?;
         if !profile.geo_direct_countries.is_empty() && !geo_policy.is_enabled() {
             let error = ControlServiceError::GeoRules(
                 "the configured GeoIP/GeoSite cache is missing or invalid".to_owned(),
@@ -1831,7 +2225,19 @@ impl ControlService {
             }
         }
 
-        let runtime = if profile.frontends.tunnel {
+        #[cfg(all(test, windows))]
+        let test_runtime = self.test_windows_agent.lock().await.as_ref().map(|_| {
+            ActiveRuntime::Harness(Box::new(active_runtime::HarnessRuntime::from_profile(
+                &profile,
+                profile.frontends.tunnel,
+                0,
+            )))
+        });
+        #[cfg(not(all(test, windows)))]
+        let test_runtime: Option<ActiveRuntime> = None;
+        let runtime = if let Some(runtime) = test_runtime {
+            runtime
+        } else if profile.frontends.tunnel {
             #[cfg(windows)]
             {
                 match windows_agent::WindowsVpnRuntime::start(
@@ -1839,10 +2245,20 @@ impl ControlService {
                     identity,
                     Arc::clone(&pin_refresher),
                     Arc::new(geo_policy.clone()),
+                    usque_transport::VpnGateStart {
+                        selected: selected_gate,
+                        status: Some(self.gate_status.clone()),
+                        cancellation: startup_cancel.clone(),
+                        deadline: Some(connection_deadline),
+                    },
+                    &self.windows_device,
                 )
                 .await
                 {
                     Ok(runtime) => ActiveRuntime::Vpn(Box::new(runtime)),
+                    Err(_) if startup_cancel.is_cancelled() => {
+                        return self.disconnect_locked().await;
+                    }
                     Err(windows_agent::WindowsVpnError::AutomaticRecoveryPending {
                         operation_id,
                         journal_generation,
@@ -1867,20 +2283,32 @@ impl ControlService {
                 unreachable!("non-Windows VPN mode was rejected before identity loading")
             }
         } else {
-            match ProxyRuntime::start_with_geo_policy(
+            match Box::pin(usque_transport::DataPlaneRuntime::start_with_vpngate(
                 &profile,
                 identity,
                 Arc::new(NoopSocketProtector),
                 Some(pin_refresher),
-                geo_policy,
-            )
+                Arc::new(geo_policy),
+                usque_transport::VpnGateStart {
+                    selected: selected_gate,
+                    status: Some(self.gate_status.clone()),
+                    cancellation: startup_cancel.clone(),
+                    deadline: Some(connection_deadline),
+                },
+            ))
             .await
             {
                 Ok(runtime) => {
+                    let mut runtime = ProxyRuntime::from_data_plane(runtime);
+                    if startup_cancel.is_cancelled() {
+                        runtime.quiesce_final();
+                    }
                     #[cfg(windows)]
-                    let mut runtime = runtime;
-                    #[cfg(windows)]
-                    let system_proxy = if profile.frontends.http && profile.proxy.system_proxy {
+                    let system_proxy = if profile.frontends.http
+                        && profile.proxy.system_proxy
+                        && runtime.gate_status().stage != usque_core::vpngate::GateStage::Error
+                        && !startup_cancel.is_cancelled()
+                    {
                         let Some(listener) =
                             windows_agent::loopback_http_listener(runtime.http_listeners())
                         else {
@@ -1916,6 +2344,19 @@ impl ControlService {
                     } else {
                         None
                     };
+                    if runtime.gate_status().stage != usque_core::vpngate::GateStage::Error
+                        && !startup_cancel.is_cancelled()
+                        && let Err(error) = runtime.activate_final().await
+                    {
+                        runtime.shutdown().await;
+                        #[cfg(windows)]
+                        if let Some(mut guard) = system_proxy {
+                            let _ = guard.shutdown().await;
+                        }
+                        let error = ControlServiceError::Transport(error);
+                        self.mark_connection_error(&error).await;
+                        return Err(error);
+                    }
                     ActiveRuntime::Proxy(Box::new(ActiveProxyRuntime {
                         runtime,
                         #[cfg(windows)]
@@ -1929,27 +2370,46 @@ impl ControlService {
                 }
             }
         };
+        if startup_cancel.is_cancelled() {
+            let mut runtime = runtime;
+            runtime.cancel_immediately();
+            self.queue_runtime_shutdown(runtime, None).await;
+            return self.disconnect_locked().await;
+        }
+        let runtime = self.accept_gate_runtime(runtime, &profile).await?;
         let path = runtime.path();
         let listener_auth = profile.proxy.listener_credentials().ok().flatten();
-        let exit_probe = exit_probe_for_session(
-            &profile,
-            &runtime,
-            self.store.path(),
-            listener_auth.as_ref(),
-        );
+        let exit_probe = exit_probe_for_session(&profile, &runtime, listener_auth.as_ref());
         let snapshot = {
             let mut state = self.state.lock().await;
             state.update_data_plane(profile.data_plane, runtime.l4_snapshot());
             if profile.transport == TransportPolicy::Auto && path.transport == Transport::Http2 {
                 state.transition(ConnectionPhase::ConnectingHttp2)?;
             }
-            state.mark_connected(
-                path.transport,
-                path.endpoint_family,
-                path.ipv4_available,
-                path.ipv6_available,
-            )?;
+            match runtime.health() {
+                RuntimeHealth::Failed {
+                    failure, message, ..
+                } => {
+                    state.mark_failure(failure, message);
+                }
+                _ => {
+                    state.mark_connected_with_gate(
+                        path.transport,
+                        path.endpoint_family,
+                        path.ipv4_available,
+                        path.ipv6_available,
+                        Some(&runtime.gate_status()),
+                    )?;
+                }
+            }
+            state.update_ads_revision(ads_rule_revision);
             let mut warnings = Vec::new();
+            if ads_unavailable {
+                warnings.push(ConnectionWarning {
+                    code: "ADS_UNAVAILABLE".into(),
+                    message: "Ads rules unavailable; custom routing remains active".into(),
+                });
+            }
             if (profile.frontends.socks5 && profile.proxy.socks5_exposes_lan())
                 || (profile.frontends.http && profile.proxy.http_exposes_lan())
             {
@@ -2026,8 +2486,13 @@ impl ControlService {
         // Location is diagnostic: report Connected immediately and fill ip.sb
         // later, matching the Android runtime. Probe failure must not delay or
         // tear down a healthy session.
-        self.spawn_exit_probe(exit_probe, profile_id, session_generation)
-            .await;
+        if profile.chain_enabled() {
+            self.spawn_gate_exit_probe(profile_id, session_generation)
+                .await;
+        } else {
+            self.spawn_exit_probe(exit_probe, profile_id, session_generation)
+                .await;
+        }
         self.publish_settings_runtime(Some(profile), Some(session_generation))
             .await;
         Ok(snapshot)
@@ -2060,23 +2525,58 @@ impl ControlService {
     }
 
     async fn disconnect(&self) -> Result<ConnectionSnapshot, ControlServiceError> {
+        // The startup owner must finish/retain its platform guard before the
+        // serialized teardown runs. Signal it without waiting for that lock.
+        self.gate_startup_cancel.lock().await.cancel();
         self.settings_intent.fetch_add(1, Ordering::SeqCst);
         #[cfg(windows)]
         self.clear_windows_connection_intent().await;
         let _mutation = self.mutation_lock.lock().await;
         *self.session_congestion_control.lock().await = None;
         *self.session_profile.lock().await = None;
-        self.disconnect_locked().await
+        let retry_cleanup = self.data_plane.lock().await.is_none();
+        self.disconnect_locked().await?;
+        if retry_cleanup {
+            self.retry_disconnect_cleanup().await;
+        }
+        Ok(self.state.lock().await.snapshot().clone())
     }
 
     pub(crate) async fn disconnect_locked(
         &self,
     ) -> Result<ConnectionSnapshot, ControlServiceError> {
+        self.disconnect_locked_with_cleanup(false).await
+    }
+
+    pub(crate) async fn disconnect_locked_deferred(
+        &self,
+    ) -> Result<ConnectionSnapshot, ControlServiceError> {
+        self.disconnect_locked_with_cleanup(true).await
+    }
+
+    async fn disconnect_locked_with_cleanup(
+        &self,
+        defer_cleanup: bool,
+    ) -> Result<ConnectionSnapshot, ControlServiceError> {
+        self.gate_status.send_replace(Default::default());
         self.abort_exit_probe().await;
         self.clear_network_quality_source().await;
         let mut data_plane = self.data_plane.lock().await;
         let phase = self.state.lock().await.snapshot().phase;
+        if data_plane.is_none() && self.disconnect_cleanup_failed.load(Ordering::Acquire) {
+            // A retry still has no cleanup proof. Keep its error/unknown safety
+            // state until the retained owner confirms restoration.
+            drop(data_plane);
+            if !defer_cleanup {
+                self.start_queued_shutdown().await;
+            }
+            return Ok(self.state.lock().await.snapshot().clone());
+        }
         if phase == ConnectionPhase::Disconnected && data_plane.is_none() {
+            drop(data_plane);
+            if !defer_cleanup {
+                self.start_queued_shutdown().await;
+            }
             return Ok(self.state.lock().await.snapshot().clone());
         }
         {
@@ -2085,27 +2585,27 @@ impl ControlService {
                 state.transition(ConnectionPhase::Disconnecting)?;
             }
         }
-        if let Some(mut active) = data_plane.take() {
+        let cleanup_owner = if let Some(mut active) = data_plane.take() {
+            let evidence = connection_evidence::ConnectionEvidence::active(
+                &active,
+                self.state.lock().await.snapshot().clone(),
+            )
+            .terminal();
+            let generation = evidence.session_generation;
+            *self.retained_connection_evidence.lock().await = Some(evidence);
             // Stop accepting and forwarding traffic synchronously. Platform
             // rollback (routes, WFP, DNS and system proxy) can take seconds and
             // must not keep the Disconnect action or data plane alive.
             active.runtime.cancel_immediately();
             drop(data_plane);
-
-            let cleanup = tokio::spawn(async move { active.runtime.shutdown().await });
-            let mut pending = self.disconnect_cleanup.lock().await;
-            debug_assert!(
-                pending.is_none(),
-                "a previous disconnect cleanup is still pending"
-            );
-            if pending.is_some() {
-                tracing::error!(
-                    "disconnect cleanup invariant violated; detaching the older cleanup task"
-                );
-            }
-            *pending = Some(cleanup);
+            Some((active.runtime, generation))
         } else {
             drop(data_plane);
+            None
+        };
+        if let Some((runtime, generation)) = cleanup_owner {
+            // Retain identity before any further fallible state transition.
+            self.queue_runtime_shutdown(runtime, Some(generation)).await;
         }
         let snapshot = self
             .state
@@ -2114,24 +2614,33 @@ impl ControlService {
             .transition(ConnectionPhase::Disconnected)?
             .clone();
         self.publish_settings_runtime(None, None).await;
+        let retained: Vec<_> = self
+            .config
+            .read()
+            .await
+            .network
+            .vpn_gate
+            .selection
+            .clone()
+            .into_iter()
+            .collect();
+        let store = usque_core::vpngate::CatalogueStore::new(&self.cache_dir);
+        let _ = tokio::task::spawn_blocking(move || store.retain_selections(&retained)).await;
+        // Error paths finish publishing their original failure first, then
+        // explicitly start this queue so cleanup uncertainty takes precedence.
+        if !defer_cleanup {
+            self.start_queued_shutdown().await;
+        }
         Ok(snapshot)
     }
 
-    async fn await_disconnect_cleanup(&self) -> Result<(), ControlServiceError> {
-        let cleanup = self.disconnect_cleanup.lock().await.take();
-        let Some(cleanup) = cleanup else {
-            return Ok(());
-        };
-        cleanup
-            .await
-            .map_err(|error| ControlServiceError::DisconnectCleanup(error.to_string()))?
-    }
-
     async fn retry(&self) -> Result<ConnectionSnapshot, ControlServiceError> {
+        let startup_cancel = self.gate_connection_request().await;
         self.settings_intent.fetch_add(1, Ordering::SeqCst);
         let _mutation = self.mutation_lock.lock().await;
-        *self.session_congestion_control.lock().await = None;
-        *self.session_profile.lock().await = None;
+        if startup_cancel.is_cancelled() {
+            return Ok(self.state.lock().await.snapshot().clone());
+        }
         let connected_profile = self
             .data_plane
             .lock()
@@ -2139,6 +2648,10 @@ impl ControlService {
             .as_ref()
             .map(|active| active.profile_id);
         let profile_id = match connected_profile {
+            #[cfg(windows)]
+            Some(_) if self.protected_chain_present().await => {
+                self.config.read().await.active_profile_id
+            }
             Some(profile_id) => Some(profile_id),
             None => self.config.read().await.active_profile_id,
         }
@@ -2146,93 +2659,96 @@ impl ControlService {
             ControlServiceError::InvalidRequest("an active profile is required".to_owned())
         })?;
 
+        self.retry_connection_locked(profile_id, startup_cancel)
+            .await
+    }
+
+    async fn retry_connection_locked(
+        &self,
+        profile_id: Uuid,
+        startup_cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ConnectionSnapshot, ControlServiceError> {
+        self.stop_failed_gate_locked().await?;
         #[cfg(windows)]
-        let automatic_recovery_retry = self
-            .state
+        if let Some(snapshot) = self
+            .retry_protected_target(profile_id, &startup_cancel, true)
+            .await?
+        {
+            return Ok(snapshot);
+        }
+        *self.session_congestion_control.lock().await = None;
+        *self.session_profile.lock().await = None;
+        let gate_retry = self
+            .data_plane
             .lock()
             .await
-            .snapshot()
-            .error
             .as_ref()
-            .is_some_and(|error| {
-                matches!(
-                    error.code,
-                    ErrorCode::WindowsRecoveryExhausted
-                        | ErrorCode::WindowsRecoveryBlocked
-                        | ErrorCode::WindowsRecoveryTimeout
-                )
-            });
+            .filter(|active| {
+                active.profile_id == profile_id
+                    && (active.profile.chain_enabled()
+                        || active.runtime.gate_status().stage
+                            == usque_core::vpngate::GateStage::Error)
+                    && active.runtime.can_retry_gate_in_place()
+            })
+            .map(|active| active.profile.clone());
+        if let Some(previous) = gate_retry {
+            // Explicit retry applies the saved request, including a new node or
+            // disabling Gate. A failed chain has already been retired above.
+            let mut profile = self
+                .config
+                .read()
+                .await
+                .runtime_profile(profile_id)
+                .ok_or(ControlServiceError::ProfileNotFound(profile_id))?;
+            self.attach_proxy_auth(&mut profile).await?;
+            if matches!(
+                usque_core::classify_reconfigure(&previous, &profile),
+                usque_core::ReconfigureClass::PersistOnly
+                    | usque_core::ReconfigureClass::HotVpnGate
+            ) {
+                profile.congestion_control = previous.congestion_control;
+                self.hot_replace_gate_with_cancellation(&profile, &startup_cancel)
+                    .await?;
+                *self.session_congestion_control.lock().await =
+                    Some((profile_id, profile.congestion_control));
+                self.apply_hot_profile_state(&profile).await;
+                let generation = self
+                    .data_plane
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|a| a.session_generation);
+                self.publish_settings_runtime(Some(profile), generation)
+                    .await;
+                return Ok(self.status_snapshot().await);
+            }
+        }
+
         #[cfg(windows)]
         let intent_generation = self.begin_windows_connection_intent(profile_id).await;
         #[cfg(windows)]
         {
-            let recovery = if automatic_recovery_retry {
-                windows_agent::restart_automatic_recovery_if_needed().await
-            } else {
-                Ok(None)
-            };
-            match recovery {
-                Ok(Some(windows_agent::AutomaticRecoveryObservation::Pending {
-                    operation_id,
-                    journal_generation,
-                })) => {
-                    let result = self
-                        .enter_windows_automatic_recovery(
-                            profile_id,
-                            operation_id,
-                            journal_generation,
-                        )
-                        .await;
-                    if result.is_err() {
-                        self.clear_windows_connection_intent_if(intent_generation)
-                            .await;
-                    }
-                    return result;
-                }
-                Ok(Some(windows_agent::AutomaticRecoveryObservation::Exhausted(failure))) => {
-                    let error = map_windows_vpn_error(
-                        windows_agent::WindowsVpnError::AutomaticRecoveryExhausted {
-                            message: failure.message,
-                        },
-                    );
-                    self.mark_connection_error(&error).await;
-                    self.clear_windows_connection_intent_if(intent_generation)
-                        .await;
-                    return Err(error);
-                }
-                Ok(Some(windows_agent::AutomaticRecoveryObservation::Blocked(failure))) => {
-                    let error = map_windows_vpn_error(
-                        windows_agent::WindowsVpnError::AutomaticRecoveryBlocked {
-                            message: failure.message,
-                        },
-                    );
-                    self.mark_connection_error(&error).await;
-                    self.clear_windows_connection_intent_if(intent_generation)
-                        .await;
-                    return Err(error);
-                }
-                Ok(Some(windows_agent::AutomaticRecoveryObservation::Clean)) | Ok(None) => {}
-                Err(error) => {
-                    let error = map_windows_vpn_error(error);
-                    self.mark_connection_error(&error).await;
-                    self.clear_windows_connection_intent_if(intent_generation)
-                        .await;
-                    return Err(error);
-                }
-            }
-
             let mut data_plane = self.data_plane.lock().await;
             if data_plane
                 .as_ref()
                 .is_some_and(|active| active.runtime.requires_agent_reattach())
             {
                 let mut active = data_plane.take().expect("checked active data plane");
-                active.runtime.detach_for_agent_reattach().await?;
+                if let Err(error) = active.runtime.detach_for_agent_reattach().await {
+                    *data_plane = Some(active);
+                    drop(data_plane);
+                    self.clear_windows_connection_intent_if(intent_generation)
+                        .await;
+                    self.mark_connection_error(&error).await;
+                    return Err(error);
+                }
                 drop(data_plane);
                 // The Agent journal remains Active and WFP stays fail-closed.
                 // `connect_locked` detects that transaction and recreates only
                 // MASQUE plus the volatile packet session.
-                let result = self.connect_locked(profile_id).await;
+                let result = self
+                    .connect_with_cancellation_locked(profile_id, startup_cancel, true)
+                    .await;
                 if result.is_err() {
                     self.clear_windows_connection_intent_if(intent_generation)
                         .await;
@@ -2248,7 +2764,9 @@ impl ControlService {
                 .await;
         }
         disconnected?;
-        let result = self.connect_locked(profile_id).await;
+        let result = self
+            .connect_with_cancellation_locked(profile_id, startup_cancel, true)
+            .await;
         #[cfg(windows)]
         if result.is_err() {
             self.clear_windows_connection_intent_if(intent_generation)
@@ -2261,12 +2779,24 @@ impl ControlService {
         if !confirmed {
             return Err(ControlServiceError::ConfirmationRequired);
         }
+        self.update_config(|config| {
+            config.initial_identity_operation = None;
+            Ok(())
+        })
+        .await?;
+        let _identity_lease = self.identity_execution_lease().await?;
+        let _diagnostics_lifecycle = self.diagnostics_lifecycle.lock().await;
+        // Cancel a disconnected Deep probe before waiting for its mutation
+        // lease, and exclude new captures through the entire reset.
+        self.diagnostics.clear().await;
         self.settings_intent.fetch_add(1, Ordering::SeqCst);
         #[cfg(windows)]
         self.clear_windows_connection_intent().await;
+        let _submission = self.settings_submission.lock().await;
         let _mutation = self.mutation_lock.lock().await;
         self.disconnect_locked().await?;
         self.await_disconnect_cleanup().await?;
+        *self.retained_connection_evidence.lock().await = None;
         let config = self.config.read().await;
         let profile_ids = config
             .profiles
@@ -2293,7 +2823,11 @@ impl ControlService {
             Ok(())
         })
         .await?;
+        usque_core::chain_exit::store::clear_library(&self.cache_dir)
+            .map_err(ControlServiceError::configuration)?;
         self.maintenance.clear_local_state().await?;
+        *self.settings.lock().await = Default::default();
+        self.settings_tx.send_replace(0);
         Ok(())
     }
 
@@ -2483,9 +3017,11 @@ impl ControlService {
     }
 
     async fn mark_connection_error(&self, error: &ControlServiceError) {
-        #[cfg(windows)]
-        windows_agent::log_recovery_error(error);
         let mut state = self.state.lock().await;
+        #[cfg(windows)]
+        if state.snapshot().error.as_ref() != Some(&connection_error_for(error)) {
+            windows_agent::log_recovery_error(error);
+        }
         if let ControlServiceError::Transport(transport) = error {
             state.mark_failure(
                 transport.failure(None, None),
@@ -2601,6 +3137,7 @@ impl ControlService {
         };
 
         let is_zero_trust = provisioned.is_zero_trust();
+        let _identity_lease = self.identity_execution_lease().await?;
         let _mutation = self.mutation_lock.lock().await;
         if let Err(error) = self.ensure_profile_exists(profile_id).await {
             return Err(Self::after_zero_trust_registration(error, is_zero_trust));
@@ -2664,74 +3201,13 @@ impl ControlService {
             )));
         }
 
-        let secret = Zeroizing::new(provisioning.warp_secret);
-        let method = v1::IdentityProvisioningMethod::try_from(provisioning.method)
-            .unwrap_or(v1::IdentityProvisioningMethod::Unspecified);
-        let provisioned = match method {
-            v1::IdentityProvisioningMethod::Register => {
-                if !secret.is_empty() {
-                    return Err(ControlServiceError::InvalidRequest(
-                        "registration provisioning must not contain a WARP Secret".to_owned(),
-                    ));
-                }
-                let options = registration_options(
-                    provisioning.device_name.clone(),
-                    provisioning.locale.clone(),
-                );
-                ProvisionedIdentity::consumer(
-                    ConsumerRegistrationClient::new()?
-                        .register(&options)
-                        .await?,
-                )
-            }
-            v1::IdentityProvisioningMethod::ImportSecret => {
-                return Err(ControlServiceError::FeatureRemoved("WARP Secret import"));
-            }
-            v1::IdentityProvisioningMethod::RegisterWithLicense => {
-                if !secret.is_empty() {
-                    return Err(ControlServiceError::InvalidRequest(
-                        "License provisioning must not contain a WARP Secret".to_owned(),
-                    ));
-                }
-                let license_key = Zeroizing::new(provisioning.license_key);
-                let license = std::str::from_utf8(&license_key)
-                    .map_err(|_| ControlServiceError::InvalidLicenseEncoding)?;
-                let options = registration_options(provisioning.device_name, provisioning.locale);
-                ProvisionedIdentity::consumer(
-                    ConsumerRegistrationClient::new()?
-                        .register_with_license(&options, license)
-                        .await?,
-                )
-            }
-            v1::IdentityProvisioningMethod::RegisterZeroTrust => {
-                if !secret.is_empty() || !provisioning.license_key.is_empty() {
-                    return Err(ControlServiceError::IdentityOperationUnsupported);
-                }
-                let enrollment = provisioning.zero_trust.ok_or_else(|| {
-                    ControlServiceError::InvalidRequest(
-                        "Zero Trust enrollment details are missing".to_owned(),
-                    )
-                })?;
-                let callback = Zeroizing::new(enrollment.callback_uri);
-                let callback = std::str::from_utf8(&callback)
-                    .map_err(|_| RegistrationError::InvalidZeroTrustCallback)?;
-                let options = registration_options(provisioning.device_name, provisioning.locale);
-                let result = ConsumerRegistrationClient::new()?
-                    .register_zero_trust(&options, &enrollment.team_name, callback)
-                    .await?;
-                ProvisionedIdentity::zero_trust(result.identity, &result.endpoint)
-            }
-            v1::IdentityProvisioningMethod::Unspecified => {
-                return Err(ControlServiceError::InvalidRequest(
-                    "identity provisioning method is missing".to_owned(),
-                ));
-            }
-        };
+        let provisioned = self.register_initial_identity(provisioning).await?;
 
         let is_zero_trust = provisioned.is_zero_trust();
         let identity_provider = provisioned.identity().provider().clone();
         let managed_endpoint_ips = provisioned.managed_endpoint_ips().cloned();
 
+        let _identity_lease = self.identity_execution_lease().await?;
         let _mutation = self.mutation_lock.lock().await;
         let mut pending = self.config.read().await.clone();
         if pending
@@ -2885,6 +3361,16 @@ impl ControlService {
                 cleanup_pending,
                 provider: provider as i32,
                 organization,
+                registered_endpoint_ipv4: account
+                    .managed_endpoint_ips
+                    .as_ref()
+                    .map(|pair| pair.ipv4.to_string())
+                    .unwrap_or_default(),
+                registered_endpoint_ipv6: account
+                    .managed_endpoint_ips
+                    .as_ref()
+                    .map(|pair| pair.ipv6.to_string())
+                    .unwrap_or_default(),
             });
         }
         catalog
@@ -2974,6 +3460,7 @@ impl ControlService {
         self.ensure_profile_exists(profile_id).await?;
         let license = std::str::from_utf8(&license_key)
             .map_err(|_| ControlServiceError::InvalidLicenseEncoding)?;
+        let _identity_lease = self.identity_execution_lease().await?;
         let _mutation = self.mutation_lock.lock().await;
         Self::require_consumer_identity(&self.load_identity_provider(profile_id).await?)?;
         let reconnect = self.connected_profile_id().await == Some(profile_id);
@@ -2997,6 +3484,7 @@ impl ControlService {
 
     async fn unbind_license_key(&self, profile_id: Uuid) -> Result<(), ControlServiceError> {
         self.ensure_profile_exists(profile_id).await?;
+        let _identity_lease = self.identity_execution_lease().await?;
         let _mutation = self.mutation_lock.lock().await;
         Self::require_consumer_identity(&self.load_identity_provider(profile_id).await?)?;
         let reconnect = self.connected_profile_id().await == Some(profile_id);
@@ -3070,34 +3558,90 @@ impl ControlService {
                 .map_err(ControlServiceError::invalid_proxy_auth)?;
         }
 
+        let _submission = self.settings_submission.lock().await;
         let _mutation = self.mutation_lock.lock().await;
-        self.migrate_shared_proxy_password().await?;
-        let mut next = self.config.read().await.clone();
-        if !next.profiles.iter().any(|profile| profile.id == profile_id) {
-            return Err(ControlServiceError::ProfileNotFound(profile_id));
+        self.ensure_profile_exists(profile_id).await?;
+        let transaction = async {
+            // Install the secret before enabling its username. A partial store
+            // failure never downgrades a configured listener to anonymous auth.
+            if !username.is_empty() {
+                self.vault
+                    .put(
+                        SHARED_NETWORK_SECRET_ID,
+                        SecretRecord::ProxyPassword,
+                        &password,
+                    )
+                    .await?;
+            }
+            let next_username = (!username.is_empty()).then_some(username);
+            self.update_config(move |latest| {
+                latest.network.proxy.auth_username = next_username;
+                latest.network.proxy.auth_password = None;
+                Ok(())
+            })
+            .await?;
+            let ids: Vec<_> = {
+                let config = self.config.read().await;
+                config
+                    .profiles
+                    .iter()
+                    .map(|p| p.id)
+                    .chain(config.pending_identity_deletions.iter().copied())
+                    .collect()
+            };
+            for id in ids {
+                self.vault.delete(id, SecretRecord::ProxyPassword).await?;
+            }
+            if password.is_empty() {
+                self.vault
+                    .delete(SHARED_NETWORK_SECRET_ID, SecretRecord::ProxyPassword)
+                    .await?;
+            }
+            Ok::<(), ControlServiceError>(())
         }
-        if username.is_empty() {
-            next.network.proxy.auth_username = None;
-            next.network.proxy.auth_password = None;
-            self.vault
-                .delete(SHARED_NETWORK_SECRET_ID, SecretRecord::ProxyPassword)
-                .await?;
-        } else {
-            next.network.proxy.auth_username = Some(username);
-            self.vault
-                .put(
-                    SHARED_NETWORK_SECRET_ID,
-                    SecretRecord::ProxyPassword,
-                    &password,
-                )
-                .await?;
+        .await;
+        if let Err(error) = transaction {
+            // Persistence may be ambiguous across the vault and config file.
+            // Retire the old listeners; a retry can reconcile the saved pair.
+            #[cfg(windows)]
+            self.clear_windows_connection_intent().await;
+            let _ = self.disconnect_locked().await;
+            return Err(error);
         }
-        self.update_config(move |latest| {
-            latest.network.proxy.auth_username = next.network.proxy.auth_username;
-            latest.network.proxy.auth_password = None;
-            Ok(())
-        })
-        .await
+        let active = self
+            .data_plane
+            .lock()
+            .await
+            .as_ref()
+            .map(|active| active.profile.clone());
+        if let Some(mut applied) = active {
+            applied.proxy.auth_username =
+                self.config.read().await.network.proxy.auth_username.clone();
+            if self.attach_proxy_auth(&mut applied).await.is_err() {
+                #[cfg(windows)]
+                self.clear_windows_connection_intent().await;
+                let _ = self.disconnect_locked().await;
+                return Err(ControlServiceError::ProxyAuthApplyFailed);
+            }
+            if self.hot_reconfigure_frontends(&applied).await.is_err() {
+                #[cfg(windows)]
+                self.clear_windows_connection_intent().await;
+                let _ = self.disconnect_locked().await;
+                return Err(ControlServiceError::ProxyAuthApplyFailed);
+            }
+            let generation = {
+                let mut runtime = self.data_plane.lock().await;
+                runtime.as_mut().map(|active| {
+                    active.profile = applied.clone();
+                    active.session_generation
+                })
+            };
+            self.apply_hot_profile_state(&applied).await;
+            *self.session_profile.lock().await = Some(applied.clone());
+            self.publish_settings_runtime(Some(applied), generation)
+                .await;
+        }
+        Ok(())
     }
 
     async fn attach_proxy_auth(&self, profile: &mut Profile) -> Result<(), ControlServiceError> {
@@ -3177,6 +3721,16 @@ impl ControlService {
         new_identity: WarpIdentity,
         managed_endpoint_ips: Option<ManagedEndpointIps>,
     ) -> Result<(), ControlServiceError> {
+        self.replace_identity_records_locked(profile_id, &new_identity, managed_endpoint_ips)
+            .await
+    }
+
+    async fn replace_identity_records_locked(
+        &self,
+        profile_id: Uuid,
+        new_identity: &WarpIdentity,
+        managed_endpoint_ips: Option<ManagedEndpointIps>,
+    ) -> Result<(), ControlServiceError> {
         let new_provider = new_identity.provider().clone();
         let current = self.config.read().await.clone();
         if current.account(profile_id).is_none() {
@@ -3234,7 +3788,7 @@ impl ControlService {
             return Err(error);
         }
 
-        if let Err(error) = self.persist_identity(profile_id, &new_identity, None).await {
+        if let Err(error) = self.persist_identity(profile_id, new_identity, None).await {
             self.rollback_pending_identity_replacement_locked(
                 profile_id,
                 previous.as_ref(),
@@ -3250,7 +3804,7 @@ impl ControlService {
         if let Err(error) = self.persist(next).await {
             if new_identity.license().is_some() {
                 let _ = ConsumerRegistrationClient::new()?
-                    .unbind_license(&new_identity)
+                    .unbind_license(new_identity)
                     .await;
             }
             self.rollback_pending_identity_replacement_locked(
@@ -3296,6 +3850,24 @@ impl ControlService {
         Ok(())
     }
 
+    async fn validate_client_routing(
+        &self,
+        source: &v1::Profile,
+    ) -> Result<(), ControlServiceError> {
+        if !source.split_exclusions.is_empty()
+            || !source.bypass_domains.is_empty()
+            || source.routing.is_none()
+                && self.config.read().await.network.routing
+                    != usque_core::RoutingSettings::default()
+        {
+            return Err(ControlServiceError::configuration(
+                ConfigError::RoutingUpgradeRequired,
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn upsert_profile(&self, profile: Profile) -> Result<Profile, ControlServiceError> {
         profile
             .validate()
@@ -3304,11 +3876,34 @@ impl ControlService {
         self.upsert_profile_locked(profile).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn upsert_profile_locked(
         &self,
         profile: Profile,
     ) -> Result<Profile, ControlServiceError> {
+        self.upsert_client_profile_locked(profile, true).await
+    }
+
+    pub(crate) async fn upsert_client_profile_locked(
+        &self,
+        profile: Profile,
+        routing_present: bool,
+    ) -> Result<Profile, ControlServiceError> {
+        // All profile APIs, including older clients, must pin an exact Gate
+        // configuration before persisting its reference.
+        if profile.custom_chain().is_none() {
+            self.pin_gate_settings(&profile.vpn_gate).await?;
+        }
+        self.validate_chain_selection(&profile)?;
         self.update_config(move |latest| {
+            // Field-scoped saves intentionally do not wait for mutation_lock.
+            // Recheck against the actual transaction, after all awaited work.
+            if !routing_present && latest.network.routing != usque_core::RoutingSettings::default()
+            {
+                return Err(ControlServiceError::configuration(
+                    ConfigError::RoutingUpgradeRequired,
+                ));
+            }
             let stored = latest
                 .upsert_runtime_profile(profile)
                 .map_err(ControlServiceError::configuration)?;
@@ -3359,7 +3954,21 @@ impl ControlService {
                 .iter()
                 .find(|profile| Some(profile.id) == next.active_profile_id)
             {
+                if active.chain_exit.is_none()
+                    && next.network.chain_exit.as_ref().is_some_and(|s| {
+                        s.source != usque_core::chain_exit::ChainSource::VpnGate
+                            && s.profile_id.is_some()
+                    })
+                {
+                    return Err(ControlServiceError::configuration(
+                        usque_core::ConfigError::ChainExitCapabilityRequired,
+                    ));
+                }
+                self.pin_gate_settings(&active.vpn_gate).await?;
                 let mut network = SharedNetworkSettings::from_profile(active);
+                network
+                    .routing
+                    .migrate_direct(&mut network.split_exclusions, &mut network.bypass_domains);
                 if active.endpoint.is_zero_trust_managed() {
                     network.endpoint = profiles
                         .iter()
@@ -3403,6 +4012,18 @@ impl ControlService {
                 return Err(ControlServiceError::LastProfile);
             }
         }
+        self.update_config(move |config| {
+            if config
+                .initial_identity_operation
+                .as_ref()
+                .is_some_and(|operation| operation.profile_id == id)
+            {
+                config.initial_identity_operation = None;
+            }
+            Ok(())
+        })
+        .await?;
+        let _identity_lease = self.identity_execution_lease().await?;
         #[cfg(windows)]
         self.clear_windows_connection_intent().await;
         let _mutation = self.mutation_lock.lock().await;
@@ -3438,6 +4059,8 @@ impl ControlService {
             return Err(ControlServiceError::ProfileNotFound(id));
         }
         #[cfg(windows)]
+        let cancellation = self.gate_connection_request().await;
+        #[cfg(windows)]
         self.clear_windows_connection_intent().await;
         let _mutation = self.mutation_lock.lock().await;
         let mut next = self.config.read().await.clone();
@@ -3445,7 +4068,13 @@ impl ControlService {
             return Err(ControlServiceError::ProfileNotFound(id));
         }
         next.active_profile_id = Some(id);
-        self.persist(next).await
+        self.persist(next).await?;
+        #[cfg(windows)]
+        if !cancellation.is_cancelled() {
+            self.retry_protected_target(id, &cancellation, false)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Roll back an identity replacement that was interrupted after its vault
@@ -3623,6 +4252,7 @@ impl ControlService {
     async fn persist(&self, mut next: AppConfig) -> Result<(), ControlServiceError> {
         self.update_config(move |latest| {
             next.network = latest.network.clone();
+            next.initial_identity_operation = latest.initial_identity_operation.clone();
             *latest = next;
             Ok(())
         })
@@ -3638,13 +4268,33 @@ impl ControlService {
         let (next, result) = tokio::task::spawn_blocking(move || store.update(change))
             .await
             .map_err(|error| ControlServiceError::PersistenceWorker(error.to_string()))??;
+        let gate_changed = next.network.vpn_gate.selection != config.network.vpn_gate.selection;
         *config = next;
+        if gate_changed {
+            let mut retained: Vec<_> = config
+                .network
+                .vpn_gate
+                .selection
+                .clone()
+                .into_iter()
+                .collect();
+            if let Some(server) = &self.gate_status.borrow().current_server {
+                retained.push(usque_core::vpngate::Selection {
+                    server_id: server.id.clone(),
+                    config_sha256: server.config_sha256.clone(),
+                });
+            }
+            let store = usque_core::vpngate::CatalogueStore::new(&self.cache_dir);
+            let _ = tokio::task::spawn_blocking(move || store.retain_selections(&retained)).await;
+        }
         Ok(result)
     }
 }
 
 #[derive(Debug, Error)]
 pub enum ControlServiceError {
+    #[error("{0}")]
+    VpnGate(usque_core::vpngate::DirectoryError),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
     #[error("the requested feature is not available yet: {0}")]
@@ -3655,6 +4305,8 @@ pub enum ControlServiceError {
     InvalidConfiguration(String),
     #[error("invalid direct DNS configuration: {message}")]
     InvalidDirectDnsConfiguration { code: &'static str, message: String },
+    #[error("invalid WARP DNS configuration: {message}")]
+    InvalidWarpDnsConfiguration { code: &'static str, message: String },
     #[error("profile does not exist: {0}")]
     ProfileNotFound(Uuid),
     #[error("profile {0} is already connected")]
@@ -3724,6 +4376,10 @@ pub enum ControlServiceError {
     DisconnectCleanup(String),
     #[error("proxy listener authentication is invalid: {0}")]
     InvalidProxyAuth(String),
+    #[error(
+        "Credentials were saved, but listeners could not apply them. The connection was stopped; retry to reconnect."
+    )]
+    ProxyAuthApplyFailed,
     #[error("geo rules operation failed: {0}")]
     GeoRules(String),
 }
@@ -3735,6 +4391,10 @@ impl ControlServiceError {
 
     fn profile_configuration(error: ConfigError) -> Self {
         match error.stable_code() {
+            Some(code) if code.starts_with("WARP_DNS_") => Self::InvalidWarpDnsConfiguration {
+                code,
+                message: error.to_string(),
+            },
             Some(code) => Self::InvalidDirectDnsConfiguration {
                 code,
                 message: error.to_string(),
@@ -3752,10 +4412,22 @@ impl ControlServiceError {
     }
 
     fn as_structured_error(&self) -> StructuredError {
+        if let Self::Transport(error) = self {
+            let failure = error.failure(None, None);
+            if !failure.retryable {
+                return StructuredError {
+                    code: failure.code.as_str().to_owned(),
+                    message: failure.code.to_string(),
+                    retryable: false,
+                };
+            }
+        }
         let (code, retryable) = match self {
             Self::InvalidRequest(_) | Self::InvalidConfiguration(_) => ("INVALID_ARGUMENT", false),
             Self::InvalidDirectDnsConfiguration { code, .. } => (*code, false),
+            Self::InvalidWarpDnsConfiguration { code, .. } => (*code, false),
             Self::InvalidProxyAuth(_) => ("CONFIGURATION_INVALID", false),
+            Self::ProxyAuthApplyFailed => ("PROXY_AUTH_APPLY_FAILED", true),
             Self::FeatureUnavailable(_) => ("FEATURE_UNAVAILABLE", false),
             Self::FeatureRemoved(_) => ("FEATURE_REMOVED", false),
             Self::ProfileNotFound(_) => ("PROFILE_NOT_FOUND", false),
@@ -3841,6 +4513,14 @@ impl ControlServiceError {
             }
             Self::DisconnectCleanup(_) => ("DISCONNECT_CLEANUP_FAILED", true),
             Self::GeoRules(_) => ("GEO_RULES_FAILED", true),
+            Self::VpnGate(error) => (
+                if *error == usque_core::vpngate::DirectoryError::StaleSelection {
+                    "VPN_GATE_SELECTION_STALE"
+                } else {
+                    "VPN_GATE_FAILED"
+                },
+                false,
+            ),
         };
         StructuredError {
             code: code.to_owned(),
@@ -3864,6 +4544,16 @@ fn connection_error_wire_code(code: ErrorCode) -> String {
 }
 
 fn connection_error_for(error: &ControlServiceError) -> ConnectionError {
+    if let ControlServiceError::Transport(error) = error {
+        let failure = error.failure(None, None);
+        if !failure.retryable {
+            return ConnectionError {
+                code: failure.code.legacy_error_code(),
+                message: failure.code.to_string(),
+                retryable: false,
+            };
+        }
+    }
     let code = match error {
         ControlServiceError::MissingCredential(_) => ErrorCode::MissingCredential,
         ControlServiceError::Transport(TransportError::EndpointPinMismatch) => {
@@ -3931,6 +4621,17 @@ pub(crate) fn map_windows_vpn_error(error: windows_agent::WindowsVpnError) -> Co
         }
         windows_agent::WindowsVpnError::RecoveryUnsupported => {
             Some(("WINDOWS_RECOVERY_UNSUPPORTED", false))
+        }
+        windows_agent::WindowsVpnError::MissingCapabilities(capabilities)
+            if capabilities.contains("protected_tunnel_replacement") =>
+        {
+            Some(("WINDOWS_RECOVERY_UNSUPPORTED", false))
+        }
+        windows_agent::WindowsVpnError::DeviceReuseUnsupported => {
+            Some(("WINDOWS_DEVICE_REUSE_UNSUPPORTED", false))
+        }
+        windows_agent::WindowsVpnError::DeviceRecoveryRequired => {
+            Some(("WINDOWS_DEVICE_RECOVERY_REQUIRED", false))
         }
         windows_agent::WindowsVpnError::AutomaticRecoveryExhausted { .. } => {
             Some(("WINDOWS_RECOVERY_EXHAUSTED", true))
@@ -4143,8 +4844,50 @@ fn profile_from_proto(source: v1::Profile) -> Result<Profile, ControlServiceErro
         },
     };
     direct_dns.canonicalize();
+    let mut warp_dns = match source.warp_dns {
+        None => WarpDnsSettings::default(),
+        Some(settings) => WarpDnsSettings {
+            mode: match settings.mode {
+                value if value == v1::WarpDnsMode::Unspecified as i32 => ConfigWarpDnsMode::Plain,
+                value if value == v1::WarpDnsMode::Plain as i32 => ConfigWarpDnsMode::Plain,
+                value if value == v1::WarpDnsMode::Doh as i32 => ConfigWarpDnsMode::Doh,
+                value if value == v1::WarpDnsMode::Dot as i32 => ConfigWarpDnsMode::Dot,
+                _ => {
+                    return Err(ControlServiceError::InvalidWarpDnsConfiguration {
+                        code: "WARP_DNS_MODE_INVALID",
+                        message: "unknown WARP DNS mode".to_owned(),
+                    });
+                }
+            },
+            server_name: settings.server_name,
+            doh_path: settings.doh_path,
+            bootstrap_ips: settings
+                .bootstrap_ips
+                .iter()
+                .map(|value| {
+                    value.parse::<IpAddr>().map_err(|_| {
+                        ControlServiceError::InvalidWarpDnsConfiguration {
+                            code: "WARP_DNS_BOOTSTRAP_INVALID",
+                            message: "WARP DNS bootstrap IP is invalid".to_owned(),
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            port: u16::try_from(settings.port).map_err(|_| {
+                ControlServiceError::InvalidWarpDnsConfiguration {
+                    code: "WARP_DNS_PORT_INVALID",
+                    message: "WARP DNS port exceeds 65535".to_owned(),
+                }
+            })?,
+        },
+    };
+    warp_dns.canonicalize();
 
     let mut profile = Profile {
+        chain_exit: source
+            .chain_exit
+            .map(chain_exit::settings_from_proto)
+            .transpose()?,
         id: parse_profile_id(&source.id)?,
         data_plane: data_plane::from_proto(source.data_plane)?,
         name: source.name,
@@ -4173,6 +4916,17 @@ fn profile_from_proto(source: v1::Profile) -> Result<Profile, ControlServiceErro
                 .map_err(ControlServiceError::configuration)?,
             port: u16::try_from(endpoint.port).map_err(ControlServiceError::configuration)?,
             sni: endpoint.sni,
+            selection: match v1::EndpointSelection::try_from(endpoint.selection) {
+                Ok(v1::EndpointSelection::Unspecified | v1::EndpointSelection::Custom) => {
+                    usque_core::EndpointSelection::Custom
+                }
+                Ok(v1::EndpointSelection::Automatic) => usque_core::EndpointSelection::Automatic,
+                Err(_) => {
+                    return Err(ControlServiceError::InvalidRequest(
+                        "unknown endpoint selection".to_owned(),
+                    ));
+                }
+            },
         },
         ip_policy: match source.ip_policy {
             value if value == v1::IpPolicy::Unspecified as i32 => IpPolicy::Auto,
@@ -4209,6 +4963,7 @@ fn profile_from_proto(source: v1::Profile) -> Result<Profile, ControlServiceErro
             })
             .collect::<Result<Vec<_>, _>>()?,
         allow_lan: source.allow_lan,
+        disable_quic: source.disable_quic,
         split_exclusions: source
             .split_exclusions
             .iter()
@@ -4265,7 +5020,11 @@ fn profile_from_proto(source: v1::Profile) -> Result<Profile, ControlServiceErro
             auth_password: None,
         },
         geo_direct_countries: source.geo_direct_countries,
+        bypass_domains: source.bypass_domains,
+        routing: routing::from_proto(source.routing)?,
         direct_dns,
+        warp_dns,
+        vpn_gate: vpngate::settings_from_proto(source.vpn_gate)?,
     };
     profile.canonicalize_mode();
     profile
@@ -4290,6 +5049,11 @@ fn parse_listeners(values: &[String]) -> Result<Vec<SocketAddr>, ControlServiceE
 
 pub(crate) fn profile_to_proto(profile: &Profile) -> v1::Profile {
     v1::Profile {
+        chain_exit: profile
+            .chain_exit
+            .as_ref()
+            .map(chain_exit::settings_to_proto),
+        vpn_gate: Some(vpngate::settings_to_proto(&profile.vpn_gate)),
         data_plane: data_plane::to_proto(profile.data_plane),
         congestion_control: congestion::to_proto(profile.congestion_control),
         id: profile.id.to_string(),
@@ -4309,6 +5073,10 @@ pub(crate) fn profile_to_proto(profile: &Profile) -> v1::Profile {
             ipv6: profile.endpoint.ipv6.to_string(),
             port: u32::from(profile.endpoint.port),
             sni: profile.endpoint.sni.clone(),
+            selection: match profile.endpoint.selection {
+                usque_core::EndpointSelection::Automatic => v1::EndpointSelection::Automatic as i32,
+                usque_core::EndpointSelection::Custom => v1::EndpointSelection::Custom as i32,
+            },
         }),
         ip_policy: match profile.ip_policy {
             IpPolicy::Auto => v1::IpPolicy::Auto as i32,
@@ -4324,6 +5092,7 @@ pub(crate) fn profile_to_proto(profile: &Profile) -> v1::Profile {
             .map(ToString::to_string)
             .collect(),
         allow_lan: profile.allow_lan,
+        disable_quic: profile.disable_quic,
         split_exclusions: profile
             .split_exclusions
             .iter()
@@ -4343,6 +5112,24 @@ pub(crate) fn profile_to_proto(profile: &Profile) -> v1::Profile {
             http: profile.frontends.http,
         }),
         geo_direct_countries: profile.geo_direct_countries.clone(),
+        bypass_domains: profile.bypass_domains.clone(),
+        routing: Some(routing::to_proto(&profile.routing)),
+        warp_dns: Some(v1::WarpDnsSettings {
+            mode: match profile.warp_dns.mode {
+                ConfigWarpDnsMode::Plain => v1::WarpDnsMode::Plain as i32,
+                ConfigWarpDnsMode::Doh => v1::WarpDnsMode::Doh as i32,
+                ConfigWarpDnsMode::Dot => v1::WarpDnsMode::Dot as i32,
+            },
+            server_name: profile.warp_dns.server_name.clone(),
+            doh_path: profile.warp_dns.doh_path.clone(),
+            bootstrap_ips: profile
+                .warp_dns
+                .bootstrap_ips
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            port: u32::from(profile.warp_dns.port),
+        }),
         direct_dns: Some(v1::DirectDnsSettings {
             mode: match profile.direct_dns.mode {
                 ConfigDirectDnsMode::PhysicalSystem => v1::DirectDnsMode::PhysicalSystem as i32,
@@ -4362,29 +5149,21 @@ pub(crate) fn profile_to_proto(profile: &Profile) -> v1::Profile {
     }
 }
 
-fn load_geo_direct_policy(profile: &Profile, cache_dir: &std::path::Path) -> GeoDirectPolicy {
-    if profile.geo_direct_countries.is_empty() {
-        return GeoDirectPolicy::disabled();
-    }
-    let countries = match profile
+fn load_geo_direct_policy(
+    profile: &Profile,
+    cache_dir: &std::path::Path,
+) -> Result<GeoDirectPolicy, ControlServiceError> {
+    let countries = profile
         .geo_direct_countries
         .iter()
         .map(|country| CountryCode::parse(country))
         .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(countries) => countries,
-        Err(error) => {
-            tracing::warn!(%error, "invalid GEO direct policy; using tunnel-only routing");
-            return GeoDirectPolicy::disabled();
-        }
-    };
-    match GeoDirectPolicy::load(cache_dir, countries) {
-        Ok(policy) => policy,
-        Err(error) => {
-            tracing::warn!(%error, "GEO rule cache could not be loaded; using tunnel-only routing");
-            GeoDirectPolicy::disabled()
-        }
-    }
+        .map_err(ControlServiceError::geo_rules)?;
+    GeoDirectPolicy::load(cache_dir, countries)
+        .map_err(ControlServiceError::geo_rules)?
+        .with_custom_rules(profile)
+        .map(|policy| policy.with_ads(cache_dir))
+        .map_err(ControlServiceError::configuration)
 }
 
 fn geo_results_to_proto(results: Vec<usque_core::GeoRulesUpdate>) -> v1::GeoRulesUpdateResults {
@@ -4421,6 +5200,11 @@ fn profile_list_to_proto(config: &AppConfig) -> v1::ProfileList {
             .map(|id| id.to_string())
             .unwrap_or_default(),
         identity_statuses: Vec::new(),
+        shared_network_profile: Some(Box::new(profile_to_proto(
+            &config
+                .network
+                .hydrate(&usque_core::config::Account::default_account()),
+        ))),
     }
 }
 
@@ -4454,6 +5238,23 @@ fn proxy_to_proto(proxy: &ProxySettings) -> v1::ProxySettings {
 
 fn current_capabilities() -> v1::Capabilities {
     v1::Capabilities {
+        chain_profile_import: cfg!(windows),
+        chain_openvpn_udp: cfg!(windows),
+        chain_wireguard: cfg!(windows) && cfg!(feature = "wireguard"),
+        chain_warp_wireguard: cfg!(windows) && cfg!(feature = "wireguard"),
+        chain_http_proxy: cfg!(windows),
+        chain_socks5_proxy: cfg!(windows),
+        chain_proxy_encrypted_dns: cfg!(windows),
+        custom_bypass: cfg!(windows),
+        automatic_endpoints: true,
+        zero_trust_endpoint_editing: true,
+        routing_rules: cfg!(windows),
+        chain_openvpn_multi_endpoint: cfg!(windows),
+        vpn_gate_tcp: true,
+        vpn_gate_pool_favorites: true,
+        application_quic_blocking: true,
+        account_metadata_mutations: true,
+        shared_proxy_auth_application: true,
         l4_tcp: true,
         l4_tun_tcp: cfg!(windows),
         l4_dns_conversion: true,
@@ -4483,6 +5284,7 @@ fn current_capabilities() -> v1::Capabilities {
         deep_diagnostics: true,
         network_quality: usque_transport::PRODUCTION_NETWORK_FEATURES.network_quality_metrics,
         encrypted_direct_dns: usque_transport::ENCRYPTED_DIRECT_DNS_ENABLED,
+        encrypted_warp_dns: usque_transport::ENCRYPTED_DIRECT_DNS_ENABLED,
         quic_migration: usque_transport::PRODUCTION_NETWORK_FEATURES.quic_migration,
         automatic_pmtu: usque_transport::PRODUCTION_NETWORK_FEATURES.automatic_pmtu,
     }
@@ -4490,6 +5292,9 @@ fn current_capabilities() -> v1::Capabilities {
 
 pub(crate) fn snapshot_to_proto(snapshot: &ConnectionSnapshot) -> v1::ConnectionSnapshot {
     v1::ConnectionSnapshot {
+        ads_rule_revision: snapshot.ads_rule_revision.clone(),
+        chain_exit: None,
+        vpn_gate: None,
         data_plane: snapshot
             .data_plane
             .map(data_plane::to_proto)
@@ -4634,14 +5439,8 @@ fn frontend_status_to_proto(status: &FrontendStatus) -> v1::FrontendStatus {
 fn exit_probe_for_session(
     profile: &Profile,
     runtime: &ActiveRuntime,
-    store_path: &std::path::Path,
     listener_auth: Option<&ProxyAuthCredentials>,
 ) -> Option<IpSbProbe> {
-    let flag_cache = store_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("cache")
-        .join("flag-icons-7.5.0");
     let loopback = runtime
         .listeners()
         .iter()
@@ -4650,15 +5449,11 @@ fn exit_probe_for_session(
     if profile.frontends.socks5 {
         loopback
             .and_then(|listener| IpSbProbe::through_socks_with_auth(listener, listener_auth).ok())
-            .map(|probe| probe.with_flag_cache(&flag_cache))
     } else if profile.frontends.http {
         loopback
             .and_then(|listener| IpSbProbe::through_http_with_auth(listener, listener_auth).ok())
-            .map(|probe| probe.with_flag_cache(&flag_cache))
     } else if profile.frontends.tunnel {
-        IpSbProbe::new()
-            .ok()
-            .map(|probe| probe.with_flag_cache(&flag_cache))
+        IpSbProbe::new().ok()
     } else {
         None
     }
@@ -4705,16 +5500,143 @@ fn location_to_proto(location: &usque_core::GeoLocation) -> v1::GeoLocation {
         country: location.country.clone().unwrap_or_default(),
         region: location.region.clone().unwrap_or_default(),
         city: location.city.clone().unwrap_or_default(),
-        flag_url: location.flag_url().unwrap_or_default(),
+        // Preserve the legacy wire field without advertising a remote asset.
+        flag_url: String::new(),
         flag_svg: location.flag_svg.clone().unwrap_or_default(),
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn terminal_transport_failure_is_consistent_in_snapshot_and_control_response() {
+        let error = ControlServiceError::Transport(TransportError::AllTransportsFailed {
+            h3: Box::new(
+                TransportError::TunnelClosed.failure(Some(usque_core::Transport::Http3), None),
+            ),
+            h2: Box::new(
+                TransportError::InvalidIdentity.failure(Some(usque_core::Transport::Http2), None),
+            ),
+        });
+        let response = error.as_structured_error();
+        assert_eq!(response.code, "IDENTITY_INVALID");
+        assert!(!response.retryable);
+        let snapshot = connection_error_for(&error);
+        assert_eq!(
+            snapshot.code,
+            usque_core::TransportFailureCode::IdentityInvalid.legacy_error_code()
+        );
+        assert!(!snapshot.retryable);
+    }
+
+    #[test]
+    fn omitted_false_profile_wire_fixture() {
+        let profile = v1::Profile {
+            id: "p".into(),
+            name: "X".into(),
+            kill_switch: false,
+            ..Default::default()
+        };
+        // Same minimal fixture is decoded by the Dart audit_accounts suite.
+        let frame = usque_ipc::encode_frame(&profile).unwrap();
+        assert_eq!(&frame[4..], &[10, 1, b'p', 18, 1, b'X']);
+    }
+
+    #[tokio::test]
+    async fn old_whole_profile_writes_cannot_clear_routing_but_explicit_empty_can() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ControlService::open_with_vault(
+            ConfigStore::new(directory.path().join("config.json")),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        service
+            .update_config(|config| {
+                config.network.routing.ads_enabled = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let profile = service.config_snapshot().await.active_profile().unwrap();
+        let mut old = profile_to_proto(&profile);
+        old.routing = None;
+        let result = service
+            .handle_payload(control_request::Payload::UpsertProfile(Box::new(
+                v1::UpsertProfileRequest { profile: Some(old) },
+            )))
+            .await;
+        assert!(result.is_err());
+        assert!(service.config_snapshot().await.network.routing.ads_enabled);
+        let mut cleared = profile;
+        cleared.routing = Default::default();
+        service
+            .handle_payload(control_request::Payload::UpsertProfile(Box::new(
+                v1::UpsertProfileRequest {
+                    profile: Some(profile_to_proto(&cleared)),
+                },
+            )))
+            .await
+            .unwrap();
+        assert!(!service.config_snapshot().await.network.routing.ads_enabled);
+    }
+
+    #[tokio::test]
+    async fn legacy_commit_rechecks_routing_after_a_concurrent_field_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ControlService::open_with_vault(
+            ConfigStore::new(directory.path().join("config.json")),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        let old = service.config_snapshot().await.active_profile().unwrap();
+        let mut wire = profile_to_proto(&old);
+        wire.routing = None;
+        let _lifecycle = service.mutation_lock.lock().await;
+        service.validate_client_routing(&wire).await.unwrap();
+        let mut modern = old.clone();
+        modern.routing.ads_enabled = true;
+        // This save must remain possible while the old lifecycle owns its lock.
+        service
+            .save_network_settings(v1::SaveNetworkSettingsRequest {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                account_id: old.id.to_string(),
+                values: Some(profile_to_proto(&modern)),
+                changed_fields: vec!["routing".into()],
+            })
+            .await
+            .unwrap();
+        let result = service.upsert_client_profile_locked(old, false).await;
+        assert!(result.is_err());
+        assert!(service.config_snapshot().await.network.routing.ads_enabled);
+        assert!(service.store.load().unwrap().network.routing.ads_enabled);
+    }
+
+    #[tokio::test]
+    async fn account_rename_does_not_replace_shared_network() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ControlService::open_with_vault(
+            ConfigStore::new(directory.path().join("config.json")),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        let before = service.config_snapshot().await;
+        let id = before.active_profile_id.unwrap();
+        service
+            .handle_payload(control_request::Payload::RenameProfile(
+                v1::RenameProfileRequest {
+                    profile_id: id.to_string(),
+                    name: "Renamed".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let after = service.config_snapshot().await;
+        assert_eq!(after.network, before.network);
+        assert_eq!(after.account(id).unwrap().name, "Renamed");
+    }
     use std::collections::HashMap;
 
-    #[cfg(windows)]
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -4725,6 +5647,35 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_disconnect_wait_retains_cleanup_for_the_next_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ControlService::open_with_vault(
+            ConfigStore::new(directory.path().join("config.json")),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *service.disconnect_cleanup.lock().await = Some(tokio::spawn(async move {
+            let _ = released.await;
+            Ok(())
+        }));
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            service.await_disconnect_cleanup(),
+        )
+        .await;
+        assert!(timed_out.is_err());
+        let retained = service.disconnect_cleanup.lock().await.is_some();
+        release.send(()).unwrap();
+        service.await_disconnect_cleanup().await.unwrap();
+        assert!(
+            retained,
+            "cancelled wait must keep ownership of unfinished cleanup"
+        );
+        assert!(service.disconnect_cleanup.lock().await.is_none());
+    }
 
     #[cfg(windows)]
     #[test]
@@ -5027,6 +5978,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipv4_only_gate_status_tracks_assignment_without_changing_family_availability() {
+        use usque_core::vpngate::{FinalNetworkParameters, GateStage, GateStatus};
+        let directory = tempfile::tempdir().unwrap();
+        let service = ControlService::open_with_vault(
+            ConfigStore::new(directory.path().join("config.json")),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        let profile = service.config_snapshot().await.active_profile().unwrap();
+        service
+            .install_test_session(profile, false, 0)
+            .await
+            .unwrap();
+        for (stage, ipv6, expected) in [
+            (GateStage::Connected, None, ConnectionPhase::Connected),
+            (GateStage::Disabled, None, ConnectionPhase::Degraded),
+            (GateStage::Connected, None, ConnectionPhase::Connected),
+            (
+                GateStage::Connected,
+                Some("fd00::2".parse().unwrap()),
+                ConnectionPhase::Degraded,
+            ),
+        ] {
+            {
+                let mut plane = service.data_plane.lock().await;
+                let ActiveRuntime::Harness(runtime) = &mut plane.as_mut().unwrap().runtime else {
+                    panic!("test requires a memory-only runtime");
+                };
+                runtime.path.ipv6_available = false;
+                runtime.gate_status = GateStatus {
+                    stage,
+                    network: Some(FinalNetworkParameters {
+                        ipv4: Some("10.8.0.2".parse().unwrap()),
+                        ipv6,
+                        dns_servers: Vec::new(),
+                        mtu: 1500,
+                    }),
+                    ..Default::default()
+                };
+            }
+            let snapshot = service.status_snapshot().await;
+            assert_eq!(snapshot.phase, expected);
+            assert!(snapshot.ipv4_available);
+            assert!(!snapshot.ipv6_available);
+            // Repeated snapshots must not restart the state timer.
+            assert_eq!(
+                service.status_snapshot().await.changed_at,
+                snapshot.changed_at
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn late_exit_probe_applies_only_while_the_same_session_is_up() {
         let directory = tempfile::tempdir().unwrap();
         let service = ControlService::open_with_vault(
@@ -5197,7 +6201,7 @@ mod tests {
         }
     }
 
-    fn test_identity(provider: IdentityProvider, license: Option<&str>) -> WarpIdentity {
+    pub(crate) fn test_identity(provider: IdentityProvider, license: Option<&str>) -> WarpIdentity {
         let entitlement = match provider {
             IdentityProvider::ZeroTrust { .. } => None,
             IdentityProvider::Consumer if license.is_some() => Some(ConsumerEntitlement::WarpPlus),
@@ -5477,6 +6481,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_profile_api_rejects_an_unpinned_gate_reference_without_persisting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let service =
+            ControlService::open_with_vault(store.clone(), Arc::new(MemoryVault::default()))
+                .unwrap();
+        let before = service.config_snapshot().await;
+        let mut profile = before.active_profile().unwrap();
+        profile.vpn_gate = usque_core::vpngate::VpnGateSettings {
+            enabled: true,
+            selection: Some(usque_core::vpngate::Selection {
+                server_id: format!("v1:{}", "0".repeat(64)),
+                config_sha256: "1".repeat(64),
+            }),
+        };
+        assert!(matches!(
+            service.upsert_profile(profile).await,
+            Err(ControlServiceError::VpnGate(
+                usque_core::vpngate::DirectoryError::StaleSelection
+            ))
+        ));
+        assert_eq!(
+            service.config_snapshot().await.network.vpn_gate,
+            before.network.vpn_gate
+        );
+        assert_eq!(
+            store.load_or_default().unwrap().network.vpn_gate,
+            before.network.vpn_gate
+        );
+    }
+
+    #[tokio::test]
     async fn profile_crud_is_persisted_atomically() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = ConfigStore::new(directory.path().join("config.json"));
@@ -5626,6 +6662,7 @@ mod tests {
                 ipv6: "2606:4700:102::2".parse().unwrap(),
                 port: 443,
                 sni: usque_core::ZERO_TRUST_SNI.to_owned(),
+                selection: usque_core::EndpointSelection::Custom,
             },
             ..Profile::default()
         };
@@ -5715,6 +6752,74 @@ mod tests {
             status.network_quality.as_ref().map(|quality| quality.level),
             Some(v1::NetworkQualityLevel::Disconnected as i32)
         );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_start_cannot_publish_an_old_capture_during_data_reset() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Arc::new(
+            ControlService::open_with_vault(
+                ConfigStore::new(directory.path().join("config.json")),
+                Arc::new(MemoryVault::default()),
+            )
+            .unwrap(),
+        );
+        let started = service
+            .handle(request(
+                "before-reset",
+                control_request::Payload::StartDiagnostics(v1::StartDiagnosticsRequest {
+                    mode: v1::DiagnosticMode::Standard as i32,
+                }),
+            ))
+            .await;
+        assert!(started.error.is_none());
+        let submission = service.settings_submission.lock().await;
+        let clearing_service = Arc::clone(&service);
+        let clearing = tokio::spawn(async move { clearing_service.clear_all_data(true).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while service.diagnostics.get().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Clear has retired the old worker, but cannot reset configuration or
+        // logs until this inert test releases the submission gate.
+        let starting_service = Arc::clone(&service);
+        let mut starting = tokio::spawn(async move {
+            starting_service
+                .handle(request(
+                    "during-reset",
+                    control_request::Payload::StartDiagnostics(v1::StartDiagnosticsRequest {
+                        mode: v1::DiagnosticMode::Standard as i32,
+                    }),
+                ))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut starting)
+                .await
+                .is_err()
+        );
+        assert!(service.diagnostics.get().await.is_none());
+        drop(submission);
+        clearing.await.unwrap().unwrap();
+        let response = starting.await.unwrap();
+        assert!(response.error.is_none());
+        let Some(control_response::Payload::Diagnostics(session)) = response.payload else {
+            panic!("diagnostics response");
+        };
+        assert_eq!(
+            service
+                .diagnostics
+                .get()
+                .await
+                .unwrap()
+                .session_id
+                .to_string(),
+            session.session_id
+        );
+        service.diagnostics.clear().await;
     }
 
     #[tokio::test]
@@ -6052,6 +7157,88 @@ mod tests {
             upsert.error.as_ref().map(|error| error.code.as_str()),
             Some("INVALID_ARGUMENT")
         );
+    }
+
+    #[test]
+    fn encrypted_warp_dns_appends_profile_and_capability_wire_fields() {
+        let profile = v1::Profile {
+            warp_dns: Some(v1::WarpDnsSettings {
+                mode: v1::WarpDnsMode::Dot as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let frame = usque_ipc::encode_frame(&profile).unwrap();
+        assert_eq!(&frame[4..], &[0xc2, 0x01, 0x02, 0x08, 0x03]);
+        let capabilities = v1::Capabilities {
+            encrypted_warp_dns: true,
+            ..Default::default()
+        };
+        let frame = usque_ipc::encode_frame(&capabilities).unwrap();
+        assert_eq!(&frame[4..], &[0xe0, 0x02, 0x01]);
+    }
+
+    #[test]
+    fn warp_dns_proto_roundtrip_and_legacy_default() {
+        for mode in [ConfigWarpDnsMode::Doh, ConfigWarpDnsMode::Dot] {
+            let mut profile = Profile {
+                warp_dns: WarpDnsSettings {
+                    mode,
+                    server_name: "DNS.Example.COM".into(),
+                    bootstrap_ips: vec!["192.0.2.53".parse().unwrap()],
+                    ..Default::default()
+                },
+                ..Profile::default()
+            };
+            profile.canonicalize_warp_dns();
+            let decoded = profile_from_proto(profile_to_proto(&profile)).unwrap();
+            assert_eq!(decoded.warp_dns, profile.warp_dns);
+            assert_eq!(decoded.dns_servers, profile.dns_servers);
+        }
+        let mut legacy = profile_to_proto(&Profile::default());
+        legacy.warp_dns = None;
+        assert_eq!(
+            profile_from_proto(legacy).unwrap().warp_dns,
+            WarpDnsSettings::default()
+        );
+        assert!(current_capabilities().encrypted_warp_dns);
+    }
+
+    #[test]
+    fn invalid_warp_dns_proto_uses_stable_codes_without_disclosing_server_fields() {
+        let valid = v1::WarpDnsSettings {
+            mode: v1::WarpDnsMode::Doh as i32,
+            server_name: "dns.private.example".into(),
+            doh_path: "/private-query".into(),
+            bootstrap_ips: vec!["192.0.2.53".into()],
+            port: 443,
+        };
+        let mut cases = Vec::new();
+        let mut settings = valid.clone();
+        settings.mode = 99;
+        cases.push((settings, "WARP_DNS_MODE_INVALID"));
+        let mut settings = valid.clone();
+        settings.bootstrap_ips = vec!["invalid".into()];
+        cases.push((settings, "WARP_DNS_BOOTSTRAP_INVALID"));
+        let mut settings = valid.clone();
+        settings.port = 65536;
+        cases.push((settings, "WARP_DNS_PORT_INVALID"));
+        let mut settings = valid.clone();
+        settings.server_name = "https://dns.private.example".into();
+        cases.push((settings, "WARP_DNS_SERVER_NAME_INVALID"));
+        let mut settings = valid;
+        settings.mode = v1::WarpDnsMode::Dot as i32;
+        cases.push((settings, "WARP_DNS_DOT_PATH_FORBIDDEN"));
+        for (settings, code) in cases {
+            let mut wire = profile_to_proto(&Profile::default());
+            wire.warp_dns = Some(settings);
+            let error = profile_from_proto(wire).unwrap_err().as_structured_error();
+            assert_eq!(error.code, code);
+            assert!(!error.message.contains("dns.private.example"));
+            assert!(!error.message.contains("private-query"));
+            assert!(!error.message.contains("192.0.2.53"));
+            assert!(!error.retryable);
+        }
     }
 
     #[test]
@@ -6849,6 +8036,7 @@ mod tests {
             ipv6: "2606:4700:102::8".parse().unwrap(),
             port: 443,
             sni: usque_core::ZERO_TRUST_SNI.to_owned(),
+            selection: usque_core::EndpointSelection::Custom,
         };
         service
             .update_config(move |latest| {
@@ -7016,6 +8204,19 @@ mod tests {
         assert_eq!(stored.endpoint.port, 8443);
         assert_eq!(stored.endpoint.sni, "shared.example.com");
 
+        service
+            .update_config(move |latest| {
+                latest
+                    .account_mut(profile_id)
+                    .unwrap()
+                    .zero_trust_endpoint_override = Some(ManagedEndpointIps {
+                    ipv4: "192.0.2.45".parse().unwrap(),
+                    ipv6: "2001:db8::45".parse().unwrap(),
+                });
+                Ok(())
+            })
+            .await
+            .unwrap();
         vault.delete_identity(profile_id).await.unwrap();
         let metadata = provider.to_metadata_json().unwrap();
         vault
@@ -7039,6 +8240,15 @@ mod tests {
         assert_eq!(repaired.endpoint.ipv6, repaired_ips.ipv6);
         assert_eq!(repaired.endpoint.port, 8443);
         assert_eq!(repaired.endpoint.sni, "shared.example.com");
+        assert!(
+            service
+                .config_snapshot()
+                .await
+                .account(profile_id)
+                .unwrap()
+                .zero_trust_endpoint_override
+                .is_none()
+        );
 
         let cross_team = service
             .provision_identity(v1::ProvisionIdentityRequest {
@@ -7122,11 +8332,19 @@ mod tests {
             ipv4: "162.159.197.8".parse().unwrap(),
             ipv6: "2606:4700:102::8".parse().unwrap(),
         };
+        let old_override = ManagedEndpointIps {
+            ipv4: "192.0.2.45".parse().unwrap(),
+            ipv6: "2001:db8::45".parse().unwrap(),
+        };
         let mut interrupted = service.config_snapshot().await;
         interrupted.identity_bindings.insert(profile_id, provider);
         interrupted
             .set_managed_endpoint_ips(profile_id, old_ips.clone())
             .unwrap();
+        interrupted
+            .account_mut(profile_id)
+            .unwrap()
+            .zero_trust_endpoint_override = Some(old_override.clone());
         interrupted.pending_identity_replacements.insert(
             profile_id,
             PendingIdentityReplacement {
@@ -7161,8 +8379,12 @@ mod tests {
         assert!(recovered.pending_identity_replacements.is_empty());
         assert!(recovered.pending_identity_local_deletions.is_empty());
         let endpoint = recovered.active_profile().unwrap().endpoint;
-        assert_eq!(endpoint.ipv4, old_ips.ipv4);
-        assert_eq!(endpoint.ipv6, old_ips.ipv6);
+        assert_eq!(endpoint.ipv4, old_override.ipv4);
+        assert_eq!(endpoint.ipv6, old_override.ipv6);
+        assert_eq!(
+            recovered.account(profile_id).unwrap().managed_endpoint_ips,
+            Some(old_ips)
+        );
     }
 
     #[tokio::test]
@@ -7358,6 +8580,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_proxy_rotation_updates_the_live_session_without_rewriting_other_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ControlService::open_with_vault(
+            ConfigStore::new(directory.path().join("config.json")),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        let profile = service.config_snapshot().await.active_profile().unwrap();
+        service
+            .install_test_session(profile.clone(), false, 3)
+            .await
+            .unwrap();
+        for password in [b"old".to_vec(), b"new".to_vec()] {
+            service
+                .update_proxy_auth(v1::UpdateProxyAuthRequest {
+                    profile_id: profile.id.to_string(),
+                    username: "user".into(),
+                    password: password.clone(),
+                    confirmed: true,
+                })
+                .await
+                .unwrap();
+            let active = service.data_plane.lock().await;
+            let active = active.as_ref().unwrap();
+            assert_eq!(
+                active
+                    .profile
+                    .proxy
+                    .auth_password
+                    .as_deref()
+                    .unwrap()
+                    .as_slice(),
+                password
+            );
+            assert_eq!(active.profile.mtu, profile.mtu);
+            assert_eq!(
+                active.profile.proxy.socks5_listeners,
+                profile.proxy.socks5_listeners
+            );
+        }
+        let state = service.network_settings_state().await;
+        assert!(!format!("{state:?}").contains("password"));
+    }
+
+    #[tokio::test]
+    async fn conflicting_legacy_passwords_are_not_arbitrarily_selected() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Arc::new(MemoryVault::default());
+        let service = ControlService::open_with_vault(
+            ConfigStore::new(directory.path().join("config.json")),
+            Arc::clone(&vault) as Arc<dyn SecretVault>,
+        )
+        .unwrap();
+        let a = service.config_snapshot().await.active_profile().unwrap();
+        let b = Profile {
+            id: Uuid::new_v4(),
+            name: "B".into(),
+            ..a.clone()
+        };
+        service.upsert_profile(b.clone()).await.unwrap();
+        vault
+            .put(a.id, SecretRecord::ProxyPassword, b"a")
+            .await
+            .unwrap();
+        vault
+            .put(b.id, SecretRecord::ProxyPassword, b"b")
+            .await
+            .unwrap();
+        assert!(service.migrate_shared_proxy_password().await.is_err());
+        assert!(
+            vault
+                .get(SHARED_NETWORK_SECRET_ID, SecretRecord::ProxyPassword)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            vault
+                .get(a.id, SecretRecord::ProxyPassword)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        service
+            .update_proxy_auth(v1::UpdateProxyAuthRequest {
+                profile_id: a.id.to_string(),
+                username: "user".into(),
+                password: b"replacement".to_vec(),
+                confirmed: true,
+            })
+            .await
+            .unwrap();
+        assert!(
+            vault
+                .get(a.id, SecretRecord::ProxyPassword)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            vault
+                .get(b.id, SecretRecord::ProxyPassword)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_per_profile_proxy_password_moves_to_the_shared_slot() {
         let directory = tempfile::tempdir().expect("tempdir");
         let vault = Arc::new(MemoryVault::default());
@@ -7466,6 +8797,7 @@ mod tests {
             ipv6: "2001:db8::1".parse().unwrap(),
             port: 8443,
             sni: "shared.example.com".to_owned(),
+            selection: usque_core::EndpointSelection::Custom,
         };
         let managed = ManagedEndpointIps {
             ipv4: "162.159.197.8".parse().unwrap(),
@@ -7546,6 +8878,36 @@ mod tests {
             snapshot_to_proto(&ConnectionSnapshot::default()).session_congestion_control,
             0
         );
+    }
+
+    #[test]
+    fn endpoint_selection_wire_roundtrip_legacy_and_unknown() {
+        for selection in [
+            usque_core::EndpointSelection::Automatic,
+            usque_core::EndpointSelection::Custom,
+        ] {
+            let mut profile = Profile::default();
+            profile.endpoint.selection = selection;
+            assert_eq!(
+                profile_from_proto(profile_to_proto(&profile))
+                    .unwrap()
+                    .endpoint
+                    .selection,
+                selection
+            );
+        }
+        let mut legacy = profile_to_proto(&Profile::default());
+        legacy.endpoint.as_mut().unwrap().selection = 0;
+        assert_eq!(
+            profile_from_proto(legacy.clone())
+                .unwrap()
+                .endpoint
+                .selection,
+            usque_core::EndpointSelection::Custom
+        );
+        legacy.endpoint.as_mut().unwrap().selection = 99;
+        assert!(profile_from_proto(legacy).is_err());
+        assert!(current_capabilities().automatic_endpoints);
     }
 
     #[tokio::test]
@@ -7663,7 +9025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconfigure_active_profile_keeps_masque_for_socks_http_and_tunnel_flips() {
+    async fn reconfigure_active_profile_keeps_custom_masque_for_socks_http_and_tunnel_flips() {
         let directory = tempfile::tempdir().unwrap();
         let service = ControlService::open_with_vault(
             ConfigStore::new(directory.path().join("config.json")),
@@ -7671,6 +9033,7 @@ mod tests {
         )
         .unwrap();
         let mut profile = service.config_snapshot().await.active_profile().unwrap();
+        profile.endpoint.selection = usque_core::EndpointSelection::Custom;
         profile.frontends = FrontendSettings {
             tunnel: true,
             socks5: true,
@@ -7838,6 +9201,216 @@ mod tests {
             .active_profile()
             .unwrap();
         assert!(!persisted.frontends.tunnel);
+    }
+
+    #[tokio::test]
+    async fn connecting_an_existing_session_refreshes_its_failed_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ControlService::open_with_vault(
+            ConfigStore::new(directory.path().join("config.json")),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        let profile = service.config_snapshot().await.active_profile().unwrap();
+        service
+            .install_test_session(profile.clone(), false, 0)
+            .await
+            .unwrap();
+        {
+            let mut data_plane = service.data_plane.lock().await;
+            let ActiveRuntime::Harness(runtime) = &mut data_plane.as_mut().unwrap().runtime else {
+                panic!("harness");
+            };
+            runtime.gate_status.failure = Some(usque_core::vpngate::GateFailure::Transport);
+        }
+        assert_eq!(
+            service.state.lock().await.snapshot().phase,
+            ConnectionPhase::Connected
+        );
+        let snapshot = service.connect_locked(profile.id).await.unwrap();
+        assert_eq!(snapshot.phase, ConnectionPhase::Error);
+        assert!(
+            snapshot
+                .frontends
+                .iter()
+                .all(|frontend| { frontend.phase != usque_core::FrontendPhase::Active })
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_hot_proxy_changes_restore_the_confirmed_runtime() {
+        for change_listener in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = ControlService::open_with_vault(
+                ConfigStore::new(directory.path().join("config.json")),
+                Arc::new(MemoryVault::default()),
+            )
+            .unwrap();
+            let mut profile = service.config_snapshot().await.active_profile().unwrap();
+            profile.frontends.tunnel = false;
+            profile.mode = OperatingMode::Socks5;
+            profile.frontends.http = true;
+            profile.proxy.system_proxy = true;
+            service
+                .install_test_session(profile.clone(), false, 5)
+                .await
+                .unwrap();
+            {
+                let mut data_plane = service.data_plane.lock().await;
+                let ActiveRuntime::Harness(runtime) = &mut data_plane.as_mut().unwrap().runtime
+                else {
+                    panic!("harness");
+                };
+                runtime.system_proxy_failures = 1;
+            }
+            let mut target = profile.clone();
+            if change_listener {
+                target.proxy.http_listeners[0].set_port(18081);
+            } else {
+                target.proxy.system_proxy = false;
+            }
+            assert!(service.reconfigure_active_profile(target).await.is_err());
+            let active = service.data_plane.lock().await;
+            let active = active.as_ref().expect("rollback preserves the session");
+            assert_eq!(active.profile, profile);
+            assert_eq!(active.frontends, profile.frontends);
+            assert!(
+                active
+                    .runtime
+                    .listeners()
+                    .contains(&profile.proxy.http_listeners[0])
+            );
+            assert!(matches!(
+                active.runtime.health(),
+                RuntimeHealth::Connected { .. }
+            ));
+            let proxy = active
+                .runtime
+                .frontend_statuses(active.frontends)
+                .into_iter()
+                .find(|status| status.kind == FrontendKind::SystemProxy)
+                .unwrap();
+            assert_eq!(proxy.phase, usque_core::FrontendPhase::Active);
+            let ActiveRuntime::Harness(runtime) = &active.runtime else {
+                panic!("harness");
+            };
+            assert_eq!(runtime.system_proxy_apply_count, 2);
+            assert_eq!(
+                service.config_snapshot().await.active_profile().unwrap(),
+                profile
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_hot_proxy_rollback_stops_the_session_and_keeps_the_first_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ControlService::open_with_vault(
+            ConfigStore::new(directory.path().join("config.json")),
+            Arc::new(MemoryVault::default()),
+        )
+        .unwrap();
+        let mut profile = service.config_snapshot().await.active_profile().unwrap();
+        profile.frontends.tunnel = false;
+        profile.mode = OperatingMode::Socks5;
+        profile.frontends.http = true;
+        profile.proxy.system_proxy = true;
+        service
+            .install_test_session(profile.clone(), false, 0)
+            .await
+            .unwrap();
+        {
+            let mut data_plane = service.data_plane.lock().await;
+            let ActiveRuntime::Harness(runtime) = &mut data_plane.as_mut().unwrap().runtime else {
+                panic!("harness");
+            };
+            runtime.system_proxy_failures = 2;
+        }
+        let mut target = profile.clone();
+        target.proxy.http_listeners[0].set_port(18081);
+        let error = service
+            .reconfigure_active_profile(target)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected system proxy apply failure")
+        );
+        assert!(service.data_plane.lock().await.is_none());
+        assert_eq!(
+            service.state.lock().await.snapshot().phase,
+            ConnectionPhase::Error
+        );
+        service.await_disconnect_cleanup().await.unwrap();
+        assert_eq!(
+            service.config_snapshot().await.active_profile().unwrap(),
+            profile
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_custom_vpn_attach_restores_the_standalone_proxy_or_stops_on_rollback_failure() {
+        for rollback_fails in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = ControlService::open_with_vault(
+                ConfigStore::new(directory.path().join("config.json")),
+                Arc::new(MemoryVault::default()),
+            )
+            .unwrap();
+            let mut profile = service.config_snapshot().await.active_profile().unwrap();
+            profile.endpoint.selection = usque_core::EndpointSelection::Custom;
+            profile.frontends.tunnel = false;
+            profile.mode = OperatingMode::Socks5;
+            profile.frontends.http = true;
+            profile.proxy.system_proxy = true;
+            service
+                .install_test_session(profile.clone(), false, 0)
+                .await
+                .unwrap();
+            {
+                let mut data_plane = service.data_plane.lock().await;
+                let ActiveRuntime::Harness(runtime) = &mut data_plane.as_mut().unwrap().runtime
+                else {
+                    panic!("harness");
+                };
+                runtime.fail_attach = true;
+                runtime.system_proxy_failures = u32::from(rollback_fails);
+            }
+            let mut target = profile.clone();
+            target.frontends.tunnel = true;
+            target.mode = OperatingMode::Vpn;
+            let error = service
+                .reconfigure_active_profile(target)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("injected VPN attach failure"));
+            let data_plane = service.data_plane.lock().await;
+            if rollback_fails {
+                assert!(data_plane.is_none());
+                assert_eq!(
+                    service.state.lock().await.snapshot().phase,
+                    ConnectionPhase::Error
+                );
+            } else {
+                let active = data_plane.as_ref().expect("restored proxy session");
+                assert!(!active.runtime.is_vpn());
+                assert_eq!(active.profile, profile);
+                let proxy = active
+                    .runtime
+                    .frontend_statuses(active.frontends)
+                    .into_iter()
+                    .find(|status| status.kind == FrontendKind::SystemProxy)
+                    .unwrap();
+                assert_eq!(proxy.phase, usque_core::FrontendPhase::Active);
+            }
+            drop(data_plane);
+            service.await_disconnect_cleanup().await.unwrap();
+            assert_eq!(
+                service.config_snapshot().await.active_profile().unwrap(),
+                profile
+            );
+        }
     }
 
     fn request(id: &str, payload: control_request::Payload) -> ControlRequest {

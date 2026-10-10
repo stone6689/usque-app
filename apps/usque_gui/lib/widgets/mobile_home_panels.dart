@@ -3,21 +3,12 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../core/usque_theme.dart';
 import '../models/app_models.dart';
-import '../screens/diagnostics_screen.dart';
-import '../screens/network_quality_screen.dart';
 import '../state/app_controller.dart';
 import 'common.dart';
 import 'controller_selector.dart';
+import 'country_flag.dart';
 import 'live_duration.dart';
 import 'sparkline.dart';
-
-/// Shared appearance for the home shortcuts; each layout controls their width.
-ButtonStyle homeToolButtonStyle(BuildContext context) =>
-    OutlinedButton.styleFrom(
-      minimumSize: const Size(0, 48),
-      padding: const EdgeInsets.all(10),
-      foregroundColor: Theme.of(context).colorScheme.onSurface,
-    );
 
 /// Share a small, bounded amount of breathing room across the home sections on
 /// tall phones. Large text and short viewports keep the compact spacing.
@@ -40,6 +31,11 @@ String homeTrafficNoteKey(
       ? 'home_traffic_unavailable'
       : quality.paused
       ? 'nq_paused'
+      // A known outage or an expired reading is not an empty start-up window.
+      : !hasSamples &&
+            (quality.streamUnavailable ||
+                (quality.latest != null && quality.stale))
+      ? 'home_traffic_stale'
       : !hasSamples
       ? 'home_traffic_waiting'
       : quality.stale
@@ -115,11 +111,11 @@ class MobileTrafficPanel extends StatelessWidget {
                     ? (download ? down : up)
                     : const <int?>[];
                 final label = strings.get(download ? 'download' : 'upload');
-                final rate = connected
+                final int? rate = connected
                     ? (download
                           ? snapshot.downloadBytesPerSecond
                           : snapshot.uploadBytesPerSecond)
-                    : 0;
+                    : null;
                 final color = download ? tokens.inbound : tokens.outbound;
                 final present = samples.whereType<int>().toList(
                   growable: false,
@@ -153,11 +149,16 @@ class MobileTrafficPanel extends StatelessWidget {
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      formatRate(rate),
-                      style: UsqueTheme.mono(
+                      rate == null ? '—' : formatRate(rate),
+                      key: ValueKey(
+                        download ? 'home-download-rate' : 'home-upload-rate',
+                      ),
+                      style: UsqueTheme.readout(
                         context,
-                        size: 18,
-                        weight: FontWeight.w500,
+                        size: 19,
+                        color: rate == null
+                            ? theme.colorScheme.onSurfaceVariant
+                            : null,
                       ),
                     ),
                     const SizedBox(height: 8),
@@ -209,7 +210,6 @@ typedef _OverviewView = ({
   ExitInfo exit,
   FrontendSettings outputs,
   bool systemProxy,
-  bool quality,
 });
 
 class MobileConnectionOverview extends StatelessWidget {
@@ -234,7 +234,6 @@ class MobileConnectionOverview extends StatelessWidget {
       exit: app.snapshot.exit,
       outputs: app.activeProfile.frontends,
       systemProxy: app.activeProfile.proxy.systemProxy,
-      quality: app.engineCapabilities?.networkQuality ?? false,
     ),
     builder: (context, view) => _buildPanel(context, view),
   );
@@ -282,11 +281,22 @@ class MobileConnectionOverview extends StatelessWidget {
                               child: Tooltip(
                                 message:
                                     location ?? strings.get('not_available'),
-                                child: Text(
-                                  location ?? strings.get('not_available'),
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.titleSmall,
+                                child: Row(
+                                  children: [
+                                    CountryFlag(
+                                      countryCode: view.exit.countryCode,
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: Text(
+                                        location ??
+                                            strings.get('not_available'),
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: theme.textTheme.titleSmall,
+                                      ),
+                                    ),
+                                  ],
                                 ),
                               ),
                             ),
@@ -345,50 +355,6 @@ class MobileConnectionOverview extends StatelessWidget {
                   ),
           ),
           const SizedBox(height: 12),
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final style = homeToolButtonStyle(context);
-              final quality = OutlinedButton.icon(
-                key: const ValueKey('home-network-quality'),
-                style: style,
-                onPressed: () => Navigator.of(context).push(
-                  MaterialPageRoute<void>(
-                    builder: (_) =>
-                        NetworkQualityScreen(controller: controller),
-                  ),
-                ),
-                icon: const Icon(LucideIcons.gauge, size: 16),
-                label: Text(strings.get('network_quality')),
-              );
-              final diagnostics = OutlinedButton.icon(
-                key: const ValueKey('home-diagnostics'),
-                style: style,
-                onPressed: () => Navigator.of(context).push(
-                  MaterialPageRoute<void>(
-                    builder: (_) => DiagnosticsScreen(controller: controller),
-                  ),
-                ),
-                icon: const Icon(LucideIcons.activity, size: 16),
-                label: Text(strings.get('diagnostics')),
-              );
-              if (!view.quality) return diagnostics;
-              if (constraints.maxWidth < 280 ||
-                  MediaQuery.textScalerOf(context).scale(14) > 21) {
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [quality, const SizedBox(height: 8), diagnostics],
-                );
-              }
-              return Row(
-                children: [
-                  Expanded(child: quality),
-                  const SizedBox(width: 8),
-                  Expanded(child: diagnostics),
-                ],
-              );
-            },
-          ),
-          const SizedBox(height: 4),
           details,
         ],
       ),

@@ -12,8 +12,11 @@
 #include "engine_ipc.h"
 #include "maintenance_shutdown.h"
 #include "window_geometry.h"
+#include "window_placement.h"
 #include "zero_trust_callback.h"
 #include "zero_trust_protocol.h"
+
+int RunShellIntegrationTests();
 
 namespace {
 
@@ -37,9 +40,9 @@ void initialWindowStaysWithinMonitorWorkArea() {
              high_dpi.right == 1512 && high_dpi.bottom == 1032,
          "windowBounds.scaledHeightFitsAboveTaskbar");
 
-  const RECT small_monitor = usque::FitWindowBounds(desired, {0, 0, 1024, 728});
+  const RECT small_monitor = usque::FitWindowBounds(desired, {0, 0, 800, 600});
   Expect(small_monitor.left == 0 && small_monitor.top == 0 &&
-             small_monitor.right == 1024 && small_monitor.bottom == 728,
+             small_monitor.right == 800 && small_monitor.bottom == 600,
          "windowBounds.smallMonitorClampsBothDimensions");
 
   const RECT secondary =
@@ -56,6 +59,77 @@ void initialWindowStaysWithinMonitorWorkArea() {
 
   const RECT unavailable = usque::FitWindowBounds(desired, {0, 0, 0, 0});
   Expect(::EqualRect(&desired, &unavailable), "windowBounds.invalidWorkAreaFallback");
+}
+
+void firstLaunchCentresAndRestoreRescales() {
+  const RECT centred = usque::CenterWindowBounds(
+      usque::kDefaultWindowWidth, usque::kDefaultWindowHeight,
+      {0, 0, 1920, 1032});
+  Expect(centred.left == 450 && centred.top == 152 && centred.right == 1470 &&
+             centred.bottom == 880,
+         "windowBounds.centredOnWorkArea");
+  const RECT secondary =
+      usque::CenterWindowBounds(usque::kDefaultWindowWidth,
+                                usque::kDefaultWindowHeight,
+                                {-1920, 40, 0, 1040});
+  Expect(secondary.left == -1470 && secondary.top == 176,
+         "windowBounds.centredOnNegativeMonitor");
+  const RECT oversized = usque::CenterWindowBounds(2000, 1200, {0, 0, 1024, 728});
+  Expect(oversized.left == 0 && oversized.top == 0 && oversized.right == 1024 &&
+             oversized.bottom == 728,
+         "windowBounds.centredClampsToWorkArea");
+
+  const RECT same =
+      usque::RestoreWindowBounds({100, 80, 1300, 920}, 96, 96, {0, 0, 1920, 1032});
+  Expect(same.left == 100 && same.top == 80 && same.right == 1300 &&
+             same.bottom == 920,
+         "windowBounds.restoreKeepsSavedFrame");
+  const RECT scaled = usque::RestoreWindowBounds({100, 80, 1300, 920}, 96, 144,
+                                                 {0, 0, 2560, 1400});
+  Expect(scaled.left == 100 && scaled.top == 80 && scaled.right == 1900 &&
+             scaled.bottom == 1340,
+         "windowBounds.restoreKeepsLogicalSizeAcrossDpi");
+  const RECT moved = usque::RestoreWindowBounds({1500, 900, 2700, 1740}, 96, 96,
+                                                {0, 0, 1920, 1032});
+  Expect(moved.left == 720 && moved.top == 192 && moved.right == 1920 &&
+             moved.bottom == 1032,
+         "windowBounds.restorePullsFrameIntoWorkArea");
+}
+
+void windowPlacementRoundTripsAndRejectsForeignValues() {
+  const std::wstring key =
+      L"Software\\io.github.georgexie2333\\Usque\\placement-test-" +
+      std::to_wstring(::GetCurrentProcessId());
+  Expect(!usque::ReadWindowPlacement(HKEY_CURRENT_USER, key.c_str()),
+         "windowPlacement.missing");
+
+  usque::WindowPlacement saved;
+  saved.bounds = {-1800, 60, -400, 1000};
+  saved.dpi = 144;
+  saved.maximized = true;
+  Expect(usque::WriteWindowPlacement(HKEY_CURRENT_USER, key.c_str(), saved),
+         "windowPlacement.write");
+  const auto restored = usque::ReadWindowPlacement(HKEY_CURRENT_USER, key.c_str());
+  Expect(restored.has_value() && ::EqualRect(&restored->bounds, &saved.bounds) &&
+             restored->dpi == 144 && restored->maximized,
+         "windowPlacement.roundTrip");
+
+  usque::WindowPlacement degenerate;
+  degenerate.bounds = {0, 0, 10, 10};
+  Expect(!usque::WriteWindowPlacement(HKEY_CURRENT_USER, key.c_str(), degenerate),
+         "windowPlacement.rejectsDegenerateWrite");
+
+  HKEY handle = nullptr;
+  if (::RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_SET_VALUE,
+                      &handle) == ERROR_SUCCESS) {
+    const DWORD foreign = 1;
+    ::RegSetValueExW(handle, L"WindowPlacement", 0, REG_BINARY,
+                     reinterpret_cast<const BYTE*>(&foreign), sizeof(foreign));
+    ::RegCloseKey(handle);
+  }
+  Expect(!usque::ReadWindowPlacement(HKEY_CURRENT_USER, key.c_str()),
+         "windowPlacement.rejectsForeignValue");
+  ::RegDeleteTreeW(HKEY_CURRENT_USER, key.c_str());
 }
 
 void matchingCallbackIsConsumedOnlyOnce() {
@@ -168,6 +242,81 @@ void unregisterDeletesOnlyAssociationPointingAtThisExe() {
   Expect(!WarpProtocolAssociationPointsAtExe(HKEY_CURRENT_USER, key, other),
          "unregisterDeletesOnlyAssociationPointingAtThisExe.otherGoneToo");
   ::RegDeleteTreeW(HKEY_CURRENT_USER, key);
+}
+
+
+void temporaryAssociationRestoresPreviousHandler() {
+  const std::wstring fixture =
+      L"Software\\io.github.georgexie2333\\Usque\\zt-temporary-test-" +
+      std::to_wstring(::GetCurrentProcessId());
+  const std::wstring key = fixture + L"\\protocol";
+  const std::wstring backup = key + L".UsqueBackup";
+  const std::wstring pending = key + L".UsquePending";
+  const wchar_t* ours = L"C:\\Usque\\usque.exe";
+  const wchar_t* other = L"C:\\WARP\\warp.exe";
+  const wchar_t* replacement = L"C:\\Other\\handler.exe";
+  const auto temporary = [&](bool enabled) {
+    return SetTemporaryWarpProtocolAssociation(HKEY_CURRENT_USER, key.c_str(),
+                                               ours, enabled);
+  };
+  const auto points = [&](const std::wstring& path, const wchar_t* exe) {
+    return WarpProtocolAssociationPointsAtExe(HKEY_CURRENT_USER, path.c_str(),
+                                              exe);
+  };
+  Expect(temporary(true) && points(key, ours), "temporary.absentBegin");
+  Expect(temporary(false) && !points(key, ours), "temporary.absentEnd");
+  Expect(temporary(false), "temporary.idempotentEnd");
+
+  Expect(SetWarpProtocolAssociation(HKEY_CURRENT_USER, key.c_str(), other, true),
+         "temporary.original");
+  HKEY original = nullptr;
+  Expect(::RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_SET_VALUE,
+                         &original) == ERROR_SUCCESS, "temporary.openMetadata");
+  if (original != nullptr) {
+    const DWORD metadata = 42;
+    Expect(::RegSetValueExW(original, L"FixtureMetadata", 0, REG_DWORD,
+                            reinterpret_cast<const BYTE*>(&metadata),
+                            sizeof(metadata)) == ERROR_SUCCESS,
+           "temporary.writeMetadata");
+    ::RegCloseKey(original);
+  }
+  Expect(temporary(true) && points(key, ours) && points(backup, other),
+         "temporary.beginBacksUpOriginal");
+  Expect(temporary(true) && points(key, ours) && points(backup, other),
+         "temporary.repeatedBeginPreservesOriginal");
+  Expect(temporary(false) && points(key, other), "temporary.restoreOriginal");
+  DWORD metadata = 0;
+  DWORD size = sizeof(metadata);
+  Expect(::RegGetValueW(HKEY_CURRENT_USER, key.c_str(), L"FixtureMetadata",
+                        RRF_RT_REG_DWORD, nullptr, &metadata, &size) ==
+             ERROR_SUCCESS && metadata == 42,
+         "temporary.restoresEntireKey");
+
+  Expect(temporary(true), "temporary.beginBeforeReplacement");
+  Expect(SetWarpProtocolAssociation(HKEY_CURRENT_USER, key.c_str(), replacement,
+                                    true), "temporary.thirdPartyReplacement");
+  Expect(temporary(false) && points(key, replacement) && points(backup, other),
+         "temporary.neverClobbersNewOwner");
+  Expect(!temporary(true) && points(key, replacement) && points(backup, other),
+         "temporary.unresolvedBackupFailsClosed");
+  ::RegDeleteTreeW(HKEY_CURRENT_USER, key.c_str());
+  Expect(temporary(false) && points(key, other),
+         "temporary.recoversCrashBeforePublishOrAfterDelete");
+
+  Expect(SetWarpProtocolAssociation(HKEY_CURRENT_USER, pending.c_str(), ours,
+                                    true), "temporary.interruptedPreparation");
+  Expect(temporary(false) && points(key, other) && !points(pending, ours),
+         "temporary.recoversPreparedKey");
+  Expect(SetWarpProtocolAssociation(HKEY_CURRENT_USER, pending.c_str(), other,
+                                    true), "temporary.pendingCollision");
+  Expect(!temporary(true) && points(key, other) && points(pending, other),
+         "temporary.foreignPendingFailsClosed");
+  ::RegDeleteTreeW(HKEY_CURRENT_USER, pending.c_str());
+
+  Expect(SetWarpProtocolAssociation(HKEY_CURRENT_USER, key.c_str(), ours, true),
+         "temporary.legacyPersistentToggle");
+  Expect(temporary(false) && !points(key, ours), "temporary.migratesLegacyToggle");
+  ::RegDeleteTreeW(HKEY_CURRENT_USER, fixture.c_str());
 }
 
 std::string TestPipeName(const char* suffix) {
@@ -297,6 +446,68 @@ void engineEventPipeReadsFramesWithReadOnlyClientAccess() {
   ::CloseHandle(server);
 }
 
+void engineEventPipeReportsTruncatedBody() {
+  const std::string pipe_name = TestPipeName("stream.events");
+  const std::wstring pipe_name_wide = Wide(pipe_name);
+  HANDLE server = ::CreateNamedPipeW(
+      pipe_name_wide.c_str(), PIPE_ACCESS_OUTBOUND,
+      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0,
+      nullptr);
+  Expect(server != INVALID_HANDLE_VALUE,
+         "engineEventPipeReportsTruncatedBody.create");
+  if (server == INVALID_HANDLE_VALUE) return;
+
+  auto active = std::make_shared<std::atomic_bool>(true);
+  std::mutex mutex;
+  std::condition_variable delivered;
+  bool callback_called = false;
+  EngineIpcResult received;
+  std::thread reader([&]() {
+    StreamEngineEvents(pipe_name, active, [&](EngineIpcResult event) {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        received = std::move(event);
+        callback_called = true;
+      }
+      active->store(false);
+      delivered.notify_one();
+    });
+  });
+
+  const BOOL connected = ::ConnectNamedPipe(server, nullptr);
+  const bool connection_ready =
+      connected || ::GetLastError() == ERROR_PIPE_CONNECTED;
+  Expect(connection_ready,
+         "engineEventPipeReportsTruncatedBody.connect");
+  const std::vector<uint8_t> frame{0, 0, 0, 4, 1};
+  DWORD written = 0;
+  const bool wrote =
+      connection_ready &&
+      ::WriteFile(server, frame.data(), static_cast<DWORD>(frame.size()),
+                  &written, nullptr) &&
+      written == static_cast<DWORD>(frame.size());
+  Expect(wrote, "engineEventPipeReportsTruncatedBody.write");
+  ::FlushFileBuffers(server);
+  ::DisconnectNamedPipe(server);
+  ::CloseHandle(server);
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    delivered.wait_for(lock, std::chrono::seconds(2),
+                       [&]() { return callback_called; });
+  }
+  active->store(false);
+  reader.join();
+  Expect(callback_called,
+         "engineEventPipeReportsTruncatedBody.callback");
+  if (callback_called) {
+    Expect(!received.error.empty(),
+           "engineEventPipeReportsTruncatedBody.error");
+    Expect(received.response.empty(),
+           "engineEventPipeReportsTruncatedBody.frame");
+  }
+}
+
 void engineEventPipeReportsFatalValidationErrors() {
   auto active = std::make_shared<std::atomic_bool>(true);
   std::mutex mutex;
@@ -371,15 +582,20 @@ void maintenanceShutdownMessagesAreClassified() {
 }  // namespace
 
 int main() {
+  g_failures += RunShellIntegrationTests();
   initialWindowStaysWithinMonitorWorkArea();
+  firstLaunchCentresAndRestoreRescales();
+  windowPlacementRoundTripsAndRejectsForeignValues();
   matchingCallbackIsConsumedOnlyOnce();
   callbackRequiresAnActiveSameTeamLogin();
   cancellationAndProcessReplacementDiscardState();
   malformedCallbacksAndTeamsAreRejected();
   unregisterDeletesOnlyAssociationPointingAtThisExe();
+  temporaryAssociationRestoresPreviousHandler();
   enginePipeReadinessRetriesAInitiallyMissingPipe();
   enginePipeReadinessUsesAnOverallDeadline();
   engineEventPipeReadsFramesWithReadOnlyClientAccess();
+  engineEventPipeReportsTruncatedBody();
   engineEventPipeReportsFatalValidationErrors();
   maintenanceShutdownMessagesAreClassified();
   if (g_failures != 0) {

@@ -75,7 +75,8 @@ class _ProfileIdentityDialogState extends State<_ProfileIdentityDialog> {
 
   @override
   void dispose() {
-    unawaited(widget.controller.cancelZeroTrustLogin());
+    final id = widget.profile?.id;
+    if (id != null && _submitting) widget.controller.cancelIdentityFlow(id);
     _licenseController.clear();
     _licenseFocusNode.dispose();
     _nameFocusNode.dispose();
@@ -105,8 +106,6 @@ class _ProfileIdentityDialogState extends State<_ProfileIdentityDialog> {
     final editor = _zeroTrustKey.currentState;
     if (editor != null) {
       await editor.clearSensitive();
-    } else {
-      await widget.controller.cancelZeroTrustLogin();
     }
     if (mounted) Navigator.of(context).pop(false);
   }
@@ -118,8 +117,6 @@ class _ProfileIdentityDialogState extends State<_ProfileIdentityDialog> {
       final editor = _zeroTrustKey.currentState;
       if (editor != null) {
         unawaited(editor.clearSensitive());
-      } else {
-        unawaited(widget.controller.cancelZeroTrustLogin());
       }
     }
     setState(() {
@@ -185,8 +182,6 @@ class _ProfileIdentityDialogState extends State<_ProfileIdentityDialog> {
     final editor = _zeroTrustKey.currentState;
     if (editor != null) {
       await editor.clearSensitive();
-    } else {
-      await widget.controller.cancelZeroTrustLogin();
     }
     if (!mounted) return;
     if (success) {
@@ -303,6 +298,8 @@ class _ProfileIdentityDialogState extends State<_ProfileIdentityDialog> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
                   Text(_strings.get('zero_trust_repair_same_team')),
+                  const SizedBox(height: 6),
+                  Text(_strings.get('zero_trust_reauth_endpoints')),
                   const SizedBox(height: 6),
                   ZeroTrustExperimentalBadge(strings: _strings),
                 ],

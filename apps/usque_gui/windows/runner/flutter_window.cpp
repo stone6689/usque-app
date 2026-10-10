@@ -3,38 +3,134 @@
 #include <flutter/event_stream_handler_functions.h>
 #include <flutter/method_result_functions.h>
 #include <flutter/standard_method_codec.h>
+#include <flutter_windows.h>
 #include <shellapi.h>
 #include <shobjidl.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <thread>
 #include <variant>
+#include <vector>
 
 #include "engine_ipc.h"
 #include "flutter/generated_plugin_registrant.h"
 #include "maintenance_shutdown.h"
 #include "resource.h"
+#include "shell_integration.h"
 #include "utils.h"
 #include "window_frame.h"
+#include "window_placement.h"
 #include "zero_trust_protocol.h"
 
 namespace {
+
+constexpr size_t kMaxChainFiles = 128;
+constexpr DWORD kMaxChainFileBytes = 128 * 1024;
+
+flutter::EncodableMap ReadChainFile(IShellItem* item) {
+  using flutter::EncodableValue;
+  flutter::EncodableMap result;
+  PWSTR path = nullptr;
+  if (item != nullptr) item->GetDisplayName(SIGDN_FILESYSPATH, &path);
+  if (path == nullptr) {
+    result[EncodableValue("name")] = EncodableValue("");
+    result[EncodableValue("error")] = EncodableValue("CHAIN_FILE_READ_FAILED");
+    return result;
+  }
+  const std::wstring full_path(path);
+  const auto separator = full_path.find_last_of(L"\\/");
+  result[EncodableValue("name")] = EncodableValue(Utf8FromUtf16(
+      full_path.substr(separator == std::wstring::npos ? 0 : separator + 1).c_str()));
+  HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  CoTaskMemFree(path);
+  if (file == INVALID_HANDLE_VALUE) {
+    result[EncodableValue("error")] = EncodableValue("CHAIN_FILE_READ_FAILED");
+    return result;
+  }
+  std::vector<uint8_t> bytes(kMaxChainFileBytes + 1);
+  DWORD count = 0;
+  bool ok = true;
+  while (count < bytes.size()) {
+    DWORD read = 0;
+    if (!ReadFile(file, bytes.data() + count,
+                  static_cast<DWORD>(bytes.size()) - count, &read, nullptr)) {
+      ok = false;
+      break;
+    }
+    if (read == 0) break;
+    count += read;
+  }
+  CloseHandle(file);
+  if (!ok || count == 0 || count > kMaxChainFileBytes) {
+    result[EncodableValue("error")] = EncodableValue(
+        count > kMaxChainFileBytes ? "CHAIN_FILE_TOO_LARGE" : "CHAIN_FILE_READ_FAILED");
+    SecureZeroMemory(bytes.data(), bytes.size());
+  } else {
+    bytes.resize(count);
+    result[EncodableValue("bytes")] = EncodableValue(std::move(bytes));
+  }
+  return result;
+}
+
+std::optional<flutter::EncodableList> ReadChainConfigurations(
+    HWND owner, bool& cancelled, std::string& error) {
+  cancelled = false;
+  error = "CHAIN_FILE_READ_FAILED";
+  IFileOpenDialog* dialog = nullptr;
+  if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&dialog)))) {
+    error = "CHAIN_FILE_UNAVAILABLE";
+    return std::nullopt;
+  }
+  const COMDLG_FILTERSPEC filters[] = {
+      {L"VPN configuration", L"*.ovpn;*.conf"}, {L"All files", L"*.*"}};
+  dialog->SetFileTypes(2, filters);
+  dialog->SetOptions(FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST |
+                    FOS_FORCEFILESYSTEM | FOS_ALLOWMULTISELECT);
+  const HRESULT shown = dialog->Show(owner);
+  if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED)) cancelled = true;
+  IShellItemArray* items = nullptr;
+  if (SUCCEEDED(shown)) dialog->GetResults(&items);
+  dialog->Release();
+  if (items == nullptr) return std::nullopt;
+  DWORD count = 0;
+  const HRESULT counted = items->GetCount(&count);
+  if (FAILED(counted) || count > kMaxChainFiles) {
+    if (count > kMaxChainFiles) error = "CHAIN_FILE_COUNT_LIMIT";
+    items->Release();
+    return std::nullopt;
+  }
+  flutter::EncodableList files;
+  files.reserve(count);
+  for (DWORD i = 0; i < count; ++i) {
+    IShellItem* item = nullptr;
+    items->GetItemAt(i, &item);
+    files.emplace_back(ReadChainFile(item));
+    if (item != nullptr) item->Release();
+  }
+  items->Release();
+  return files;
+}
 
 constexpr UINT kEngineIpcComplete = WM_APP + 17;
 constexpr UINT kEngineEventAvailable = WM_APP + 18;
 constexpr UINT kTrayCallback = WM_APP + 19;
 constexpr UINT kEngineReadyComplete = WM_APP + 20;
+constexpr UINT_PTR kZeroTrustLoginTimer = 41004;
+constexpr UINT kZeroTrustLoginTimeoutMs = 10 * 60 * 1000;
+constexpr UINT kZeroTrustCleanupRetryMs = 10 * 1000;
 constexpr UINT kTrayOpen = 41001;
 constexpr UINT kTrayToggle = 41002;
 constexpr UINT kTrayDisconnectExit = 41003;
-constexpr wchar_t kUsqueSettingsKey[] =
-    L"Software\\io.github.georgexie2333\\Usque";
+constexpr UINT kTrayTunnel = 41005;
+constexpr UINT kTraySystemProxy = 41006;
 constexpr wchar_t kCloseToTrayValue[] = L"CloseToTray";
-constexpr wchar_t kRunKey[] =
-    L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-constexpr wchar_t kRunValue[] = L"Usque";
 std::atomic<uint64_t> g_engine_event_generation = 0;
 const UINT kTaskbarCreated = ::RegisterWindowMessageW(L"TaskbarCreated");
 
@@ -42,15 +138,15 @@ bool ReadCloseToTray() {
   DWORD value = 1;
   DWORD size = sizeof(value);
   const LSTATUS status = ::RegGetValueW(
-      HKEY_CURRENT_USER, kUsqueSettingsKey, kCloseToTrayValue, RRF_RT_REG_DWORD,
-      nullptr, &value, &size);
+      HKEY_CURRENT_USER, usque::kUsqueSettingsKey, kCloseToTrayValue,
+      RRF_RT_REG_DWORD, nullptr, &value, &size);
   return status != ERROR_SUCCESS || value != 0;
 }
 
 bool WriteCloseToTray(bool enabled) {
   HKEY key = nullptr;
-  if (::RegCreateKeyExW(HKEY_CURRENT_USER, kUsqueSettingsKey, 0, nullptr, 0,
-                        KEY_SET_VALUE, nullptr, &key, nullptr) !=
+  if (::RegCreateKeyExW(HKEY_CURRENT_USER, usque::kUsqueSettingsKey, 0,
+                        nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) !=
       ERROR_SUCCESS) {
     return false;
   }
@@ -62,40 +158,102 @@ bool WriteCloseToTray(bool enabled) {
   return status == ERROR_SUCCESS;
 }
 
-bool IsStartOnLoginEnabled() {
-  wchar_t value[32768]{};
-  DWORD size = sizeof(value);
-  return ::RegGetValueW(HKEY_CURRENT_USER, kRunKey, kRunValue, RRF_RT_REG_SZ,
-                        nullptr, value, &size) == ERROR_SUCCESS;
+std::optional<COLORREF> TrayBadgeColor(const std::string& badge) {
+  if (badge == "connected") return RGB(0x4A, 0xDE, 0x9C);
+  if (badge == "busy" || badge == "warning") return RGB(0xF2, 0xB2, 0x4C);
+  if (badge == "error") return RGB(0xE5, 0x53, 0x4B);
+  return std::nullopt;
 }
 
-bool SetStartOnLogin(bool enabled) {
-  HKEY key = nullptr;
-  if (::RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0,
-                        KEY_SET_VALUE, nullptr, &key, nullptr) !=
-      ERROR_SUCCESS) {
-    return false;
-  }
-  LSTATUS status = ERROR_SUCCESS;
-  if (enabled) {
-    wchar_t executable[MAX_PATH]{};
-    const DWORD length = ::GetModuleFileNameW(nullptr, executable, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
-      ::RegCloseKey(key);
-      return false;
+// Paints a status dot into the bottom-right corner of straight-alpha BGRA
+// |pixels|, cutting a transparent ring so the dot stays legible on the
+// artwork and on any taskbar colour.
+void PaintTrayBadge(std::vector<uint32_t>& pixels, int width, int height,
+                    COLORREF color) {
+  const double size = static_cast<double>(std::min(width, height));
+  const double radius = size * 0.23;
+  const double ring = std::max(1.0, size / 16.0);
+  const double center_x = width - radius;
+  const double center_y = height - radius;
+  const double fill_r = GetRValue(color);
+  const double fill_g = GetGValue(color);
+  const double fill_b = GetBValue(color);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const double distance =
+          std::hypot(x + 0.5 - center_x, y + 0.5 - center_y);
+      const double cleared =
+          std::clamp(radius + ring - distance + 0.5, 0.0, 1.0);
+      if (cleared <= 0) continue;
+      const double fill = std::clamp(radius - distance + 0.5, 0.0, 1.0);
+      uint32_t& pixel = pixels[static_cast<size_t>(y) * width + x];
+      const double alpha = ((pixel >> 24) & 0xFF) / 255.0 * (1 - cleared);
+      const double out_alpha = fill + alpha * (1 - fill);
+      if (out_alpha <= 0) {
+        pixel = 0;
+        continue;
+      }
+      const auto blend = [&](double top, int shift) {
+        const double bottom = (pixel >> shift) & 0xFF;
+        return static_cast<uint32_t>(std::lround(
+            (top * fill + bottom * alpha * (1 - fill)) / out_alpha));
+      };
+      pixel = (static_cast<uint32_t>(std::lround(out_alpha * 255)) << 24) |
+              (blend(fill_r, 16) << 16) | (blend(fill_g, 8) << 8) |
+              blend(fill_b, 0);
     }
-    const std::wstring command = L"\"" + std::wstring(executable, length) +
-                                 L"\" --background";
-    status = ::RegSetValueExW(
-        key, kRunValue, 0, REG_SZ,
-        reinterpret_cast<const BYTE*>(command.c_str()),
-        static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-  } else {
-    status = ::RegDeleteValueW(key, kRunValue);
-    if (status == ERROR_FILE_NOT_FOUND) status = ERROR_SUCCESS;
   }
-  ::RegCloseKey(key);
-  return status == ERROR_SUCCESS;
+}
+
+// Returns nullptr when |base| has no alpha channel to composite against; the
+// caller then keeps the plain icon and relies on the tooltip.
+HICON CreateBadgedTrayIcon(HICON base, COLORREF color) {
+  ICONINFO info{};
+  if (base == nullptr || !::GetIconInfo(base, &info)) return nullptr;
+  HICON result = nullptr;
+  BITMAP bitmap{};
+  if (info.hbmColor != nullptr &&
+      ::GetObjectW(info.hbmColor, sizeof(bitmap), &bitmap) != 0 &&
+      bitmap.bmWidth > 0 && bitmap.bmHeight > 0) {
+    const int width = bitmap.bmWidth;
+    const int height = bitmap.bmHeight;
+    BITMAPINFO bitmap_info{};
+    bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmap_info.bmiHeader.biWidth = width;
+    bitmap_info.bmiHeader.biHeight = -height;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB;
+    std::vector<uint32_t> pixels(static_cast<size_t>(width) * height);
+    HDC screen = ::GetDC(nullptr);
+    const bool read =
+        screen != nullptr &&
+        ::GetDIBits(screen, info.hbmColor, 0, height, pixels.data(),
+                    &bitmap_info, DIB_RGB_COLORS) == height;
+    const bool has_alpha =
+        read && std::any_of(pixels.begin(), pixels.end(),
+                            [](uint32_t pixel) { return (pixel >> 24) != 0; });
+    if (has_alpha) {
+      PaintTrayBadge(pixels, width, height, color);
+      void* bits = nullptr;
+      HBITMAP color_bitmap = ::CreateDIBSection(
+          screen, &bitmap_info, DIB_RGB_COLORS, &bits, nullptr, 0);
+      const std::vector<uint8_t> mask_bits(
+          static_cast<size_t>((width + 15) / 16) * 2 * height, 0);
+      HBITMAP mask = ::CreateBitmap(width, height, 1, 1, mask_bits.data());
+      if (color_bitmap != nullptr && bits != nullptr && mask != nullptr) {
+        std::memcpy(bits, pixels.data(), pixels.size() * sizeof(uint32_t));
+        ICONINFO badged{TRUE, 0, 0, mask, color_bitmap};
+        result = ::CreateIconIndirect(&badged);
+      }
+      if (mask != nullptr) ::DeleteObject(mask);
+      if (color_bitmap != nullptr) ::DeleteObject(color_bitmap);
+    }
+    if (screen != nullptr) ::ReleaseDC(nullptr, screen);
+  }
+  if (info.hbmColor != nullptr) ::DeleteObject(info.hbmColor);
+  if (info.hbmMask != nullptr) ::DeleteObject(info.hbmMask);
+  return result;
 }
 
 struct PendingEngineReply {
@@ -183,8 +341,10 @@ SaveDialogResult SelectDestination(HWND owner, const wchar_t* label,
 }  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project,
-                             bool start_hidden)
-    : project_(project), start_hidden_(start_hidden) {}
+                             bool start_hidden, bool start_maximized)
+    : project_(project),
+      start_hidden_(start_hidden),
+      pending_maximize_(start_maximized) {}
 
 FlutterWindow::~FlutterWindow() {}
 
@@ -210,6 +370,8 @@ bool FlutterWindow::OnCreate() {
   RegisterPlugins(flutter_controller_->engine());
   usque::BindWindowFrameChannel(flutter_controller_->engine()->messenger(),
                                 GetHandle());
+  // Recover a previous interrupted login or migrate the old persistent toggle.
+  ReleaseZeroTrustProtocol();
   close_to_tray_ = ReadCloseToTray();
   AddTrayIcon();
   engine_channel_ =
@@ -221,6 +383,34 @@ bool FlutterWindow::OnCreate() {
       [this](const flutter::MethodCall<flutter::EncodableValue>& call,
              std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
                  result) {
+        if (call.method_name() == "readChainConfigurations") {
+          if (chain_picker_busy_) {
+            result->Error("CHAIN_FILE_BUSY", "A file picker is already open.");
+            return;
+          }
+          chain_picker_busy_ = true;
+          bool cancelled = false;
+          std::string error;
+          auto files = ReadChainConfigurations(GetHandle(), cancelled, error);
+          chain_picker_busy_ = false;
+          if (files) {
+            flutter::EncodableValue value(std::move(*files));
+            result->Success(value);
+            for (auto& entry : std::get<flutter::EncodableList>(value)) {
+              auto& fields = std::get<flutter::EncodableMap>(entry);
+              const auto found = fields.find(flutter::EncodableValue("bytes"));
+              if (found != fields.end()) {
+                auto& data = std::get<std::vector<uint8_t>>(found->second);
+                SecureZeroMemory(data.data(), data.size());
+              }
+            }
+          } else if (cancelled) {
+            result->Success();
+          } else {
+            result->Error(error, "Configuration file could not be read.");
+          }
+          return;
+        }
         if (call.method_name() == "exchangeFrame") {
           const auto* arguments =
               std::get_if<flutter::EncodableMap>(call.arguments());
@@ -337,11 +527,9 @@ bool FlutterWindow::OnCreate() {
         if (call.method_name() == "platformPreferences") {
           flutter::EncodableMap preferences;
           preferences[flutter::EncodableValue("start_on_boot")] =
-              flutter::EncodableValue(IsStartOnLoginEnabled());
+              flutter::EncodableValue(usque::shell::IsStartOnLoginEnabled());
           preferences[flutter::EncodableValue("close_to_tray")] =
               flutter::EncodableValue(close_to_tray_);
-          preferences[flutter::EncodableValue("warp_protocol_association")] =
-              flutter::EncodableValue(IsCurrentUserWarpProtocolAssociated());
           result->Success(flutter::EncodableValue(preferences));
           return;
         }
@@ -367,6 +555,16 @@ bool FlutterWindow::OnCreate() {
                           "Enter one Cloudflare Zero Trust team name.");
             return;
           }
+          if (!ReleaseZeroTrustProtocol() ||
+              !SetCurrentUserWarpProtocolAssociation(true) ||
+              ::SetTimer(GetHandle(), kZeroTrustLoginTimer,
+                         kZeroTrustLoginTimeoutMs, nullptr) == 0) {
+            zero_trust_session_.Cancel();
+            ReleaseZeroTrustProtocol();
+            result->Error("ZERO_TRUST_PROTOCOL_FAILED",
+                          "Windows could not prepare the Access callback handler.");
+            return;
+          }
           result->Success(flutter::EncodableValue(*login));
           return;
         }
@@ -381,28 +579,9 @@ bool FlutterWindow::OnCreate() {
         }
         if (call.method_name() == "cancelZeroTrustLogin") {
           zero_trust_session_.Cancel();
-          result->Success();
-          return;
-        }
-        if (call.method_name() == "setWarpProtocolAssociation") {
-          const auto* arguments =
-              std::get_if<flutter::EncodableMap>(call.arguments());
-          const auto iterator =
-              arguments == nullptr
-                  ? flutter::EncodableMap::const_iterator{}
-                  : arguments->find(flutter::EncodableValue("enabled"));
-          const bool valid = arguments != nullptr &&
-                             iterator != arguments->end() &&
-                             std::holds_alternative<bool>(iterator->second);
-          if (!valid) {
-            result->Error("INVALID_ARGUMENT",
-                          "The Windows shell setting is malformed.");
-            return;
-          }
-          if (!SetCurrentUserWarpProtocolAssociation(
-                  std::get<bool>(iterator->second))) {
-            result->Error("WINDOWS_SHELL_SETTING_FAILED",
-                          "Windows could not save the shell integration setting.");
+          if (!ReleaseZeroTrustProtocol()) {
+            result->Error("ZERO_TRUST_PROTOCOL_FAILED",
+                          "Windows could not restore the Access callback handler.");
             return;
           }
           result->Success();
@@ -426,7 +605,7 @@ bool FlutterWindow::OnCreate() {
           }
           const bool enabled = std::get<bool>(iterator->second);
           const bool saved = call.method_name() == "setStartOnBoot"
-                                 ? SetStartOnLogin(enabled)
+                                 ? usque::shell::SetStartOnLogin(enabled)
                                  : WriteCloseToTray(enabled);
           if (!saved) {
             result->Error("WINDOWS_SHELL_SETTING_FAILED",
@@ -472,12 +651,54 @@ bool FlutterWindow::OnCreate() {
               target = Utf16FromUtf8(value);
             }
           };
+          const auto read_bool = [arguments](const char* key) {
+            const auto iterator =
+                arguments->find(flutter::EncodableValue(key));
+            return iterator != arguments->end() &&
+                   std::holds_alternative<bool>(iterator->second) &&
+                   std::get<bool>(iterator->second);
+          };
           assign_label(tray_open_, "open");
           assign_label(tray_connect_, "connect");
           assign_label(tray_disconnect_, "disconnect");
           assign_label(tray_exit_, "disconnect_exit");
+          tray_tunnel_label_ = Utf16FromUtf8(read_utf8("tunnel_label"));
+          tray_system_proxy_label_ =
+              Utf16FromUtf8(read_utf8("system_proxy_label"));
+          tray_tunnel_ = read_bool("tunnel");
+          tray_system_proxy_ = read_bool("system_proxy");
+          tray_outputs_enabled_ = read_bool("outputs_enabled");
+          tray_system_proxy_available_ = read_bool("system_proxy_available");
           UpdateTrayState(status, std::get<bool>(connected_it->second));
+          ApplyTrayBadge(read_utf8("badge"));
           result->Success();
+          return;
+        }
+        if (call.method_name() == "showTrayNotification") {
+          const auto* arguments =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          const auto read_utf8 = [arguments](const char* key) -> std::string {
+            if (arguments == nullptr) return {};
+            const auto iterator =
+                arguments->find(flutter::EncodableValue(key));
+            if (iterator == arguments->end() ||
+                !std::holds_alternative<std::string>(iterator->second)) {
+              return {};
+            }
+            return std::get<std::string>(iterator->second);
+          };
+          const std::string title = read_utf8("title");
+          const std::string body = read_utf8("body");
+          const std::string level = read_utf8("level");
+          if (title.empty() || body.empty()) {
+            result->Error("INVALID_ARGUMENT", "Tray notification is malformed.");
+            return;
+          }
+          const DWORD flags = level == "error"     ? NIIF_ERROR
+                              : level == "warning" ? NIIF_WARNING
+                                                   : NIIF_INFO;
+          result->Success(flutter::EncodableValue(ShowTrayNotification(
+              Utf16FromUtf8(title), Utf16FromUtf8(body), flags)));
           return;
         }
         if (call.method_name() == "exitApplication") {
@@ -563,8 +784,15 @@ bool FlutterWindow::OnCreate() {
   SetChildContent(flutter_view);
   usque::AttachFlutterView(GetHandle(), flutter_view);
 
+  RememberNormalBounds();
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    if (!start_hidden_) this->Show();
+    if (start_hidden_) return;
+    if (pending_maximize_) {
+      pending_maximize_ = false;
+      ::ShowWindow(GetHandle(), SW_SHOWMAXIMIZED);
+    } else {
+      this->Show();
+    }
   });
 
   // Flutter can complete the first frame before the "show window" callback is
@@ -576,6 +804,9 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  zero_trust_session_.Cancel();
+  ReleaseZeroTrustProtocol();
+  ::KillTimer(GetHandle(), kZeroTrustLoginTimer);
   usque::UnbindWindowFrameChannel();
   usque::DetachFlutterView();
   StopEngineEventStream();
@@ -590,17 +821,23 @@ void FlutterWindow::OnDestroy() {
 }
 
 void FlutterWindow::AddTrayIcon() {
+  if (tray_base_icon_ == nullptr) {
+    tray_base_icon_ = static_cast<HICON>(::LoadImageW(
+        ::GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON),
+        IMAGE_ICON, ::GetSystemMetrics(SM_CXSMICON),
+        ::GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+  }
   tray_icon_ = {};
   tray_icon_.cbSize = sizeof(tray_icon_);
   tray_icon_.hWnd = GetHandle();
   tray_icon_.uID = 1;
-  tray_icon_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+  // NOTIFYICON_VERSION_4 suppresses the standard tooltip without NIF_SHOWTIP.
+  tray_icon_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
   tray_icon_.uCallbackMessage = kTrayCallback;
-  tray_icon_.hIcon = static_cast<HICON>(::LoadImageW(
-      ::GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
-      ::GetSystemMetrics(SM_CXSMICON), ::GetSystemMetrics(SM_CYSMICON),
-      LR_DEFAULTCOLOR));
-  wcscpy_s(tray_icon_.szTip, L"Usque - Disconnected");
+  tray_icon_.hIcon =
+      tray_badge_icon_ != nullptr ? tray_badge_icon_ : tray_base_icon_;
+  const std::wstring tooltip = L"Usque - " + tray_status_;
+  wcsncpy_s(tray_icon_.szTip, tooltip.c_str(), _TRUNCATE);
   tray_icon_added_ = ::Shell_NotifyIconW(NIM_ADD, &tray_icon_) == TRUE;
   if (tray_icon_added_) {
     tray_icon_.uVersion = NOTIFYICON_VERSION_4;
@@ -613,9 +850,14 @@ void FlutterWindow::RemoveTrayIcon() {
     ::Shell_NotifyIconW(NIM_DELETE, &tray_icon_);
     tray_icon_added_ = false;
   }
-  if (tray_icon_.hIcon != nullptr) {
-    ::DestroyIcon(tray_icon_.hIcon);
-    tray_icon_.hIcon = nullptr;
+  tray_icon_.hIcon = nullptr;
+  if (tray_badge_icon_ != nullptr) {
+    ::DestroyIcon(tray_badge_icon_);
+    tray_badge_icon_ = nullptr;
+  }
+  if (tray_base_icon_ != nullptr) {
+    ::DestroyIcon(tray_base_icon_);
+    tray_base_icon_ = nullptr;
   }
 }
 
@@ -627,13 +869,79 @@ void FlutterWindow::UpdateTrayState(const std::string& phase,
   if (!tray_icon_added_) return;
   const std::wstring tooltip = L"Usque - " + tray_status_;
   wcsncpy_s(tray_icon_.szTip, tooltip.c_str(), _TRUNCATE);
-  tray_icon_.uFlags = NIF_TIP;
+  tray_icon_.uFlags = NIF_TIP | NIF_SHOWTIP;
   ::Shell_NotifyIconW(NIM_MODIFY, &tray_icon_);
 }
 
+void FlutterWindow::ApplyTrayBadge(const std::string& badge) {
+  if (badge == tray_badge_) return;
+  tray_badge_ = badge;
+  HICON previous = tray_badge_icon_;
+  const std::optional<COLORREF> color = TrayBadgeColor(badge);
+  tray_badge_icon_ = color.has_value()
+                         ? CreateBadgedTrayIcon(tray_base_icon_, *color)
+                         : nullptr;
+  tray_icon_.hIcon =
+      tray_badge_icon_ != nullptr ? tray_badge_icon_ : tray_base_icon_;
+  if (tray_icon_added_) {
+    tray_icon_.uFlags = NIF_ICON;
+    ::Shell_NotifyIconW(NIM_MODIFY, &tray_icon_);
+  }
+  if (previous != nullptr) ::DestroyIcon(previous);
+}
+
+bool FlutterWindow::ShowTrayNotification(const std::wstring& title,
+                                         const std::wstring& body,
+                                         DWORD level) {
+  if (!tray_icon_added_) return false;
+  const HWND window = GetHandle();
+  if (::IsWindowVisible(window) && !::IsIconic(window) &&
+      ::GetForegroundWindow() == window) {
+    return false;
+  }
+  NOTIFYICONDATAW notice{};
+  notice.cbSize = sizeof(notice);
+  notice.hWnd = window;
+  notice.uID = tray_icon_.uID;
+  notice.uFlags = NIF_INFO;
+  notice.dwInfoFlags = level | NIIF_RESPECT_QUIET_TIME;
+  wcsncpy_s(notice.szInfoTitle, title.c_str(), _TRUNCATE);
+  wcsncpy_s(notice.szInfo, body.c_str(), _TRUNCATE);
+  return ::Shell_NotifyIconW(NIM_MODIFY, &notice) == TRUE;
+}
+
 void FlutterWindow::ShowAndActivate() {
-  ::ShowWindow(GetHandle(), SW_RESTORE);
-  ::SetForegroundWindow(GetHandle());
+  const HWND window = GetHandle();
+  if (::IsIconic(window)) {
+    ::ShowWindow(window, SW_RESTORE);
+  } else if (!::IsWindowVisible(window)) {
+    // SW_RESTORE would un-maximize a window that was hidden to the tray.
+    const bool maximize = pending_maximize_;
+    pending_maximize_ = false;
+    ::ShowWindow(window, maximize ? SW_SHOWMAXIMIZED : SW_SHOW);
+  }
+  ::SetForegroundWindow(window);
+}
+
+void FlutterWindow::RememberNormalBounds() {
+  const HWND window = GetHandle();
+  if (window == nullptr || ::IsIconic(window) || ::IsZoomed(window)) return;
+  RECT bounds{};
+  if (::GetWindowRect(window, &bounds)) normal_bounds_ = bounds;
+}
+
+void FlutterWindow::SaveWindowPlacement() {
+  const HWND window = GetHandle();
+  if (window == nullptr || !normal_bounds_.has_value() ||
+      !::IsWindowVisible(window) || ::IsIconic(window)) {
+    return;
+  }
+  usque::WindowPlacement placement;
+  placement.bounds = *normal_bounds_;
+  placement.dpi = FlutterDesktopGetDpiForHWND(window);
+  placement.maximized = ::IsZoomed(window) != FALSE;
+  usque::WriteWindowPlacement(HKEY_CURRENT_USER, usque::kUsqueSettingsKey,
+                              placement);
 }
 
 void FlutterWindow::NotifyZeroTrustCallbackArrived() {
@@ -641,8 +949,19 @@ void FlutterWindow::NotifyZeroTrustCallbackArrived() {
   engine_channel_->InvokeMethod("zeroTrustCallbackArrived", nullptr);
 }
 
+bool FlutterWindow::ReleaseZeroTrustProtocol() {
+  if (!SetCurrentUserWarpProtocolAssociation(false)) {
+    ::SetTimer(GetHandle(), kZeroTrustLoginTimer, kZeroTrustCleanupRetryMs,
+               nullptr);
+    return false;
+  }
+  ::KillTimer(GetHandle(), kZeroTrustLoginTimer);
+  return true;
+}
+
 void FlutterWindow::OfferZeroTrustCallback(std::string_view callback_uri) {
   if (!zero_trust_session_.Accept(callback_uri)) return;
+  ReleaseZeroTrustProtocol();
   NotifyZeroTrustCallbackArrived();
 }
 
@@ -671,6 +990,25 @@ void FlutterWindow::ShowTrayMenu() {
   ::AppendMenuW(menu, MF_STRING, kTrayToggle,
                 tray_connected_ ? tray_disconnect_.c_str()
                                 : tray_connect_.c_str());
+  if (!tray_tunnel_label_.empty() || !tray_system_proxy_label_.empty()) {
+    ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  }
+  if (!tray_tunnel_label_.empty()) {
+    ::AppendMenuW(menu,
+                  MF_STRING | (tray_tunnel_ ? MF_CHECKED : MF_UNCHECKED) |
+                      (tray_outputs_enabled_ ? MF_ENABLED : MF_GRAYED),
+                  kTrayTunnel, tray_tunnel_label_.c_str());
+  }
+  if (!tray_system_proxy_label_.empty()) {
+    // Turning system proxy on needs the HTTP local proxy; turning it off never
+    // does.
+    const bool available = tray_outputs_enabled_ &&
+                           (tray_system_proxy_ || tray_system_proxy_available_);
+    ::AppendMenuW(menu,
+                  MF_STRING | (tray_system_proxy_ ? MF_CHECKED : MF_UNCHECKED) |
+                      (available ? MF_ENABLED : MF_GRAYED),
+                  kTraySystemProxy, tray_system_proxy_label_.c_str());
+  }
   ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   ::AppendMenuW(menu, MF_STRING, kTrayDisconnectExit, tray_exit_.c_str());
   POINT point{};
@@ -684,6 +1022,10 @@ void FlutterWindow::ShowTrayMenu() {
     ShowAndActivate();
   } else if (command == kTrayToggle) {
     InvokeTrayCommand("toggle", false);
+  } else if (command == kTrayTunnel) {
+    InvokeTrayCommand("toggleTunnel", false);
+  } else if (command == kTraySystemProxy) {
+    InvokeTrayCommand("toggleSystemProxy", false);
   } else if (command == kTrayDisconnectExit) {
     RequestDisconnectAndExit();
   }
@@ -735,6 +1077,11 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  if (message == WM_TIMER && wparam == kZeroTrustLoginTimer) {
+    zero_trust_session_.Cancel();
+    ReleaseZeroTrustProtocol();
+    return 0;
+  }
   if (message == WM_COPYDATA) {
     return HandleZeroTrustCopyData(
                reinterpret_cast<const COPYDATASTRUCT*>(lparam))
@@ -773,13 +1120,9 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   if (message == kTaskbarCreated) {
+    // Explorer restarted and forgot the icon; the cached images stay valid.
     tray_icon_added_ = false;
-    if (tray_icon_.hIcon != nullptr) {
-      ::DestroyIcon(tray_icon_.hIcon);
-      tray_icon_.hIcon = nullptr;
-    }
     AddTrayIcon();
-    UpdateTrayState(Utf8FromUtf16(tray_status_.c_str()), tray_connected_);
     return 0;
   }
 
@@ -825,7 +1168,8 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     }
     case kTrayCallback: {
       const UINT event = LOWORD(lparam);
-      if (event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK) {
+      if (event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK ||
+          event == NIN_KEYSELECT || event == NIN_BALLOONUSERCLICK) {
         ShowAndActivate();
       } else if (event == WM_RBUTTONUP || event == WM_CONTEXTMENU) {
         ShowTrayMenu();
@@ -833,10 +1177,25 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
       return 0;
     }
     case WM_SIZE:
+      RememberNormalBounds();
+      usque::PublishWindowFrameState(hwnd, false);
+      break;
     case WM_ACTIVATE:
       usque::PublishWindowFrameState(hwnd, false);
       break;
+    case WM_EXITSIZEMOVE:
+      SaveWindowPlacement();
+      break;
+    case WM_SHOWWINDOW:
+      // A path that showed the window without consulting the saved state,
+      // such as a second instance asking it to come forward.
+      if (wparam == TRUE && pending_maximize_) {
+        pending_maximize_ = false;
+        ::PostMessageW(hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0);
+      }
+      break;
     case WM_CLOSE:
+      SaveWindowPlacement();
       if (force_exit_) {
         break;
       }

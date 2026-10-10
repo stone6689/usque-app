@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use ipnet::IpNet;
+pub use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -14,16 +14,26 @@ use zeroize::Zeroizing;
 use crate::identity::IdentityProvider;
 
 mod account;
+#[cfg(test)]
+mod bypass_tests;
 mod congestion;
 mod data_plane;
+mod initial_identity;
 mod network;
+mod routing;
+#[cfg(test)]
+mod warp_dns_tests;
 
 pub use account::{Account, ManagedEndpointIps};
 pub use congestion::CongestionControlAlgorithm;
 pub use data_plane::{CONSUMER_L4_SNI, DataPlaneMode, ZERO_TRUST_L4_SNI, l4_server_name};
+pub use initial_identity::{InitialIdentityOperation, InitialIdentityPhase};
 pub use network::SharedNetworkSettings;
+pub use routing::{
+    MAX_ROUTING_RULES_PER_KIND, RoutingAction, RoutingMatch, RoutingRule, RoutingSettings,
+};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 15;
+pub const CURRENT_SCHEMA_VERSION: u32 = 24;
 /// Vault namespace for device-wide proxy-listener secrets. Never a profile id.
 pub const SHARED_NETWORK_SECRET_ID: Uuid =
     Uuid::from_u128(0x9f1c_6b20_5a7e_4d3a_9c11_00c0_ffee_0001);
@@ -39,6 +49,7 @@ pub const DEFAULT_PROFILE_ID: Uuid = Uuid::from_u128(0x8c30_b771_9ebd_457a_b67b_
 pub const MAX_PROFILES: usize = 128;
 pub const MAX_DNS_SERVERS: usize = 8;
 pub const MAX_SPLIT_EXCLUSIONS: usize = 256;
+pub const MAX_BYPASS_DOMAINS: usize = 256;
 pub const MAX_PROXY_LISTENERS_PER_PROTOCOL: usize = 16;
 pub const MAX_GEO_DIRECT_COUNTRIES: usize = 32;
 pub const MAX_DIRECT_DNS_BOOTSTRAP_IPS: usize = 8;
@@ -60,7 +71,7 @@ pub struct AppConfig {
     pub schema_version: u32,
     pub active_profile_id: Option<Uuid>,
     /// Device-wide connection settings. Zero Trust accounts may replace only
-    /// the endpoint IPv4/IPv6 pair with registration-owned addresses.
+    /// the endpoint IPv4/IPv6 pair with registered or explicitly overridden addresses.
     #[serde(default)]
     pub network: SharedNetworkSettings,
     pub profiles: Vec<Account>,
@@ -83,6 +94,9 @@ pub struct AppConfig {
     /// Identity replacements with a durable write-ahead state.
     #[serde(default)]
     pub pending_identity_replacements: BTreeMap<Uuid, PendingIdentityReplacement>,
+    /// First-run intent only; credentials and callback assertions stay in the vault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_identity_operation: Option<InitialIdentityOperation>,
 }
 
 impl Default for AppConfig {
@@ -99,6 +113,7 @@ impl Default for AppConfig {
             pending_identity_local_deletions: Vec::new(),
             pending_identity_creations: Vec::new(),
             pending_identity_replacements: BTreeMap::new(),
+            initial_identity_operation: None,
         }
     }
 }
@@ -155,8 +170,17 @@ impl AppConfig {
     /// updating the shared port, SNI, and remaining network settings.
     pub fn upsert_runtime_profile(&mut self, incoming: Profile) -> Result<Profile, ConfigError> {
         let mut incoming = incoming;
+        if self.account(incoming.id).is_some()
+            && incoming.chain_exit.is_none()
+            && self.network.chain_exit.as_ref().is_some_and(|s| {
+                s.source != crate::chain_exit::ChainSource::VpnGate && s.profile_id.is_some()
+            })
+        {
+            return Err(ConfigError::ChainExitCapabilityRequired);
+        }
         incoming.canonicalize_geo_direct()?;
         incoming.canonicalize_direct_dns();
+        incoming.canonicalize_warp_dns();
         incoming.validate()?;
         let id = incoming.id;
         let name = incoming.name.clone();
@@ -170,6 +194,7 @@ impl AppConfig {
                     id,
                     name,
                     managed_endpoint_ips: None,
+                    zero_trust_endpoint_override: None,
                 });
             }
             Some(index) => {
@@ -181,6 +206,7 @@ impl AppConfig {
                 if keep_shared_endpoint_ips {
                     network.endpoint.ipv4 = self.network.endpoint.ipv4;
                     network.endpoint.ipv6 = self.network.endpoint.ipv6;
+                    network.endpoint.selection = self.network.endpoint.selection;
                 }
                 if keep_username {
                     network.proxy.auth_username = self.network.proxy.auth_username.clone();
@@ -205,6 +231,7 @@ impl AppConfig {
             id,
             name,
             managed_endpoint_ips,
+            zero_trust_endpoint_override: None,
         });
         let profile = self
             .runtime_profile(id)
@@ -218,9 +245,11 @@ impl AppConfig {
         id: Uuid,
         managed_endpoint_ips: ManagedEndpointIps,
     ) -> Result<Profile, ConfigError> {
-        self.account_mut(id)
-            .ok_or(ConfigError::MissingActiveProfile(id))?
-            .managed_endpoint_ips = Some(managed_endpoint_ips);
+        let account = self
+            .account_mut(id)
+            .ok_or(ConfigError::MissingActiveProfile(id))?;
+        account.managed_endpoint_ips = Some(managed_endpoint_ips);
+        account.zero_trust_endpoint_override = None;
         let profile = self
             .runtime_profile(id)
             .ok_or(ConfigError::MissingActiveProfile(id))?;
@@ -229,6 +258,12 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(operation) = &self.initial_identity_operation {
+            operation.validate()?;
+            if self.account(operation.profile_id).is_none() {
+                return Err(ConfigError::InvalidInitialIdentityOperation);
+            }
+        }
         if self.schema_version > CURRENT_SCHEMA_VERSION {
             return Err(ConfigError::NewerSchema {
                 found: self.schema_version,
@@ -240,6 +275,7 @@ impl AppConfig {
             return Err(ConfigError::NoProfiles);
         }
         self.network.direct_dns.validate()?;
+        self.network.warp_dns.validate()?;
         if self.profiles.len() > MAX_PROFILES {
             return Err(ConfigError::TooManyProfiles(self.profiles.len()));
         }
@@ -442,7 +478,14 @@ pub struct Profile {
     pub mtu: u16,
     pub dns_mode: DnsMode,
     pub dns_servers: Vec<IpAddr>,
+    /// Resolver reached through the WARP underlay. Plain preserves the saved
+    /// numeric DNS servers and existing DNS-mode behavior.
+    #[serde(default)]
+    pub warp_dns: WarpDnsSettings,
     pub allow_lan: bool,
+    /// Block application UDP/443 on tunnel paths, after GEO direct routing.
+    #[serde(default)]
+    pub disable_quic: bool,
     pub split_exclusions: Vec<IpNet>,
     pub kill_switch: bool,
     pub auto_connect: bool,
@@ -450,10 +493,19 @@ pub struct Profile {
     /// Uppercase ISO 3166-1 alpha-2 codes sent DIRECT. Empty disables the feature.
     #[serde(default)]
     pub geo_direct_countries: Vec<String>,
+    #[serde(default)]
+    pub bypass_domains: Vec<String>,
+    #[serde(default)]
+    pub routing: RoutingSettings,
     /// Resolver used only for GeoSite traffic routed directly over the
     /// physical network. The default preserves the system-resolver behavior.
     #[serde(default)]
     pub direct_dns: DirectDnsSettings,
+    /// Additional final exit; independent from the WARP transport/backend.
+    #[serde(default)]
+    pub vpn_gate: crate::vpngate::VpnGateSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_exit: Option<crate::chain_exit::ChainExitSettings>,
 }
 
 impl Default for Profile {
@@ -471,13 +523,19 @@ impl Default for Profile {
             mtu: DEFAULT_MTU,
             dns_mode: DnsMode::Tunnel,
             dns_servers: default_dns_servers(),
-            allow_lan: false,
+            warp_dns: WarpDnsSettings::default(),
+            allow_lan: true,
+            disable_quic: false,
             split_exclusions: Vec::new(),
             kill_switch: true,
             auto_connect: false,
             proxy: ProxySettings::default(),
             geo_direct_countries: Vec::new(),
+            bypass_domains: Vec::new(),
+            routing: RoutingSettings::default(),
             direct_dns: DirectDnsSettings::default(),
+            vpn_gate: crate::vpngate::VpnGateSettings::default(),
+            chain_exit: None,
         };
         profile.canonicalize_mode();
         profile
@@ -485,6 +543,26 @@ impl Default for Profile {
 }
 
 impl Profile {
+    pub fn uses_encrypted_warp_dns(&self) -> bool {
+        !self.chain_enabled() && self.warp_dns.is_encrypted()
+    }
+
+    pub fn chain_enabled(&self) -> bool {
+        self.chain_exit
+            .as_ref()
+            .map_or(self.vpn_gate.enabled, |s| s.enabled)
+    }
+    pub fn custom_chain(&self) -> Option<&crate::chain_exit::ChainExitSettings> {
+        self.chain_exit
+            .as_ref()
+            .filter(|s| s.source != crate::chain_exit::ChainSource::VpnGate)
+    }
+    pub fn disable_chain(&mut self) {
+        self.vpn_gate.enabled = false;
+        if let Some(chain) = &mut self.chain_exit {
+            chain.enabled = false;
+        }
+    }
     /// `mode` is the persisted projection of `frontends`.
     pub fn canonicalize_mode(&mut self) {
         self.mode = if self.frontends.tunnel {
@@ -502,6 +580,28 @@ impl Profile {
             return Err(ConfigError::InvalidProfileName);
         }
         self.endpoint.validate()?;
+
+        if let Some(chain) = &self.chain_exit {
+            chain
+                .validate()
+                .map_err(|_| ConfigError::InvalidVpnGateSelection)?;
+            if chain.source == crate::chain_exit::ChainSource::VpnGate {
+                let mut gate = self.vpn_gate.clone();
+                gate.enabled = chain.enabled;
+                gate.validate()
+                    .map_err(|_| ConfigError::InvalidVpnGateSelection)?;
+            }
+            if chain.source == crate::chain_exit::ChainSource::VpnGate
+                && chain.enabled
+                && self.vpn_gate.selection.is_none()
+            {
+                return Err(ConfigError::InvalidVpnGateSelection);
+            }
+        } else {
+            self.vpn_gate
+                .validate()
+                .map_err(|_| ConfigError::InvalidVpnGateSelection)?;
+        }
 
         if !(1280..=9000).contains(&self.mtu) {
             return Err(ConfigError::InvalidMtu(self.mtu));
@@ -525,7 +625,10 @@ impl Profile {
             return Err(ConfigError::DuplicateSplitExclusion);
         }
         normalize_geo_direct_countries(&self.geo_direct_countries)?;
+        normalize_bypass_domains(&self.bypass_domains)?;
+        self.routing.normalized()?;
         self.direct_dns.validate()?;
+        self.warp_dns.validate()?;
         if self.frontends.tunnel {
             if self.dns_mode == DnsMode::System {
                 return Err(ConfigError::VpnSystemDnsForbidden);
@@ -538,20 +641,26 @@ impl Profile {
             {
                 return Err(ConfigError::InvalidVpnDnsServer(server));
             }
-            if let Some(server) = self.dns_servers.iter().copied().find(|server| {
-                self.split_exclusions
-                    .iter()
-                    .any(|network| network.contains(server))
-                    || *server == IpAddr::V4(self.endpoint.ipv4)
-                    || *server == IpAddr::V6(self.endpoint.ipv6)
-                    || self.allow_lan && is_lan_bypass_address(*server)
-            }) {
+            if !self.uses_encrypted_warp_dns()
+                && let Some(server) = self.dns_servers.iter().copied().find(|server| {
+                    self.split_exclusions
+                        .iter()
+                        .any(|network| network.contains(server))
+                        || self.endpoint.selection == EndpointSelection::Custom
+                            && (*server == IpAddr::V4(self.endpoint.ipv4)
+                                || *server == IpAddr::V6(self.endpoint.ipv6))
+                        || self.allow_lan && is_lan_bypass_address(*server)
+                })
+            {
                 return Err(ConfigError::VpnDnsServerBypassed(server));
             }
         }
         self.proxy.validate()?;
         if self.proxy.dns_mode == ProxyDnsMode::EdgeResolved
             && self.data_plane != DataPlaneMode::L4Proxy
+            && !self
+                .custom_chain()
+                .is_some_and(|c| c.enabled && c.source.is_proxy())
         {
             return Err(ConfigError::EdgeDnsRequiresL4);
         }
@@ -586,20 +695,50 @@ impl Profile {
         self.mtu = DEFAULT_MTU;
         self.dns_mode = DnsMode::Tunnel;
         self.dns_servers = default_dns_servers();
+        self.warp_dns = WarpDnsSettings::default();
         self.allow_lan = false;
+        self.disable_quic = false;
         self.split_exclusions.clear();
         self.proxy = ProxySettings::default();
         self.geo_direct_countries.clear();
+        self.bypass_domains.clear();
+        self.routing = RoutingSettings::default();
         self.direct_dns = DirectDnsSettings::default();
+        self.vpn_gate = crate::vpngate::VpnGateSettings::default();
+        self.chain_exit = None;
+    }
+
+    pub fn has_domain_direct_rules(&self) -> bool {
+        !self.geo_direct_countries.is_empty()
+            || !self.bypass_domains.is_empty()
+            || self.routing.has_direct_domains()
+    }
+
+    pub fn needs_domain_routing(&self) -> bool {
+        self.has_domain_direct_rules() || self.routing.has_domain_rules()
     }
 
     pub fn canonicalize_geo_direct(&mut self) -> Result<(), ConfigError> {
+        self.routing = self.routing.normalized()?;
         self.geo_direct_countries = normalize_geo_direct_countries(&self.geo_direct_countries)?;
+        self.bypass_domains = normalize_bypass_domains(&self.bypass_domains)?;
+        self.routing.normalized()?;
+        let mut seen = HashSet::new();
+        self.split_exclusions = self
+            .split_exclusions
+            .iter()
+            .map(|net| net.trunc())
+            .filter(|net| seen.insert(*net))
+            .collect();
         Ok(())
     }
 
     pub fn canonicalize_direct_dns(&mut self) {
         self.direct_dns.canonicalize();
+    }
+
+    pub fn canonicalize_warp_dns(&mut self) {
+        self.warp_dns.canonicalize();
     }
 
     pub fn validate_geo_cache(&self, cache_dir: &std::path::Path) -> Result<(), ConfigError> {
@@ -650,7 +789,7 @@ impl Default for FrontendSettings {
     }
 }
 
-fn invalid_vpn_dns_address(address: IpAddr) -> bool {
+pub(crate) fn invalid_vpn_dns_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             address.is_unspecified()
@@ -679,8 +818,10 @@ fn invalid_direct_dns_bootstrap(address: IpAddr) -> bool {
     }
 }
 
-fn is_lan_bypass_address(address: IpAddr) -> bool {
-    match address {
+/// The private and link-local ranges excluded by the Allow LAN setting.
+/// IPv4-mapped IPv6 addresses follow the corresponding IPv4 policy.
+pub fn is_lan_bypass_address(address: IpAddr) -> bool {
+    match address.to_canonical() {
         IpAddr::V4(address) => {
             let [first, second, ..] = address.octets();
             first == 10
@@ -755,6 +896,89 @@ pub enum DirectDnsMode {
     Dot,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WarpDnsMode {
+    #[default]
+    Plain,
+    Doh,
+    Dot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WarpDnsSettings {
+    #[serde(default)]
+    pub mode: WarpDnsMode,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub doh_path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bootstrap_ips: Vec<IpAddr>,
+    #[serde(default, skip_serializing_if = "direct_dns_port_is_zero")]
+    pub port: u16,
+}
+
+impl WarpDnsSettings {
+    pub fn is_encrypted(&self) -> bool {
+        self.mode != WarpDnsMode::Plain
+    }
+
+    pub fn encrypted_settings(&self) -> Option<DirectDnsSettings> {
+        let mode = match self.mode {
+            WarpDnsMode::Plain => return None,
+            WarpDnsMode::Doh => DirectDnsMode::Doh,
+            WarpDnsMode::Dot => DirectDnsMode::Dot,
+        };
+        Some(DirectDnsSettings {
+            mode,
+            server_name: self.server_name.clone(),
+            doh_path: self.doh_path.clone(),
+            bootstrap_ips: self.bootstrap_ips.clone(),
+            port: self.port,
+        })
+    }
+
+    pub fn canonicalize(&mut self) {
+        let Some(mut settings) = self.encrypted_settings() else {
+            *self = Self::default();
+            return;
+        };
+        settings.canonicalize();
+        self.server_name = settings.server_name;
+        self.doh_path = settings.doh_path;
+        self.bootstrap_ips = settings.bootstrap_ips;
+        self.port = settings.port;
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let Some(settings) = self.encrypted_settings() else {
+            return if self == &Self::default() {
+                Ok(())
+            } else {
+                Err(ConfigError::NonCanonicalPlainWarpDns)
+            };
+        };
+        settings
+            .validate_with_bootstrap(false)
+            .map_err(|error| match error {
+                ConfigError::InvalidDirectDnsServerName => ConfigError::InvalidWarpDnsServerName,
+                ConfigError::InvalidDirectDnsPort => ConfigError::InvalidWarpDnsPort,
+                ConfigError::MissingDirectDnsBootstrapIp => ConfigError::MissingWarpDnsBootstrapIp,
+                ConfigError::TooManyDirectDnsBootstrapIps(count) => {
+                    ConfigError::TooManyWarpDnsBootstrapIps(count)
+                }
+                ConfigError::DuplicateDirectDnsBootstrapIp => {
+                    ConfigError::DuplicateWarpDnsBootstrapIp
+                }
+                ConfigError::InvalidDirectDnsBootstrapIp => ConfigError::InvalidWarpDnsBootstrapIp,
+                ConfigError::InvalidDirectDnsDohPath => ConfigError::InvalidWarpDnsDohPath,
+                ConfigError::DirectDnsDotPathForbidden => ConfigError::WarpDnsDotPathForbidden,
+                other => other,
+            })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectDnsSettings {
     #[serde(default)]
@@ -771,6 +995,27 @@ pub struct DirectDnsSettings {
 
 fn direct_dns_port_is_zero(port: &u16) -> bool {
     *port == 0
+}
+
+/// Normalize a suffix rule without permitting URL syntax or numeric hosts.
+pub fn canonical_bypass_domain(name: &str) -> Option<String> {
+    canonical_direct_dns_name(name.strip_suffix('.').unwrap_or(name))
+}
+
+pub fn normalize_bypass_domains(values: &[String]) -> Result<Vec<String>, ConfigError> {
+    if values.len() > MAX_BYPASS_DOMAINS {
+        return Err(ConfigError::TooManyBypassDomains);
+    }
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        let name =
+            canonical_bypass_domain(value).ok_or(ConfigError::InvalidBypassDomain(index + 1))?;
+        if seen.insert(name.clone()) {
+            result.push(name);
+        }
+    }
+    Ok(result)
 }
 
 fn canonical_direct_dns_name(name: &str) -> Option<String> {
@@ -836,6 +1081,10 @@ impl DirectDnsSettings {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with_bootstrap(true)
+    }
+
+    fn validate_with_bootstrap(&self, required: bool) -> Result<(), ConfigError> {
         if self.mode == DirectDnsMode::PhysicalSystem {
             if self != &Self::default() {
                 return Err(ConfigError::NonCanonicalPhysicalDirectDns);
@@ -848,7 +1097,7 @@ impl DirectDnsSettings {
         if self.port == 0 {
             return Err(ConfigError::InvalidDirectDnsPort);
         }
-        if self.bootstrap_ips.is_empty() {
+        if required && self.bootstrap_ips.is_empty() {
             return Err(ConfigError::MissingDirectDnsBootstrapIp);
         }
         if self.bootstrap_ips.len() > MAX_DIRECT_DNS_BOOTSTRAP_IPS {
@@ -891,12 +1140,24 @@ impl DirectDnsSettings {
     }
 }
 
+/// Address selection is independent of the saved custom address pair.
+/// Missing legacy fields preserve manual endpoint selection.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointSelection {
+    Automatic,
+    #[default]
+    Custom,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EndpointSettings {
     pub ipv4: Ipv4Addr,
     pub ipv6: Ipv6Addr,
     pub port: u16,
     pub sni: String,
+    #[serde(default)]
+    pub selection: EndpointSelection,
 }
 
 impl Default for EndpointSettings {
@@ -906,6 +1167,7 @@ impl Default for EndpointSettings {
             ipv6: DEFAULT_ENDPOINT_V6,
             port: DEFAULT_PORT,
             sni: DEFAULT_SNI.to_owned(),
+            selection: EndpointSelection::Automatic,
         }
     }
 }
@@ -1220,6 +1482,24 @@ fn valid_dns_name(value: &str) -> bool {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
+    #[error("ROUTING_RULE_INVALID:{0}")]
+    InvalidRoutingRule(Uuid),
+    #[error("ROUTING_RULE_CONFLICT:{0}:{1}")]
+    RoutingConflict(Uuid, Uuid),
+    #[error("ROUTING_RULE_LIMIT")]
+    RoutingLimit,
+    #[error("ROUTING_UPGRADE_REQUIRED")]
+    RoutingUpgradeRequired,
+    #[error("initial identity operation is invalid")]
+    InvalidInitialIdentityOperation,
+    #[error("no more than 256 bypass domains are allowed")]
+    TooManyBypassDomains,
+    #[error("invalid bypass domain at entry {0}")]
+    InvalidBypassDomain(usize),
+    #[error("chain_exit capability is required to replace an imported exit")]
+    ChainExitCapabilityRequired,
+    #[error("VPN Gate requires a valid pinned server selection")]
+    InvalidVpnGateSelection,
     #[error("edge-resolved proxy DNS requires the L4 data plane")]
     EdgeDnsRequiresL4,
     #[error("profile name must contain 1 to 64 visible characters")]
@@ -1258,6 +1538,26 @@ pub enum ConfigError {
     InvalidDirectDnsDohPath,
     #[error("DoT settings cannot contain a DoH path")]
     DirectDnsDotPathForbidden,
+    #[error("plain WARP DNS settings must use the canonical empty form")]
+    NonCanonicalPlainWarpDns,
+    #[error("encrypted WARP DNS requires a valid server name")]
+    InvalidWarpDnsServerName,
+    #[error("encrypted WARP DNS port must be between 1 and 65535")]
+    InvalidWarpDnsPort,
+    #[error("encrypted WARP DNS requires at least one bootstrap IP")]
+    MissingWarpDnsBootstrapIp,
+    #[error(
+        "no more than {MAX_DIRECT_DNS_BOOTSTRAP_IPS} WARP DNS bootstrap IPs are allowed, got {0}"
+    )]
+    TooManyWarpDnsBootstrapIps(usize),
+    #[error("duplicate WARP DNS bootstrap IP")]
+    DuplicateWarpDnsBootstrapIp,
+    #[error("WARP DNS bootstrap IP must be unicast")]
+    InvalidWarpDnsBootstrapIp,
+    #[error("WARP DoH path must be an absolute path without whitespace or a fragment")]
+    InvalidWarpDnsDohPath,
+    #[error("WARP DoT settings cannot contain a DoH path")]
+    WarpDnsDotPathForbidden,
     #[error("VPN mode cannot use the physical system DNS resolver")]
     VpnSystemDnsForbidden,
     #[error("VPN DNS server {0} is not a routable unicast address")]
@@ -1356,6 +1656,15 @@ impl ConfigError {
             Self::InvalidDirectDnsBootstrapIp => Some("DIRECT_DNS_BOOTSTRAP_INVALID"),
             Self::InvalidDirectDnsDohPath => Some("DIRECT_DNS_DOH_PATH_INVALID"),
             Self::DirectDnsDotPathForbidden => Some("DIRECT_DNS_DOT_PATH_FORBIDDEN"),
+            Self::NonCanonicalPlainWarpDns => Some("WARP_DNS_PLAIN_NOT_CANONICAL"),
+            Self::InvalidWarpDnsServerName => Some("WARP_DNS_SERVER_NAME_INVALID"),
+            Self::InvalidWarpDnsPort => Some("WARP_DNS_PORT_INVALID"),
+            Self::MissingWarpDnsBootstrapIp => Some("WARP_DNS_BOOTSTRAP_REQUIRED"),
+            Self::TooManyWarpDnsBootstrapIps(_) => Some("WARP_DNS_BOOTSTRAP_TOO_MANY"),
+            Self::DuplicateWarpDnsBootstrapIp => Some("WARP_DNS_BOOTSTRAP_DUPLICATE"),
+            Self::InvalidWarpDnsBootstrapIp => Some("WARP_DNS_BOOTSTRAP_INVALID"),
+            Self::InvalidWarpDnsDohPath => Some("WARP_DNS_DOH_PATH_INVALID"),
+            Self::WarpDnsDotPathForbidden => Some("WARP_DNS_DOT_PATH_FORBIDDEN"),
             _ => None,
         }
     }
@@ -1364,6 +1673,17 @@ impl ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_bypass_defaults_on_but_preserves_saved_settings() {
+        let mut network = SharedNetworkSettings::default();
+        assert!(network.allow_lan);
+        network.allow_lan = false;
+        let saved = serde_json::to_string(&network).expect("serialize settings");
+        let restored: SharedNetworkSettings =
+            serde_json::from_str(&saved).expect("deserialize settings");
+        assert!(!restored.allow_lan);
+    }
 
     #[test]
     fn defaults_match_the_product_contract() {
@@ -1610,6 +1930,8 @@ mod tests {
 
         profile.split_exclusions.clear();
         profile.dns_servers = vec![IpAddr::V4(profile.endpoint.ipv4)];
+        assert_eq!(profile.validate(), Ok(()));
+        profile.endpoint.selection = EndpointSelection::Custom;
         assert_eq!(
             profile.validate(),
             Err(ConfigError::VpnDnsServerBypassed(IpAddr::V4(
@@ -1793,6 +2115,7 @@ mod tests {
             ipv6: Ipv6Addr::new(0x2606, 0x4700, 0x0102, 0, 0, 0, 0, 2),
             port: 8443,
             sni: "shared.example.com".to_owned(),
+            selection: crate::EndpointSelection::Custom,
         };
         let stored = config.upsert_runtime_profile(registered).unwrap();
         assert_eq!(stored.endpoint.ipv4, DEFAULT_ENDPOINT_V4);
@@ -1824,6 +2147,7 @@ mod tests {
             ipv6: Ipv6Addr::new(0x2606, 0x4700, 0x0102, 0, 0, 0, 0, 2),
             port: 443,
             sni: "zt-masque.cloudflareclient.com".to_owned(),
+            selection: crate::EndpointSelection::Custom,
         };
         let stored = config.upsert_runtime_profile(registered).unwrap();
 
@@ -1840,6 +2164,7 @@ mod tests {
                 ipv6: Ipv6Addr::new(0x2606, 0x4700, 0x0102, 0, 0, 0, 0, 2),
                 port: 443,
                 sni: "zt-masque.cloudflareclient.com".to_owned(),
+                selection: crate::EndpointSelection::Custom,
             },
             mtu: 1400,
             ..Profile::default()

@@ -15,7 +15,6 @@ import java.util.zip.ZipOutputStream
 internal object AndroidMaintenance {
     private const val UPDATE_PREFERENCES = "usque_update_state_v1"
     private const val MAX_UPDATE_RESULT_BYTES = 16 * 1024
-    private const val MAX_DIAGNOSTIC_LOG_BYTES = 2 * 1024 * 1024
     private const val MAX_DIAGNOSTIC_BUNDLE_BYTES = 8 * 1024 * 1024
     private const val RELEASE_URL_PREFIX =
         "https://github.com/GeorgeXie2333/usque-app/releases/"
@@ -54,71 +53,27 @@ internal object AndroidMaintenance {
         snapshot: Map<String, Any?>,
         diagnosticSession: Map<String, Any?>? = null,
         connectionTimeline: Map<String, Any?> = emptyMap(),
+        logSnapshot: AndroidLogStore.Snapshot? = null,
     ) {
-        val logs = AndroidLogStore(context).diagnosticSnapshot(MAX_DIAGNOSTIC_LOG_BYTES)
-        val connection =
-            JSONObject()
-                .put("phase", safeEnum(snapshot["phase"], CONNECTION_PHASES, "unknown"))
-                .put("transport", safeEnum(snapshot["transport"], setOf("h2", "h3"), null))
-                .put("data_plane", L4StatusFields.mode(snapshot["data_plane"]))
-                .put(
-                    "l4",
-                    L4StatusFields
-                        .decode(
-                            (snapshot["l4"] as? Map<*, *>)?.let {
-                                JSONObject(it).toString()
-                            },
-                        )?.let { JSONObject(it) },
-                ).put(
-                    "address_family",
-                    safeEnum(snapshot["address_family"], setOf("ipv4", "ipv6", "dual"), null),
-                ).put("reconnect_count", safeCounter(snapshot["reconnect_count"]))
-                .put(
-                    "kill_switch_state",
-                    safeEnum(snapshot["kill_switch_state"], KILL_SWITCH_STATES, "unknown"),
-                ).put("platform_lockdown", snapshot["platform_lockdown"] == true)
-                .put("always_on", snapshot["always_on"] == true)
-                .put(
-                    "active_listener_count",
-                    (snapshot["active_listeners"] as? List<*>)?.size?.coerceAtMost(32) ?: 0,
-                ).put("exit_ipv4_observed", snapshot["exit_ipv4"] != null)
-                .put("exit_ipv6_observed", snapshot["exit_ipv6"] != null)
+        val capturedLogs =
+            logSnapshot?.let { AndroidLogStore.fromMap(it.toMap()) } ?: AndroidLogStore.readPersisted(context)
+        val logs = capturedLogs.lines
+        val capture = DiagnosticMetadata.captureSummary(snapshot, connectionTimeline)
+        val scopedTimeline =
+            if (capture["timeline_scope_availability"] == "stale") {
+                connectionTimeline +
+                    mapOf("events" to emptyList<Any>(), "metrics" to emptyMap<String, Any>(), "availability" to "stale")
+            } else {
+                connectionTimeline
+            }
+        val connection = sanitizeConnectionSummary(snapshot)
         val configuration =
             JSONObject()
                 .put("platform", "android")
                 .put("vpn_service_diagnostics", true)
                 .put("diagnostic_modes", listOf("standard", "deep"))
                 .put("automatic_upload", false)
-        val platformHealth =
-            JSONObject()
-                .put(
-                    "vpn_service_state",
-                    safeEnum(snapshot["vpn_service_state"], SERVICE_STATES, "unknown"),
-                ).put(
-                    "vpn_process_state",
-                    safeEnum(snapshot["vpn_process_state"], PROCESS_STATES, "unknown"),
-                ).put("tun_fd_valid", snapshot["tun_fd_valid"] == true)
-                .put("tun_interface_present", snapshot["tun_interface_present"] == true)
-                .put(
-                    "underlying_network_present",
-                    snapshot["underlying_network_present"] == true,
-                ).put("underlying_family_mask", safeCounter(snapshot["underlying_family_mask"]))
-                .put("network_generation", safeCounter(snapshot["network_generation"]))
-                .put("dns_server_count", safeCounter(snapshot["dns_server_count"]))
-                .put("always_on_state", snapshot["always_on"] == true)
-                .put("lockdown_state", snapshot["platform_lockdown"] == true)
-                .put(
-                    "foreground_notification_state",
-                    safeEnum(
-                        snapshot["foreground_notification_state"],
-                        NOTIFICATION_STATES,
-                        "unknown",
-                    ),
-                ).put(
-                    "native_runtime_state",
-                    safeEnum(snapshot["native_runtime_state"], RUNTIME_STATES, "unknown"),
-                ).put("pending_cleanup", snapshot["pending_cleanup"] == true)
-                .put("independent_leak_verification", false)
+        val platformHealth = sanitizePlatformHealth(snapshot)
         val readme =
             """
             Usque diagnostic bundle
@@ -133,17 +88,26 @@ internal object AndroidMaintenance {
         payloads["configuration-summary.json"] = configuration.toString(2).toByteArray()
         payloads["connection-summary.json"] = connection.toString(2).toByteArray()
         payloads["connection-timeline.json"] =
-            sanitizeConnectionTimeline(connectionTimeline).toString(2).toByteArray()
+            sanitizeConnectionTimeline(scopedTimeline).toString(2).toByteArray()
+        payloads["export-capture.json"] = JSONObject(capture).toString(2).toByteArray()
         payloads["platform-health.json"] = platformHealth.toString(2).toByteArray()
         NetworkQualityFields.diagnostic(snapshot["network_quality"], snapshot["data_plane"] == "l4_proxy")?.let {
             payloads["network-quality.json"] = it.toString(2).toByteArray()
         }
-        val sanitizedSession = diagnosticSession?.let(::sanitizeDiagnosticSession)
+        val sanitizedSession =
+            diagnosticSession?.let {
+                sanitizeDiagnosticSession(
+                    it,
+                    DiagnosticMetadata.connectionId(snapshot),
+                    DiagnosticMetadata.unsigned(snapshot["network_generation"]),
+                )
+            }
         if (diagnosticSession != null) {
             payloads["diagnostic-session.json"] =
                 requireNotNull(sanitizedSession).toString(2).toByteArray()
         }
         if (logs.isNotEmpty()) payloads["logs/android-engine.jsonl"] = logs.toByteArray()
+        payloads["log-storage-health.json"] = JSONObject(capturedLogs.health).toString(2).toByteArray()
         payloads["README.txt"] = readme.toByteArray()
         val payloadBytes = payloads.values.sumOf(ByteArray::size)
         if (payloadBytes > MAX_DIAGNOSTIC_BUNDLE_BYTES) {
@@ -202,6 +166,74 @@ internal object AndroidMaintenance {
         }
     }
 
+    internal fun sanitizeConnectionSummary(snapshot: Map<String, Any?>): JSONObject {
+        val platform = observedPlatformFields(snapshot)
+        val result =
+            JSONObject()
+                .put("phase", safeEnum(snapshot["phase"], CONNECTION_PHASES, "unknown"))
+                .put("transport", safeEnum(snapshot["transport"], setOf("h2", "h3"), null))
+                .put("data_plane", L4StatusFields.mode(snapshot["data_plane"]))
+                .put(
+                    "l4",
+                    L4StatusFields
+                        .decode((snapshot["l4"] as? Map<*, *>)?.let { JSONObject(it).toString() })
+                        ?.let { JSONObject(it) },
+                ).put("address_family", safeEnum(snapshot["address_family"], setOf("ipv4", "ipv6", "dual"), null))
+                .put("reconnect_count", DiagnosticMetadata.unsigned(snapshot["reconnect_count"]))
+                .put("kill_switch_state", safeEnum(snapshot["kill_switch_state"], KILL_SWITCH_STATES, "unknown"))
+                .put("platform_lockdown", platform["platform_lockdown"] as? Boolean)
+                .put("always_on", platform["always_on"] as? Boolean)
+                .put("platform_observation", platformObservation(snapshot))
+                .put("active_listener_count", (snapshot["active_listeners"] as? List<*>)?.size?.coerceAtMost(32))
+        for (family in listOf("ipv4", "ipv6")) {
+            val key = "exit_$family"
+            val value = snapshot[key]
+            if (snapshot.containsKey(key) && (value == null || value is String)) {
+                result.put("${key}_observed", value?.isNotBlank() == true)
+            }
+        }
+        return result
+    }
+
+    internal fun sanitizePlatformHealth(snapshot: Map<String, Any?>): JSONObject {
+        val platform = observedPlatformFields(snapshot)
+        val result =
+            JSONObject()
+                .put("observation", platformObservation(snapshot))
+                .put("vpn_service_state", safeEnum(platform["vpn_service_state"], SERVICE_STATES, "unknown"))
+                .put("vpn_process_state", safeEnum(platform["vpn_process_state"], PROCESS_STATES, "unknown"))
+                .put(
+                    "foreground_notification_state",
+                    safeEnum(platform["foreground_notification_state"], NOTIFICATION_STATES, "unknown"),
+                ).put("native_runtime_state", safeEnum(platform["native_runtime_state"], RUNTIME_STATES, "unknown"))
+                .put("independent_leak_verification", false)
+        for ((output, input) in PLATFORM_BOOLEAN_FIELDS) {
+            result.put(output, platform[input] as? Boolean)
+        }
+        for (key in listOf("underlying_family_mask", "network_generation", "dns_server_count")) {
+            result.put(key, DiagnosticMetadata.unsigned(platform[key]))
+        }
+        return result
+    }
+
+    private fun observedPlatformFields(snapshot: Map<String, Any?>): Map<String, Any?> =
+        if (snapshot["platform_state_observed"] == true) snapshot else emptyMap()
+
+    private fun platformObservation(snapshot: Map<String, Any?>): JSONObject =
+        JSONObject()
+            .put("source", "platform")
+            .put("availability", if (snapshot["platform_state_observed"] == true) "observed" else "unavailable")
+
+    private val PLATFORM_BOOLEAN_FIELDS =
+        mapOf(
+            "tun_fd_valid" to "tun_fd_valid",
+            "tun_interface_present" to "tun_interface_present",
+            "underlying_network_present" to "underlying_network_present",
+            "always_on_state" to "always_on",
+            "lockdown_state" to "platform_lockdown",
+            "pending_cleanup" to "pending_cleanup",
+        )
+
     // Clear-all must know whether persistence succeeded before continuing.
     @SuppressLint("ApplySharedPref", "UseKtx")
     fun clearLocalState(context: Context) {
@@ -217,9 +249,9 @@ internal object AndroidMaintenance {
         check(AndroidLocaleController.clear(context)) {
             "Android locale state could not be cleared"
         }
-        AndroidLogStore(context).clear()
+        AndroidLogStore.clearPersisted(context)
         FlagSvgCache(context).clear()
-        PerAppProxyStore.clear(context)
+        AndroidPolicyStore.clear(context)
     }
 
     internal fun parseUpdateResult(json: String): Map<String, Any?> {
@@ -271,19 +303,42 @@ internal object AndroidMaintenance {
         )
     }
 
-    internal fun sanitizeDiagnosticSession(source: Map<String, Any?>): JSONObject {
+    internal fun sanitizeDiagnosticSession(
+        source: Map<String, Any?>,
+        expectedConnectionId: String? = null,
+        expectedNetworkGeneration: Long? = null,
+    ): JSONObject {
         val startedAt = safeCounter(source["started_at_unix_milliseconds"])
         val state = safeEnum(source["state"], SESSION_STATES, "failed") ?: "failed"
         val mode = safeEnum(source["mode"], DIAGNOSTIC_MODES, "standard") ?: "standard"
         val findings = JSONArray()
         val statuses = mutableListOf<String>()
+        var currentCheck: String? = null
         val rawFindings = source["findings"] as? List<*> ?: emptyList<Any?>()
         for (rawFinding in rawFindings.take(MAX_DIAGNOSTIC_FINDINGS)) {
             val finding = stringMap(rawFinding) ?: continue
             val checkId = (finding["check_id"] as? String)?.takeIf(CHECK_IDS::contains) ?: continue
+            val observation = DiagnosticMetadata.observation(finding["observation"])
+            val scoped = observation?.get("source") in setOf("runtime", "platform", "active_probe")
+            val observedId = observation?.get("connection_instance_id") as? String
+            val observedGeneration = DiagnosticMetadata.unsigned(observation?.get("network_generation"))
+            val mismatched =
+                scoped && (
+                    (expectedConnectionId != null && observedId != null && expectedConnectionId != observedId) ||
+                        (
+                            expectedNetworkGeneration != null && observedGeneration != null &&
+                                expectedNetworkGeneration != observedGeneration
+                        )
+                )
             val status =
-                safeEnum(finding["status"], CHECK_STATUSES, "skipped") ?: "skipped"
+                if (mismatched) {
+                    "skipped"
+                } else {
+                    safeEnum(finding["status"], CHECK_STATUSES, "skipped")
+                        ?: "skipped"
+                }
             statuses += status
+            if (status == "running" && currentCheck == null) currentCheck = checkId
             val output =
                 JSONObject()
                     .put("check_id", checkId)
@@ -291,7 +346,7 @@ internal object AndroidMaintenance {
                     .put("status", status)
                     .put(
                         "severity",
-                        safeEnum(finding["severity"], SEVERITIES, "info") ?: "info",
+                        if (mismatched) "info" else safeEnum(finding["severity"], SEVERITIES, "info") ?: "info",
                     ).put("duration_milliseconds", safeCounter(finding["duration_milliseconds"]))
             val expectedSummary = "diagnostics.$checkId.$status"
             if (finding["summary_key"] == expectedSummary) {
@@ -301,27 +356,42 @@ internal object AndroidMaintenance {
                 ?.takeIf(
                     NETWORK_SUMMARIES::contains,
                 )?.let { output.put("summary_key", it) }
-            safeRemediationKey(finding["remediation_key"])?.let { key ->
+            (if (mismatched) "nq_retry" else safeRemediationKey(finding["remediation_key"]))?.let { key ->
                 output.put("remediation_key", key)
             }
             val evidence = JSONArray()
-            (finding["sanitized_evidence"] as? List<*>)
+            (if (mismatched) emptyList<Any>() else finding["sanitized_evidence"] as? List<*>)
                 ?.asSequence()
                 ?.filterIsInstance<String>()
                 ?.filter(::safeEvidence)
                 ?.take(MAX_EVIDENCE_ITEMS)
                 ?.forEach(evidence::put)
             output.put("sanitized_evidence", evidence)
+            observation?.let {
+                output.put(
+                    "observation",
+                    JSONObject(if (mismatched) it + ("availability" to "stale") else it),
+                )
+            }
+            val typedEvidence = JSONArray()
+            (if (mismatched) emptyList<Any>() else finding["evidence"] as? List<*>)
+                ?.mapNotNull(DiagnosticMetadata::evidence)
+                ?.take(MAX_EVIDENCE_ITEMS)
+                ?.forEach { typedEvidence.put(JSONObject(it)) }
+            output.put("evidence", typedEvidence)
             val findingStarted = safeCounter(finding["started_at_unix_milliseconds"])
             if (startedAt > 0 && findingStarted >= startedAt) {
                 output.put("started_after_milliseconds", findingStarted - startedAt)
             }
             (finding["dependency_reason"] as? String)
-                ?.takeIf(CHECK_IDS::contains)
+                ?.takeIf { it in CHECK_IDS || it in DiagnosticsContract.remediationKeys }
                 ?.let { dependency -> output.put("dependency_reason", dependency) }
-            sanitizeFailure(finding["failure"])?.let { failure ->
-                output.put("failure", failure)
+            if (!mismatched) {
+                sanitizeFailure(finding["failure"])?.let { failure ->
+                    output.put("failure", failure)
+                }
             }
+            if (mismatched) output.put("summary_key", "nq_finding_stale")
             findings.put(output)
         }
         val output =
@@ -335,9 +405,7 @@ internal object AndroidMaintenance {
                 .put("progress_percent", safeCounter(source["progress_percent"]).coerceAtMost(100))
                 .put("findings", findings)
                 .put("summary", diagnosticSummary(statuses))
-        (source["current_check"] as? String)
-            ?.takeIf(CHECK_IDS::contains)
-            ?.let { current -> output.put("current_check", current) }
+        currentCheck?.let { output.put("current_check", it) }
         val completedAt = safeCounter(source["completed_at_unix_milliseconds"])
         if (startedAt > 0 && completedAt >= startedAt) {
             output.put("completed_after_milliseconds", completedAt - startedAt)
@@ -373,6 +441,22 @@ internal object AndroidMaintenance {
             safeEnum(event["address_family"], ADDRESS_FAMILIES, null)?.let { family ->
                 output.put("address_family", family)
             }
+            safeEnum(
+                event["queue_kind"],
+                setOf(
+                    "tun_to_transport",
+                    "proxy_to_transport",
+                    "transport_outgoing",
+                    "h3_datagram_send",
+                    "h3_wire_send",
+                    "transport_to_tun",
+                    "transport_to_proxy",
+                    "direct_dns",
+                ),
+                null,
+            )?.let {
+                output.put("queue_kind", it)
+            }
             (event["duration_milliseconds"] as? Number)?.let { duration ->
                 output.put("duration_milliseconds", safeCounter(duration))
             }
@@ -392,7 +476,9 @@ internal object AndroidMaintenance {
             }
         }
         for (key in COUNTER_METRICS) {
-            metrics.put(key, safeCounter(metricsSource[key]))
+            (metricsSource[key] as? Number)?.let { value ->
+                metrics.put(key, safeCounter(value))
+            }
         }
         if (metricsSource["current_smoothed_rtt_known"] == true) {
             metrics.put(
@@ -406,11 +492,30 @@ internal object AndroidMaintenance {
         (metricsSource["last_reconnect_code"] as? String)
             ?.takeIf(FAILURE_CODES::contains)
             ?.let { code -> metrics.put("last_reconnect_code", code) }
-        return JSONObject()
-            .put("schema_version", 1)
-            .put("events", events)
-            .put("metrics", metrics)
-            .put("dropped_event_count", safeCounter(source["dropped_event_count"]))
+        val result =
+            JSONObject()
+                .put("schema_version", 1)
+                .put("events", events)
+                .put("metrics", metrics)
+                .put("dropped_event_count", safeCounter(source["dropped_event_count"]))
+        DiagnosticMetadata.runtimeId(source["connection_instance_id"])?.let { result.put("connection_instance_id", it) }
+        DiagnosticMetadata.unsigned(source["session_generation"])?.let { result.put("session_generation", it) }
+        (source["retained"] as? Boolean)?.let { result.put("retained", it) }
+        (source["source"] as? String)?.takeIf { it in setOf("runtime", "platform") }?.let { result.put("source", it) }
+        (source["availability"] as? String)
+            ?.takeIf {
+                it in setOf("observed", "inferred", "unavailable", "stale")
+            }?.let { result.put("availability", it) }
+        if (includeLiveTimestamps) {
+            DiagnosticMetadata.unsigned(source["captured_at_unix_milliseconds"])?.let {
+                result.put("captured_at_unix_milliseconds", it)
+            }
+        } else {
+            DiagnosticMetadata.unsigned(source["captured_at_unix_milliseconds"])?.let {
+                result.put("capture_age_milliseconds", (System.currentTimeMillis() - it).coerceAtLeast(0L))
+            }
+        }
+        return result
     }
 
     private fun sanitizeFailure(value: Any?): JSONObject? {
@@ -486,17 +591,7 @@ internal object AndroidMaintenance {
                 }
             }
 
-    private fun safeEvidence(value: String): Boolean =
-        value in STATIC_EVIDENCE ||
-            EVIDENCE_COUNTER_PREFIXES.any { prefix ->
-                value.removePrefix(prefix).let { suffix ->
-                    suffix.length < value.length &&
-                        suffix.isNotEmpty() &&
-                        suffix.length <= 20 &&
-                        suffix.toULongOrNull() != null &&
-                        suffix.all { character -> character in '0'..'9' }
-                }
-            }
+    private fun safeEvidence(value: String): Boolean = DiagnosticMetadata.fromLegacy(value) != null
 
     private fun stringMap(value: Any?): Map<String, Any?>? {
         val source = value as? Map<*, *> ?: return null
@@ -552,177 +647,11 @@ internal object AndroidMaintenance {
     private val SEVERITIES = setOf("info", "warning", "error", "critical")
     private val TRANSPORTS = setOf("h2", "h3", "http2", "http3")
     private val ADDRESS_FAMILIES = setOf("ipv4", "ipv6", "dual")
-    private val TRANSPORT_STAGES =
-        setOf(
-            "endpoint_resolution",
-            "socket_creation",
-            "socket_protection",
-            "socket_connect",
-            "tls_handshake",
-            "quic_handshake",
-            "masque_connect",
-            "peer_settings",
-            "address_assignment",
-            "tunnel_startup",
-            "packet_send",
-            "packet_receive",
-            "dns_apply",
-            "route_apply",
-            "kill_switch_apply",
-            "platform_recovery",
-            "diagnostics",
-        )
-    private val EVENT_TYPES =
-        setOf(
-            "attempt_started",
-            "endpoint_resolved",
-            "socket_connected",
-            "tls_ready",
-            "quic_ready",
-            "masque_accepted",
-            "peer_settings_received",
-            "address_assigned",
-            "tunnel_ready",
-            "first_packet_sent",
-            "first_packet_received",
-            "fallback_started",
-            "reconnect_scheduled",
-            "network_changed",
-            "recovery_probe_started",
-            "recovery_probe_succeeded",
-            "recovery_probe_failed",
-            "path_promoted",
-            "migration_started",
-            "migration_path_validated",
-            "migration_promoted",
-            "migration_failed",
-            "pmtu_changed",
-            "pmtu_revalidation_started",
-            "pmtu_revalidation_failed",
-            "queue_saturated",
-            "disconnected",
-            "failed",
-        )
-    private val CHECK_IDS =
-        setOf(
-            "engine.control_channel",
-            "engine.event_stream",
-            "engine.capabilities",
-            "engine.configuration",
-            "engine.secure_storage_metadata",
-            "frontend.socks_port",
-            "frontend.http_port",
-            "frontend.system_proxy_state",
-            "physical.network_present",
-            "physical.ipv4_route",
-            "physical.ipv6_route",
-            "physical.dns_available",
-            "physical.network_generation",
-            "transport.h3_connect",
-            "transport.h3_datagram",
-            "transport.h2_tcp",
-            "transport.h2_tls",
-            "transport.h2_connect",
-            "transport.endpoint_pin",
-            "transport.fallback_policy",
-            "tunnel.address_assignment",
-            "tunnel.routes",
-            "tunnel.dns",
-            "tunnel.first_packet",
-            "tunnel.ipv4_egress",
-            "tunnel.ipv6_egress",
-            "protection.kill_switch",
-            "protection.dns_path",
-            "protection.route_ownership",
-            "protection.recovery_journal",
-            "quality.rtt",
-            "quality.packet_loss",
-            "quality.queue_pressure",
-            "quality.pmtu",
-            "transport.migration_capability",
-            "dns.direct_encrypted_configuration",
-            "dns.direct_encrypted_runtime_state",
-            "dns.direct_encrypted_reachability",
-            "transport.h3_path_validation_probe",
-        )
-    private val FAILURE_CODES =
-        setOf(
-            "ENGINE_UNAVAILABLE",
-            "AGENT_UNREACHABLE",
-            "VPN_SERVICE_UNAVAILABLE",
-            "PROXY_PORT_IN_USE",
-            "PHYSICAL_IPV4_UNAVAILABLE",
-            "PHYSICAL_IPV6_UNAVAILABLE",
-            "PHYSICAL_DNS_UNAVAILABLE",
-            "PHYSICAL_NETWORK_CHANGED",
-            "H3_UDP_UNREACHABLE",
-            "H3_HANDSHAKE_TIMEOUT",
-            "H3_PROTOCOL_ERROR",
-            "H3_DATAGRAM_UNAVAILABLE",
-            "H3_CONNECTION_CLOSED",
-            "PMTU_REVALIDATION_EXHAUSTED",
-            "H2_TCP_CONNECT_FAILED",
-            "H2_TLS_FAILED",
-            "H2_STREAM_CLOSED",
-            "H2_CONNECT_REJECTED",
-            "H2_GOAWAY",
-            "ALL_TRANSPORTS_FAILED",
-            "ENDPOINT_PIN_MISMATCH",
-            "IDENTITY_INVALID",
-            "AUTHENTICATION_FAILED",
-            "CONFIGURATION_INVALID",
-            "CONNECT_IP_REJECTED",
-            "ADDRESS_ASSIGNMENT_INVALID",
-            "TUN_ADDRESS_MISSING",
-            "SOCKET_PROTECTION_FAILED",
-            "SOCKET_AFFINITY_INVALID",
-            "DNS_APPLY_FAILED",
-            "ROUTE_APPLY_FAILED",
-            "KILL_SWITCH_APPLY_FAILED",
-            "KILL_SWITCH_STATE_MISMATCH",
-            "SYSTEM_PROXY_STATE_MISMATCH",
-            "ROUTE_RESTORE_INCOMPLETE",
-            "DNS_RESTORE_INCOMPLETE",
-            "SYSTEM_PROXY_STALE",
-            "PLATFORM_RECOVERY_PENDING",
-            "PACKET_SEND_FAILED",
-            "PACKET_SEND_TIMEOUT",
-            "PACKET_RECEIVE_FAILED",
-            "PACKET_RECEIVE_STALLED",
-            "SEND_QUEUE_FULL",
-            "DIAGNOSTIC_ALREADY_RUNNING",
-            "DIAGNOSTIC_TIMEOUT",
-            "DIAGNOSTIC_CANCELLED",
-            "DIAGNOSTIC_DEPENDENCY_FAILED",
-            "INTERNAL",
-            "L4_SESSION_UNAVAILABLE",
-            "L4_PROTOCOL_ERROR",
-            "L4_CONNECT_REJECTED",
-            "L4_CONNECT_TIMEOUT",
-            "L4_RESOURCE_EXHAUSTED",
-            "L4_DNS_FAILED",
-        )
-    private val REMEDIATION_KEYS =
-        setOf(
-            "nq_profile",
-            "nq_retry",
-            "nq_network",
-            "nq_reconnect",
-            "none",
-            "retry",
-            "try_http2",
-            "check_physical_network",
-            "refresh_or_replace_identity",
-            "replace_identity",
-            "review_configuration",
-            "restore_platform_state",
-            "resolve_dependency",
-            "run_deep_diagnostics",
-            "run_release_leak_gate",
-            "inspect_platform_state",
-            "generate_tunnel_traffic",
-            "export_diagnostics",
-        )
+    private val TRANSPORT_STAGES = DiagnosticMetadata.transportStages
+    private val EVENT_TYPES = DiagnosticsContract.eventTypes
+    private val CHECK_IDS = DiagnosticsContract.checkIds
+    private val FAILURE_CODES = DiagnosticsContract.failureCodes
+    private val REMEDIATION_KEYS = DiagnosticsContract.remediationKeys
     private val DURATION_METRICS =
         setOf(
             "last_connect_duration_milliseconds",
@@ -739,55 +668,7 @@ internal object AndroidMaintenance {
         )
     private val FAILURE_DETAIL_PREFIXES =
         setOf("attempt ", "status ", "generation ", "queue depth ")
-    private val STATIC_EVIDENCE =
-        setOf(
-            "network=present",
-            "network=absent",
-            "kill_switch=active",
-            "kill_switch=inactive",
-            "kill_switch=notApplicable",
-            "kill_switch=unknown",
-        )
-    private val EVIDENCE_COUNTER_PREFIXES =
-        setOf(
-            "dns_server_count=",
-            "generation=",
-            "rtt_ms=",
-            "loss_basis_points=",
-            "queue_percent=",
-            "queue_drops=",
-            "pmtu_bytes=",
-            "pmtu_failures=",
-            "migration_failures=",
-            "dns_successes=",
-            "dns_failures=",
-            "dns_timeouts=",
-            "plaintext_fallback=",
-            "probe_ms=",
-        )
-    private val NETWORK_SUMMARIES =
-        setOf(
-            "nq_finding_unavailable",
-            "nq_finding_invalid_configuration",
-            "nq_finding_dns_system",
-            "nq_finding_unsupported",
-            "nq_finding_dns_custom_valid",
-            "nq_finding_stale",
-            "nq_finding_rtt_high",
-            "nq_finding_healthy",
-            "nq_finding_loss_high",
-            "nq_finding_queue_pressure",
-            "nq_finding_pmtu_degraded",
-            "nq_finding_migration_reconnect",
-            "nq_finding_dns_changed",
-            "nq_finding_dns_runtime",
-            "nq_finding_dns_degraded",
-            "nq_finding_probe_unsafe",
-            "nq_finding_probe_success",
-            "nq_finding_probe_cancelled",
-            "nq_finding_probe_timeout",
-            "nq_finding_probe_failed",
-        )
+    private val NETWORK_SUMMARIES = DiagnosticsContract.summaryKeys
     private val SERVICE_STATES = setOf("running", "stopped", "unknown")
     private val PROCESS_STATES = setOf("reachable", "unreachable", "unknown")
     private val NOTIFICATION_STATES = setOf("active", "inactive", "unknown")

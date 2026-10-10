@@ -7,17 +7,20 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket as TokioUdpSocket};
 use tokio::sync::{Mutex, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 #[cfg(test)]
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+#[cfg(test)]
 use ts_netstack_smoltcp::CreateSocket;
+#[cfg(test)]
 use ts_netstack_smoltcp::netcore::Channel;
+#[cfg(test)]
 use ts_netstack_smoltcp::netsock::UdpSocket as StackUdpSocket;
 use usque_core::{OperatingMode, Profile, ProxyAuthCredentials};
 
-use crate::dns::Resolver;
+use crate::dns::{CandidateResolution, Resolver};
 use crate::geo_direct::{
     GeoDirectPolicy, GeoRoute, GeoTarget, RoutedTcpStream, bind_protected_udp, connect_routed,
 };
@@ -29,6 +32,7 @@ use crate::netstack::{
 use crate::pin_refresh::EndpointPinRefresher;
 #[cfg(test)]
 use crate::port_allocator::next_tcp_port;
+#[cfg(test)]
 use crate::port_allocator::next_udp_port;
 use crate::socket::{
     DirectEgressLease, DirectProtocol, SocketProtector, noop_socket_protector, socket_handle,
@@ -58,6 +62,7 @@ const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TARGET_ADDRESSES: usize = 16;
 const MAX_UDP_DATAGRAM: usize = 65_535;
 const UDP_RESPONSE_CAPACITY: usize = 128;
+const MAX_UDP_DNS_QUERIES: usize = 4;
 
 pub struct Socks5Runtime {
     stack: PacketStack,
@@ -206,6 +211,7 @@ impl Socks5Frontend {
         let cancellation = services.cancellation.child_token();
         let (failure_tx, failure) = watch::channel(None);
         let context = Arc::new(SocksContext {
+            traffic_policy: services.traffic_policy,
             relay_buffer: if profile.data_plane == usque_core::DataPlaneMode::L4Proxy {
                 crate::l4::Limits::platform().relay
             } else {
@@ -213,14 +219,12 @@ impl Socks5Frontend {
             },
             admission: services.admission,
             channel: services.udp,
-            resolver: services.resolver,
+            resolver: services.resolver.with_routing(services.geo_policy.clone()),
             dialer: services.dialer,
             edge_resolved: profile.proxy.dns_mode == usque_core::ProxyDnsMode::EdgeResolved,
             protector: services.protector,
             geo_policy: services.geo_policy,
             counters: services.counters,
-            assigned_ipv4: services.ipv4,
-            assigned_ipv6: services.ipv6,
             udp_idle_timeout: Duration::from_secs(u64::from(
                 profile.proxy.udp_idle_timeout_seconds.max(1),
             )),
@@ -280,17 +284,16 @@ impl Drop for Socks5Frontend {
 }
 
 struct SocksContext {
+    traffic_policy: Arc<crate::application_traffic::ApplicationTrafficPolicy>,
     relay_buffer: usize,
     admission: Option<Arc<crate::tcp::FrontendAdmission>>,
-    channel: Option<Channel>,
+    channel: Option<Arc<dyn crate::proxy_udp::UdpFactory>>,
     dialer: Arc<dyn crate::tcp::TcpDialer>,
     edge_resolved: bool,
     resolver: Resolver,
     protector: Arc<dyn SocketProtector>,
     geo_policy: Arc<GeoDirectPolicy>,
     counters: Arc<TrafficCounters>,
-    assigned_ipv4: Ipv4Addr,
-    assigned_ipv6: Ipv6Addr,
     udp_idle_timeout: Duration,
     cancellation: tokio_util::sync::CancellationToken,
     failure: watch::Sender<Option<String>>,
@@ -362,7 +365,8 @@ async fn serve_client(
             read_request(&mut client).await
         }) => result.map_err(|_| TransportError::Socks5("SOCKS5 negotiation timed out".to_owned()))??,
     };
-    if matches!(&*context.health.borrow(), RuntimeHealth::Failed { .. })
+    if !context.dialer.is_ready()
+        || matches!(&*context.health.borrow(), RuntimeHealth::Failed { .. })
         || (context.channel.is_some()
             && !matches!(&*context.health.borrow(), RuntimeHealth::Connected { .. }))
     {
@@ -435,7 +439,8 @@ async fn serve_udp_association(
     context: Arc<SocksContext>,
     request: SocksRequest,
 ) -> Result<(), TransportError> {
-    let Some(channel) = context.channel.as_ref() else {
+    let dns = context.resolver.stream_dns();
+    if context.channel.is_none() && dns.is_none() {
         send_reply(
             &mut control,
             REPLY_COMMAND_UNSUPPORTED,
@@ -443,7 +448,7 @@ async fn serve_udp_association(
         )
         .await?;
         return Ok(());
-    };
+    }
     let requested_ip = match request.target {
         Target::Address(address) if !address.is_unspecified() => Some(address),
         Target::Address(_) | Target::Domain(_) => None,
@@ -460,49 +465,82 @@ async fn serve_udp_association(
         ));
     }
 
+    let association_cancel = context.cancellation.child_token();
+    let association_guard = association_cancel.clone().drop_guard();
+    let _udp_buffers = if dns.is_some()
+        && let Some(admission) = &context.admission
+    {
+        let Some(lease) = admission.reserve_udp_buffers() else {
+            send_reply(&mut control, REPLY_GENERAL_FAILURE, unspecified_for(peer)).await?;
+            return Ok(());
+        };
+        Some(lease)
+    } else {
+        None
+    };
+    let opened = match context.channel.as_ref() {
+        Some(channel) if dns.is_some() => Ok(Arc::new(crate::proxy_udp::LazyAssociation::new(
+            channel.clone(),
+            association_cancel.clone(),
+        ))
+            as Arc<dyn crate::proxy_udp::UdpAssociation>),
+        Some(channel) => {
+            channel
+                .open(&association_cancel, Instant::now() + REMOTE_CONNECT_TIMEOUT)
+                .await
+        }
+        None => {
+            Ok(Arc::new(crate::proxy_udp::DirectOnly) as Arc<dyn crate::proxy_udp::UdpAssociation>)
+        }
+    };
+    let (association, tunnel_udp_unavailable): (Arc<dyn crate::proxy_udp::UdpAssociation>, bool) =
+        match opened {
+            Ok(a) => (a, context.channel.is_none()),
+            Err(crate::tcp::DialError::Rejected(7))
+                if dns.is_some() || context.geo_policy.is_enabled() =>
+            {
+                (Arc::new(crate::proxy_udp::DirectOnly), true)
+            }
+            Err(error) => {
+                send_reply(
+                    &mut control,
+                    if matches!(error, crate::tcp::DialError::Rejected(7)) {
+                        REPLY_COMMAND_UNSUPPORTED
+                    } else {
+                        REPLY_GENERAL_FAILURE
+                    },
+                    unspecified_for(peer),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
     let relay_ip = control.local_addr()?.ip();
     let relay = Arc::new(TokioUdpSocket::bind(SocketAddr::new(relay_ip, 0)).await?);
     let relay_address = relay.local_addr()?;
     send_reply(&mut control, REPLY_SUCCEEDED, relay_address).await?;
 
-    let association_cancel = CancellationToken::new();
-    let (response_tx, mut response_rx) = mpsc::channel(UDP_RESPONSE_CAPACITY);
+    let packet_limit = if dns.is_some() {
+        16 * 1024 - 48
+    } else {
+        MAX_UDP_DATAGRAM
+    };
+    let (response_tx, mut response_rx) = mpsc::channel(if dns.is_some() {
+        16
+    } else {
+        UDP_RESPONSE_CAPACITY
+    });
     let mut response_tasks = Vec::with_capacity(4);
-    let v4_socket = Arc::new(
-        channel
-            .udp_bind(SocketAddr::new(
-                IpAddr::V4(context.assigned_ipv4),
-                next_udp_port(),
-            ))
-            .await
-            .map_err(|error| TransportError::Socks5(format!("bind tunnel UDP/IPv4: {error}")))?,
-    );
-    response_tasks.push(spawn_udp_receiver(
-        Arc::clone(&v4_socket),
+    response_tasks.push(spawn_association_receiver(
+        association.clone(),
         response_tx.clone(),
         association_cancel.clone(),
-        context.cancellation.clone(),
     ));
-    let v6_socket = Arc::new(
-        channel
-            .udp_bind(SocketAddr::new(
-                IpAddr::V6(context.assigned_ipv6),
-                next_udp_port(),
-            ))
-            .await
-            .map_err(|error| TransportError::Socks5(format!("bind tunnel UDP/IPv6: {error}")))?,
-    );
-    response_tasks.push(spawn_udp_receiver(
-        Arc::clone(&v6_socket),
-        response_tx.clone(),
-        association_cancel.clone(),
-        context.cancellation.clone(),
-    ));
-    let direct_udp = if context.geo_policy.is_enabled() {
+    let direct_udp = Arc::new(if context.geo_policy.is_enabled() {
         DirectUdpSockets::new(context.protector.as_ref())
     } else {
         DirectUdpSockets::default()
-    };
+    });
     if let Some(socket) = &direct_udp.v4 {
         response_tasks.push(spawn_direct_udp_receiver(
             Arc::clone(socket),
@@ -510,6 +548,7 @@ async fn serve_udp_association(
             association_cancel.clone(),
             context.cancellation.clone(),
             Arc::clone(&context.counters),
+            packet_limit,
         ));
     }
     if let Some(socket) = &direct_udp.v6 {
@@ -519,12 +558,15 @@ async fn serve_udp_association(
             association_cancel.clone(),
             context.cancellation.clone(),
             Arc::clone(&context.counters),
+            packet_limit,
         ));
     }
 
     let requested_port = NonZeroU16::new(request.port);
     let mut client_endpoint = requested_port.map(|port| SocketAddr::new(peer.ip(), port.get()));
-    let mut datagram = vec![0u8; MAX_UDP_DATAGRAM];
+    let mut datagram = vec![0u8; packet_limit + 1];
+    let mut dns_queries = JoinSet::<Option<UdpDnsReply>>::new();
+    let mut udp_sends = JoinSet::new();
     let idle = tokio::time::sleep(context.udp_idle_timeout);
     tokio::pin!(idle);
     let result = loop {
@@ -542,13 +584,36 @@ async fn serve_udp_association(
                     Err(error) => break Err(TransportError::Io(error)),
                 }
             }
+            completed = dns_queries.join_next(), if !dns_queries.is_empty() => {
+                let reply = match completed {
+                    Some(Ok(Some(reply))) => reply,
+                    Some(Ok(None)) => continue,
+                    _ => break Err(TransportError::Socks5("UDP DNS worker stopped".to_owned())),
+                };
+                let Some(endpoint) = client_endpoint else { continue; };
+                tokio::select! {
+                    biased;
+                    _ = association_cancel.cancelled() => break Ok(()),
+                    _ = control.read_u8() => break Ok(()),
+                    result = relay.send_to(&reply.packet, endpoint) => {
+                        if let Err(error) = result { break Err(TransportError::Io(error)); }
+                    }
+                }
+                // Keep the query/response reservation until delivery finishes.
+                drop(reply);
+                idle.as_mut().reset(Instant::now() + context.udp_idle_timeout);
+            }
+            _ = udp_sends.join_next(), if !udp_sends.is_empty() => {},
             received = relay.recv_from(&mut datagram) => {
                 let (length, source) = match received {
                     Ok(value) => value,
+                    Err(error) if crate::udp_io::is_message_too_long(&error) => continue,
                     Err(error) => break Err(TransportError::Io(error)),
                 };
+                if length > packet_limit { continue; }
                 if source.ip() != peer.ip()
                     || requested_port.is_some_and(|port| source.port() != port.get())
+                    || client_endpoint.is_some_and(|endpoint| endpoint != source)
                 {
                     tracing::warn!(%source, %peer, "rejected UDP datagram outside its SOCKS5 association");
                     continue;
@@ -560,16 +625,129 @@ async fn serve_udp_association(
                         continue;
                     }
                 };
+                let valid_dns = parsed.port == 53
+                    && crate::split_dns::validate_query_bytes(parsed.payload).is_ok();
+                if context.channel.is_none() && !valid_dns {
+                    // A DNS-only local relay does not enable ordinary UDP,
+                    // including the existing L4 direct-routing restriction.
+                    continue;
+                }
+                let route = match &parsed.target {
+                    Target::Address(address) => GeoTarget::Ip(*address),
+                    Target::Domain(name) => GeoTarget::Host(name),
+                }.route(&context.geo_policy);
+                if route == GeoRoute::Reject { continue; }
+                if valid_dns && let Some(refused) = crate::split_dns::routing_dns_refused(parsed.payload, &context.geo_policy) {
+                    let target = match &parsed.target {
+                        Target::Address(ip) => crate::tcp::TcpTarget::address(SocketAddr::new(*ip, parsed.port)),
+                        Target::Domain(name) => match crate::tcp::TcpTarget::new(name, parsed.port) { Ok(target) => target, Err(_) => continue },
+                    };
+                    let mut response = vec![0, 0, 0];
+                    crate::proxy_exit::encode_target(&target, &mut response);
+                    response.extend_from_slice(&refused);
+                    let _ = relay.send_to(&response, source).await;
+                    continue;
+                }
+                if tunnel_udp_unavailable && route == GeoRoute::Tunnel && !valid_dns
+                    && !(context.geo_policy.has_ip_rules() && matches!(&parsed.target, Target::Domain(_))) {
+                    continue;
+                }
+                if valid_dns
+                    && route == GeoRoute::Tunnel
+                    && let Some(dns) = &dns
+                {
+                    // The local client uses UDP, but its DNS query is a framed
+                    // TCP exchange through the final exit. An unavailable UDP
+                    // relay must not disable this path or change its resolver.
+                    let target = match &parsed.target {
+                        Target::Address(address) => crate::tcp::TcpTarget::address(SocketAddr::new(*address, parsed.port)),
+                        Target::Domain(name) => match crate::tcp::TcpTarget::new(name, parsed.port) {
+                            Ok(target) => target,
+                            Err(_) => continue,
+                        },
+                    };
+                    let mut packet = vec![0, 0, 0];
+                    crate::proxy_exit::encode_target(&target, &mut packet);
+                    // Pin the first accepted client before asynchronous work.
+                    // A pending query must not leave this association claimable
+                    // by another endpoint sharing the TCP peer's address.
+                    client_endpoint.get_or_insert(source);
+                    idle.as_mut().reset(Instant::now() + context.udp_idle_timeout);
+                    let lease = (dns_queries.len() < MAX_UDP_DNS_QUERIES)
+                        .then(|| context.admission.as_ref()
+                            .and_then(|admission| admission.reserve_udp_dns_query(parsed.payload.len())))
+                        .flatten();
+                    let Some(lease) = lease else {
+                        let response = crate::split_dns::limit_udp_response(
+                            parsed.payload,
+                            crate::split_dns::l4_dns_error(parsed.payload),
+                            packet_limit.saturating_sub(packet.len()),
+                        );
+                        packet.extend_from_slice(&response);
+                        tokio::select! {
+                            biased;
+                            _ = association_cancel.cancelled() => break Ok(()),
+                            _ = control.read_u8() => break Ok(()),
+                            result = relay.send_to(&packet, source) => {
+                                if let Err(error) = result { break Err(TransportError::Io(error)); }
+                            }
+                        }
+                        continue;
+                    };
+                    let query = parsed.payload.to_vec();
+                    let target = parsed.target;
+                    let port = parsed.port;
+                    let context = context.clone();
+                    let dns = dns.clone();
+                    let cancel = association_cancel.clone();
+                    dns_queries.spawn(async move {
+                        let request = SocksUdpRequest { target, port, payload: &query };
+                        let response = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return None,
+                            response = forward_udp_dns(&context, &dns, &request) => response,
+                        };
+                        let response = response?;
+                        let response = crate::split_dns::limit_udp_response(
+                            &query, response, packet_limit.saturating_sub(packet.len()),
+                        );
+                        packet.extend_from_slice(&response);
+                        Some(UdpDnsReply { packet, _lease: lease })
+                    });
+                    continue;
+                }
+                if dns.is_some() && route == GeoRoute::Tunnel {
+                    let lease = (udp_sends.len() < 4).then(|| context.admission.as_ref()
+                        .and_then(|admission| admission.reserve_udp_dns_query(parsed.payload.len()))).flatten();
+                    let Some(lease) = lease else { continue; };
+                    let payload = parsed.payload.to_vec();
+                    let target = parsed.target;
+                    let port = parsed.port;
+                    let send_context = context.clone();
+                    let association = association.clone();
+                    let direct = direct_udp.clone();
+                    let cancel = association_cancel.clone();
+                    udp_sends.spawn(async move {
+                        let _lease = lease;
+                        tokio::select! {
+                            _ = cancel.cancelled() => {},
+                            result = send_udp_routed(&send_context, &target, port, &payload, &direct,
+                                TunnelUdpSockets::Association(association.as_ref())) => {
+                                if let Err(error) = result { tracing::debug!(%error, "SOCKS5 UDP send failed"); }
+                            }
+                        }
+                    });
+                    client_endpoint.get_or_insert(source);
+                    idle.as_mut().reset(Instant::now() + context.udp_idle_timeout);
+                    continue;
+                }
                 if let Err(error) = send_udp_routed(
                     &context,
                     &parsed.target,
                     parsed.port,
                     parsed.payload,
                     &direct_udp,
-                    TunnelUdpSockets {
-                        v4: &v4_socket,
-                        v6: &v6_socket,
-                    },
+                    TunnelUdpSockets::Association(association.as_ref()),
                 ).await {
                     tracing::debug!(%error, "SOCKS5 UDP send failed");
                     continue;
@@ -583,14 +761,26 @@ async fn serve_udp_association(
                         "all SOCKS5 UDP tunnel receivers stopped".to_owned(),
                     ));
                 };
-                let response = match response {
+                let mut response = match response {
                     Ok(response) => response,
                     Err(error) => break Err(TransportError::Socks5(error)),
                 };
+                if response.blocked_by(&context.traffic_policy) { continue; }
+                if context.geo_policy.is_enabled() && response.source.host_port().1 == 53 {
+                    let Some(server) = response.source.socket_address() else { continue; };
+                    let Some(filtered) = direct_udp.routing_dns_queries.lock().await.filter(server, &response.payload, &context.geo_policy) else { continue; };
+                    response.payload = bytes::Bytes::from(filtered);
+                }
+                if response.route == GeoRoute::Tunnel && !association.accounts_traffic() {
+                    context.counters.record_received(response.payload.len());
+                }
                 let Some(client_endpoint) = client_endpoint else {
                     continue;
                 };
-                let packet = encode_udp_response(response.source, &response.payload);
+                let mut packet = vec![0, 0, 0];
+                crate::proxy_exit::encode_target(&response.source, &mut packet);
+                if packet.len() + response.payload.len() > packet_limit { continue; }
+                packet.extend_from_slice(&response.payload);
                 if let Err(error) = relay.send_to(&packet, client_endpoint).await {
                     break Err(TransportError::Io(error));
                 }
@@ -600,28 +790,138 @@ async fn serve_udp_association(
     };
 
     association_cancel.cancel();
+    drop(association_guard);
+    udp_sends.abort_all();
+    while udp_sends.join_next().await.is_some() {}
+    dns_queries.abort_all();
+    while dns_queries.join_next().await.is_some() {}
     for task in response_tasks {
         let _ = task.await;
     }
     result
 }
 
+struct UdpDnsReply {
+    packet: Vec<u8>,
+    _lease: crate::l4::stream::BufferLease,
+}
+
+async fn udp_dns_target(
+    context: &SocksContext,
+    request: &SocksUdpRequest<'_>,
+) -> Result<Option<(crate::tcp::TcpTarget, GeoRoute)>, String> {
+    let target = match &request.target {
+        Target::Address(ip) => GeoTarget::Ip(*ip),
+        Target::Domain(name) => GeoTarget::Host(name),
+    };
+    if target.route(&context.geo_policy) == GeoRoute::Reject {
+        return Ok(None);
+    }
+    match &request.target {
+        Target::Address(ip) => Ok(Some((
+            crate::tcp::TcpTarget::address(SocketAddr::new(*ip, request.port)),
+            target.route(&context.geo_policy),
+        ))),
+        Target::Domain(name) if context.edge_resolved && !context.geo_policy.has_ip_rules() => {
+            crate::tcp::TcpTarget::new(name, request.port)
+                .map(|target| Some((target, GeoRoute::Tunnel)))
+                .map_err(|_| "invalid DNS target".into())
+        }
+        Target::Domain(name) => {
+            let addresses = context
+                .resolver
+                .resolve_for_policy(name)
+                .await
+                .map_err(|error| error.to_string());
+            let addresses = match addresses {
+                Err(error) if error.contains("routing_rejected") => return Ok(None),
+                other => other?,
+            };
+            Ok(addresses
+                .into_iter()
+                .find(|ip| !context.geo_policy.rejects_ip(*ip))
+                .map(|ip| {
+                    (
+                        crate::tcp::TcpTarget::address(SocketAddr::new(ip, request.port)),
+                        context.geo_policy.resolved_route(name, ip),
+                    )
+                }))
+        }
+    }
+}
+
+async fn forward_udp_dns(
+    context: &SocksContext,
+    dns: &crate::dns_stream::StreamDns,
+    request: &SocksUdpRequest<'_>,
+) -> Option<Vec<u8>> {
+    if let Some(refused) =
+        crate::split_dns::routing_dns_refused(request.payload, &context.geo_policy)
+    {
+        return Some(refused);
+    }
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let work = async {
+        let Some((target, route)) = udp_dns_target(context, request).await.map_err(|_| ())? else {
+            return Ok(None);
+        };
+        let direct = if route == GeoRoute::Direct {
+            let remote = target.socket_address().ok_or(())?;
+            crate::split_dns::direct_udp(context.protector.as_ref(), remote, request.payload)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let response = if let Some(response) = direct {
+            context.counters.record_sent(request.payload.len());
+            context.counters.record_received(response.len());
+            response
+        } else {
+            dns.query_target(target, request.payload, deadline)
+                .await
+                .map_err(|_| ())?
+        };
+        Ok(Some(crate::split_dns::filter_routing_dns_response(
+            request.payload,
+            response,
+            &context.geo_policy,
+        )))
+    };
+    tokio::time::timeout_at(deadline, work)
+        .await
+        .unwrap_or(Err(()))
+        .unwrap_or_else(|_| Some(crate::split_dns::l4_dns_error(request.payload)))
+}
+
 struct UdpResponse {
-    source: SocketAddr,
+    source: crate::tcp::TcpTarget,
     payload: bytes::Bytes,
+    route: GeoRoute,
+}
+
+impl UdpResponse {
+    fn blocked_by(&self, policy: &crate::application_traffic::ApplicationTrafficPolicy) -> bool {
+        self.route == GeoRoute::Tunnel && policy.blocks_udp(self.source.host_port().1)
+    }
 }
 
 #[derive(Default)]
 struct DirectUdpSockets {
+    routing_dns_queries: Mutex<crate::split_dns::RoutingDnsQueries>,
     v4: Option<Arc<TokioUdpSocket>>,
     v6: Option<Arc<TokioUdpSocket>>,
     leases: Mutex<HashMap<(Option<u64>, SocketAddr), DirectEgressLease>>,
 }
 
 #[derive(Clone, Copy)]
-struct TunnelUdpSockets<'a> {
-    v4: &'a StackUdpSocket,
-    v6: &'a StackUdpSocket,
+enum TunnelUdpSockets<'a> {
+    #[cfg(test)]
+    Stack {
+        v4: &'a StackUdpSocket,
+        v6: &'a StackUdpSocket,
+    },
+    Association(&'a dyn crate::proxy_udp::UdpAssociation),
 }
 
 impl DirectUdpSockets {
@@ -640,7 +940,21 @@ impl DirectUdpSockets {
                 })
                 .ok(),
             leases: Mutex::new(HashMap::new()),
+            routing_dns_queries: Mutex::default(),
         }
+    }
+
+    async fn track_dns(&self, context: &SocksContext, remote: SocketAddr, payload: &[u8]) -> bool {
+        if !context.geo_policy.is_enabled()
+            || remote.port() != 53
+            || crate::split_dns::validate_query_bytes(payload).is_err()
+        {
+            return true;
+        }
+        self.routing_dns_queries
+            .lock()
+            .await
+            .record(remote, payload)
     }
 
     fn for_address(&self, address: SocketAddr) -> Option<&Arc<TokioUdpSocket>> {
@@ -694,10 +1008,65 @@ async fn send_udp_routed(
         Target::Address(address) => GeoTarget::Ip(*address),
         Target::Domain(name) => GeoTarget::Host(name),
     };
+    if geo_target.route(&context.geo_policy) == GeoRoute::Reject {
+        return Ok(());
+    }
+    if context.geo_policy.has_ip_rules()
+        && let Target::Domain(name) = target
+    {
+        let (addresses, tunnel_only) = crate::geo_direct::resolve_routing_host(
+            &context.geo_policy,
+            context.protector.as_ref(),
+            &context.resolver,
+            name,
+            port,
+        )
+        .await?;
+        for ip in addresses
+            .into_iter()
+            .filter(|ip| !context.geo_policy.rejects_ip(*ip))
+            .take(MAX_TARGET_ADDRESSES)
+        {
+            let route = if tunnel_only {
+                GeoRoute::Tunnel
+            } else {
+                context.geo_policy.resolved_route(name, ip)
+            };
+            if route == GeoRoute::Reject {
+                continue;
+            }
+            let remote = SocketAddr::new(ip, port);
+            if route == GeoRoute::Direct
+                && let Some(socket) = direct.for_address(remote)
+                && direct
+                    .ensure_target(context.protector.as_ref(), remote)
+                    .await
+                    .is_ok()
+                && direct.track_dns(context, remote, payload).await
+                && socket.send_to(payload, remote).await.is_ok()
+            {
+                context.counters.record_sent(payload.len());
+                return Ok(());
+            }
+            if context.traffic_policy.blocks_udp(port) {
+                return Ok(());
+            }
+            return send_numeric_udp(context, direct, tunnel, remote, payload).await;
+        }
+        return Ok(());
+    }
     if geo_target.route(&context.geo_policy) == GeoRoute::Direct {
         let addresses = match target {
             Target::Address(address) => Ok(vec![SocketAddr::new(*address, port)]),
-            Target::Domain(name) => context.protector.resolve_direct(name, port).await,
+            Target::Domain(name) => {
+                crate::split_dns::resolve_direct_routed(
+                    context.protector.as_ref(),
+                    name,
+                    port,
+                    &context.geo_policy,
+                )
+                .await
+            }
         };
         match addresses {
             Ok(addresses) => {
@@ -727,6 +1096,9 @@ async fn send_udp_routed(
                         failures.push(format!("{remote}: {error}"));
                         continue;
                     }
+                    if !direct.track_dns(context, remote, payload).await {
+                        return Ok(());
+                    }
                     match socket.send_to(payload, remote).await {
                         Ok(written) if written == payload.len() => {
                             context.counters.record_sent(written);
@@ -746,7 +1118,10 @@ async fn send_udp_routed(
                     );
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                if error == "routing_rejected" {
+                    return Ok(());
+                }
                 if context.protector.direct_dns_resolver().is_some() {
                     return Err("encrypted_direct_dns_failed".to_owned());
                 }
@@ -758,6 +1133,37 @@ async fn send_udp_routed(
         }
     }
 
+    // GEO direct has already had its opportunity. A failed direct attempt
+    // must not bypass the tunnel policy, nor trigger an unnecessary DNS query.
+    if context.traffic_policy.blocks_udp(port) {
+        return Ok(());
+    }
+    match tunnel {
+        #[cfg(test)]
+        TunnelUdpSockets::Stack { .. } => {}
+        TunnelUdpSockets::Association(association) => {
+            association
+                .prepare()
+                .await
+                .map_err(|_| "final UDP unavailable".to_owned())?;
+        }
+    }
+    if context.edge_resolved
+        && !(port == 53 && context.geo_policy.is_enabled())
+        && resolved_for_tunnel.is_none()
+        && let Target::Domain(name) = target
+        && let TunnelUdpSockets::Association(association) = tunnel
+    {
+        let target = crate::tcp::TcpTarget::new(name, port).map_err(|_| "invalid target")?;
+        association
+            .send(&target, payload)
+            .await
+            .map_err(|_| "final UDP send failed".to_owned())?;
+        if !association.accounts_traffic() {
+            context.counters.record_sent(payload.len());
+        }
+        return Ok(());
+    }
     let addresses = if let Some(addresses) = resolved_for_tunnel {
         addresses
     } else {
@@ -765,7 +1171,7 @@ async fn send_udp_routed(
             Target::Address(address) => vec![*address],
             Target::Domain(name) => context
                 .resolver
-                .resolve(name)
+                .resolve_for_policy(name)
                 .await
                 .map_err(|error| error.to_string())?,
         }
@@ -775,39 +1181,78 @@ async fn send_udp_routed(
         .map(|address| SocketAddr::new(address, port))
         .next()
         .ok_or_else(|| "target has no usable address".to_owned())?;
-    let socket = if remote.is_ipv4() {
-        tunnel.v4
-    } else {
-        tunnel.v6
-    };
-    socket
-        .send_to(remote, payload)
-        .await
-        .map_err(|error| format!("tunnel send to {remote}: {error}"))
+    if context.traffic_policy.blocks_udp(port) {
+        return Ok(());
+    }
+    send_numeric_udp(context, direct, tunnel, remote, payload).await
 }
 
-fn spawn_udp_receiver(
-    socket: Arc<StackUdpSocket>,
+async fn send_numeric_udp(
+    context: &SocksContext,
+    direct: &DirectUdpSockets,
+    tunnel: TunnelUdpSockets<'_>,
+    remote: SocketAddr,
+    payload: &[u8],
+) -> Result<(), String> {
+    if context.geo_policy.rejects_ip(remote.ip())
+        || !direct.track_dns(context, remote, payload).await
+    {
+        return Ok(());
+    }
+    match tunnel {
+        #[cfg(test)]
+        TunnelUdpSockets::Stack { .. } => {}
+        TunnelUdpSockets::Association(association) => association
+            .prepare()
+            .await
+            .map_err(|_| "final UDP unavailable".to_owned())?,
+    }
+    match tunnel {
+        #[cfg(test)]
+        TunnelUdpSockets::Stack { v4, v6 } => {
+            let socket = if remote.is_ipv4() { v4 } else { v6 };
+            socket
+                .send_to(remote, payload)
+                .await
+                .map_err(|_| "tunnel UDP send failed".to_owned())
+        }
+        TunnelUdpSockets::Association(association) => {
+            association
+                .send(&crate::tcp::TcpTarget::address(remote), payload)
+                .await
+                .map_err(|_| "final UDP send failed".to_owned())?;
+            if !association.accounts_traffic() {
+                context.counters.record_sent(payload.len());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn spawn_association_receiver(
+    association: Arc<dyn crate::proxy_udp::UdpAssociation>,
     sender: mpsc::Sender<Result<UdpResponse, String>>,
-    association_cancel: CancellationToken,
-    runtime_cancel: CancellationToken,
+    cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        loop {
-            let received = tokio::select! {
-                _ = association_cancel.cancelled() => break,
-                _ = runtime_cancel.cancelled() => break,
-                received = socket.recv_from_bytes() => received,
-            };
-            let message = match received {
-                Ok((source, payload)) => Ok(UdpResponse { source, payload }),
-                Err(error) => Err(format!("tunnel UDP receive failed: {error}")),
-            };
-            let failed = message.is_err();
-            if sender.send(message).await.is_err() || failed {
-                break;
+        let work = async {
+            loop {
+                let result = association
+                    .recv()
+                    .await
+                    .map(|(source, payload)| UdpResponse {
+                        source,
+                        payload,
+                        route: GeoRoute::Tunnel,
+                    })
+                    .map_err(|_| "final UDP association closed".to_owned());
+                let failed = result.is_err();
+                if sender.send(result).await.is_err() || failed {
+                    break;
+                }
             }
-        }
+        };
+        tokio::select! { _ = cancel.cancelled() => {}, _ = work => {} }
     })
 }
 
@@ -817,9 +1262,10 @@ fn spawn_direct_udp_receiver(
     association_cancel: CancellationToken,
     runtime_cancel: CancellationToken,
     counters: Arc<TrafficCounters>,
+    packet_limit: usize,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut buffer = vec![0u8; MAX_UDP_DATAGRAM];
+        let mut buffer = vec![0u8; packet_limit + 1];
         loop {
             let received = tokio::select! {
                 _ = association_cancel.cancelled() => break,
@@ -828,16 +1274,26 @@ fn spawn_direct_udp_receiver(
             };
             let message = match received {
                 Ok((length, source)) => {
+                    if length > packet_limit {
+                        continue;
+                    }
                     counters.record_received(length);
                     Ok(UdpResponse {
-                        source,
+                        source: crate::tcp::TcpTarget::address(source),
+                        route: GeoRoute::Direct,
                         payload: bytes::Bytes::copy_from_slice(&buffer[..length]),
                     })
                 }
+                Err(error) if crate::udp_io::is_message_too_long(&error) => continue,
                 Err(error) => Err(format!("direct UDP receive failed: {error}")),
             };
             let failed = message.is_err();
-            if sender.send(message).await.is_err() || failed {
+            let sent = tokio::select! {
+                _ = association_cancel.cancelled() => break,
+                _ = runtime_cancel.cancelled() => break,
+                result = sender.send(message) => result,
+            };
+            if sent.is_err() || failed {
                 break;
             }
         }
@@ -912,6 +1368,7 @@ fn decode_udp_request(packet: &[u8]) -> Result<SocksUdpRequest<'_>, &'static str
     })
 }
 
+#[cfg(test)]
 fn encode_udp_response(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let mut packet = Vec::with_capacity(payload.len() + 22);
     packet.extend_from_slice(&[0, 0, 0]);
@@ -1143,12 +1600,19 @@ async fn connect_remote_inner(
         &context.geo_policy,
         context.protector.as_ref(),
         Arc::clone(&context.counters),
-        (geo_target, port),
-        || ConnectFailure {
-            reply: REPLY_HOST_UNREACHABLE,
-            message: "encrypted_direct_dns_failed".to_owned(),
-        },
+        (geo_target, port, Some(&context.resolver)),
+        (
+            || ConnectFailure {
+                reply: REPLY_HOST_UNREACHABLE,
+                message: "encrypted_direct_dns_failed".to_owned(),
+            },
+            || ConnectFailure {
+                reply: REPLY_CONNECTION_NOT_ALLOWED,
+                message: "routing_rejected".into(),
+            },
+        ),
         |resolved| async {
+            let deadline = tokio::time::Instant::now() + REMOTE_CONNECT_TIMEOUT;
             if resolved.is_none()
                 && context.edge_resolved
                 && let Target::Domain(name) = target
@@ -1158,30 +1622,28 @@ async fn connect_remote_inner(
                     .dialer
                     .connect(
                         target,
-                        tokio::time::Instant::now() + REMOTE_CONNECT_TIMEOUT,
+                        deadline,
                         &context.cancellation,
                         crate::tcp::FlowClass::Business,
                     )
                     .await
                     .map_err(connect_failure);
             }
-            let addresses =
-                if let Some(addresses) = resolved {
-                    addresses
-                } else {
-                    match target {
-                        Target::Address(address) => vec![*address],
-                        Target::Domain(name) => {
-                            context.resolver.resolve(name).await.map_err(|error| {
-                                ConnectFailure {
-                                    reply: REPLY_HOST_UNREACHABLE,
-                                    message: error.to_string(),
-                                }
-                            })?
-                        }
-                    }
-                };
-            connect_tunnel_remote(context, &addresses, port).await
+            let resolution = if let Some(addresses) = resolved {
+                CandidateResolution::from_addresses(addresses)
+            } else {
+                match target {
+                    Target::Address(address) => CandidateResolution::from_addresses(vec![*address]),
+                    Target::Domain(name) => context
+                        .resolver
+                        .resolve_candidates(name, deadline)
+                        .map_err(|error| ConnectFailure {
+                            reply: REPLY_HOST_UNREACHABLE,
+                            message: error.to_string(),
+                        })?,
+                }
+            };
+            connect_tunnel_remote(context, resolution, port, deadline).await
         },
     )
     .await
@@ -1189,33 +1651,29 @@ async fn connect_remote_inner(
 
 async fn connect_tunnel_remote(
     context: &SocksContext,
-    addresses: &[IpAddr],
+    resolution: CandidateResolution,
     port: u16,
+    deadline: tokio::time::Instant,
 ) -> Result<crate::tcp::TcpStream, ConnectFailure> {
-    let deadline = tokio::time::Instant::now() + REMOTE_CONNECT_TIMEOUT;
-    let mut last = crate::tcp::DialError::Network;
-    for address in addresses.iter().take(MAX_TARGET_ADDRESSES) {
-        let target = crate::tcp::TcpTarget::address(SocketAddr::new(*address, port));
-        match context
-            .dialer
-            .connect(
-                target,
-                deadline,
-                &context.cancellation,
-                crate::tcp::FlowClass::Business,
-            )
-            .await
-        {
-            Ok(stream) => return Ok(stream),
-            Err(
-                error @ (crate::tcp::DialError::Budget
-                | crate::tcp::DialError::Cancelled
-                | crate::tcp::DialError::Rejected(401 | 403)),
-            ) => return Err(connect_failure(error)),
-            Err(error) => last = error,
-        }
-    }
-    Err(connect_failure(last))
+    crate::tcp_candidates::connect_candidates(
+        context.dialer.clone(),
+        resolution,
+        port,
+        deadline,
+        &context.cancellation,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::tcp_candidates::CandidateDialError::Resolve(error) => ConnectFailure {
+            reply: if error.to_string().contains("routing_rejected") {
+                REPLY_CONNECTION_NOT_ALLOWED
+            } else {
+                REPLY_HOST_UNREACHABLE
+            },
+            message: error.to_string(),
+        },
+        crate::tcp_candidates::CandidateDialError::Dial(error) => connect_failure(error),
+    })
 }
 
 fn connect_failure(error: crate::tcp::DialError) -> ConnectFailure {
@@ -1255,6 +1713,11 @@ async fn send_reply(
 }
 
 #[cfg(test)]
+mod dns_concurrency_tests;
+#[cfg(test)]
+mod dns_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1272,7 +1735,7 @@ mod tests {
         }
 
         fn ip_matches(&self, ip: IpAddr, country: &usque_geo::CountryCode) -> bool {
-            ip == Ipv4Addr::new(10, 0, 0, 2) && country.as_str() == "CN"
+            (ip == Ipv4Addr::new(10, 0, 0, 2) || ip.is_loopback()) && country.as_str() == "CN"
         }
     }
 
@@ -1344,7 +1807,12 @@ mod tests {
             reconnect_count: 0,
         });
         let context = SocksContext {
-            channel: Some(channel.clone()),
+            traffic_policy: Arc::default(),
+            channel: Some(crate::proxy_udp::StackFactory::shared(
+                channel.clone(),
+                assigned_ipv4,
+                Ipv6Addr::UNSPECIFIED,
+            )),
             dialer: Arc::new(crate::tcp::StackDialer {
                 channel: channel.clone(),
                 ipv4: assigned_ipv4,
@@ -1364,8 +1832,6 @@ mod tests {
             protector,
             geo_policy: test_geo_policy(),
             counters: Arc::new(TrafficCounters::default()),
-            assigned_ipv4,
-            assigned_ipv6: Ipv6Addr::LOCALHOST,
             udp_idle_timeout: Duration::from_secs(10),
             cancellation: CancellationToken::new(),
             failure,
@@ -1410,6 +1876,178 @@ mod tests {
         assert_eq!(&encoded[22..], b"dns");
     }
 
+    #[tokio::test]
+    async fn allow_lan_socks_connect_and_udp_attempt_protected_direct_egress() {
+        use crate::geo_direct::{LanProbeProtector, lan_test_policy};
+        for allow_lan in [false, true] {
+            let protector = Arc::new(LanProbeProtector::default());
+            let (mut context, tunnel, server, tasks) = test_socks_context(protector.clone()).await;
+            context.geo_policy = Arc::new(lan_test_policy(allow_lan));
+            let remote: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+            let tcp = server.tcp_listen(remote).await.unwrap();
+            let stream =
+                connect_remote(&context, &Target::Address(remote.ip()), remote.port()).await;
+            assert!(matches!(stream, Ok(RoutedTcpStream::Tunnel(_))));
+            let _accepted = tcp.accept().await.unwrap();
+            let udp = server.udp_bind(remote).await.unwrap();
+            let direct = DirectUdpSockets::new(protector.as_ref());
+            send_udp_routed(
+                &context,
+                &Target::Address(remote.ip()),
+                remote.port(),
+                b"lan",
+                &direct,
+                TunnelUdpSockets::Stack {
+                    v4: &tunnel,
+                    v6: &tunnel,
+                },
+            )
+            .await
+            .unwrap();
+            let (_, payload) = timeout(Duration::from_secs(1), udp.recv_from_bytes())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&payload[..], b"lan");
+            let expected = if allow_lan {
+                vec![(remote, DirectProtocol::Tcp), (remote, DirectProtocol::Udp)]
+            } else {
+                vec![]
+            };
+            assert_eq!(*protector.attempts.lock().unwrap(), expected);
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_connect_and_udp_never_reach_a_target() {
+        let protector = Arc::new(TestProtector {
+            resolved: "127.0.0.1:9000".parse().unwrap(),
+            protect_calls: AtomicUsize::new(0),
+            resolve_calls: AtomicUsize::new(0),
+            reject: false,
+        });
+        let (mut context, tunnel, server, tasks) = test_socks_context(protector.clone()).await;
+        context.geo_policy = Arc::new(crate::geo_direct::routing_test_policy(&[
+            ("blocked.test", usque_core::RoutingAction::Reject),
+            ("10.0.0.2", usque_core::RoutingAction::Reject),
+        ]));
+        let origin = server
+            .udp_bind("10.0.0.2:9000".parse().unwrap())
+            .await
+            .unwrap();
+        for target in [
+            Target::Domain("blocked.test".into()),
+            Target::Address("10.0.0.2".parse().unwrap()),
+        ] {
+            let result = connect_remote(&context, &target, 9000).await;
+            assert!(matches!(
+                result,
+                Err(ConnectFailure {
+                    reply: REPLY_CONNECTION_NOT_ALLOWED,
+                    ..
+                })
+            ));
+            send_udp_routed(
+                &context,
+                &target,
+                9000,
+                b"blocked",
+                &DirectUdpSockets::default(),
+                TunnelUdpSockets::Stack {
+                    v4: &tunnel,
+                    v6: &tunnel,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(protector.resolve_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), origin.recv_from(&mut [0_u8; 32]))
+                .await
+                .is_err()
+        );
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_udp_dns_replaces_a_blocked_cname_reply_with_refused() {
+        let (mut context, _tunnel, server, tasks) =
+            test_socks_context(Arc::new(crate::socket::NoopSocketProtector)).await;
+        context.geo_policy = Arc::new(crate::geo_direct::routing_test_policy(&[(
+            "blocked.test",
+            usque_core::RoutingAction::Reject,
+        )]));
+        let cancellation = context.cancellation.clone();
+        let dns = server
+            .udp_bind("10.0.0.2:53".parse().unwrap())
+            .await
+            .unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut control = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (accepted, peer) = listener.accept().await.unwrap();
+        let worker = tokio::spawn(serve_udp_association(
+            accepted,
+            peer,
+            Arc::new(context),
+            SocksRequest {
+                command: COMMAND_UDP_ASSOCIATE,
+                target: Target::Address(Ipv4Addr::UNSPECIFIED.into()),
+                port: 0,
+            },
+        ));
+        let mut header = [0; 10];
+        control.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header[..4], &[5, 0, 0, 1]);
+        let relay = SocketAddr::new(
+            Ipv4Addr::LOCALHOST.into(),
+            u16::from_be_bytes([header[8], header[9]]),
+        );
+        let udp = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let query = crate::split_dns::test_host_query("allowed.test");
+        let mut request = vec![0, 0, 0, ADDRESS_IPV4, 10, 0, 0, 2, 0, 53];
+        request.extend(&query);
+        udp.send_to(&request, relay).await.unwrap();
+        let (peer, received) = timeout(Duration::from_secs(1), dns.recv_from_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..], &query);
+        dns.send_to(
+            peer,
+            &crate::split_dns::test_cname_response(&query, &["blocked.test".into()]),
+        )
+        .await
+        .unwrap();
+        let mut response = [0; 4096];
+        let (length, _) = timeout(Duration::from_secs(1), udp.recv_from(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let parsed = decode_udp_request(&response[..length]).unwrap();
+        assert_eq!(parsed.payload[3] & 15, 5);
+        assert_eq!(&parsed.payload[..2], &query[..2]);
+        drop(control);
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        cancellation.cancel();
+        for task in tasks {
+            task.abort();
+        }
+    }
+
     #[test]
     fn udp_request_codec_rejects_fragments_and_truncation() {
         assert_eq!(
@@ -1418,6 +2056,58 @@ mod tests {
         );
         assert!(decode_udp_request(&[0, 0, 0, ADDRESS_IPV6, 1]).is_err());
         assert!(decode_udp_request(&[0, 0, 0, ADDRESS_IPV4, 1, 1, 1, 1, 0, 0]).is_err());
+    }
+
+    #[tokio::test]
+    async fn full_direct_reply_queue_does_not_block_association_cleanup() {
+        for cancel_runtime in [false, true] {
+            let socket = Arc::new(
+                TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .unwrap(),
+            );
+            let peer = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let (sender, _receiver) = mpsc::channel(1);
+            sender
+                .try_send(Ok(UdpResponse {
+                    source: crate::tcp::TcpTarget::address(peer.local_addr().unwrap()),
+                    payload: bytes::Bytes::new(),
+                    route: GeoRoute::Direct,
+                }))
+                .unwrap_or_else(|_| panic!("reply queue must start full"));
+            let association_cancel = CancellationToken::new();
+            let runtime_cancel = CancellationToken::new();
+            let counters = Arc::new(TrafficCounters::default());
+            let task = spawn_direct_udp_receiver(
+                socket.clone(),
+                sender,
+                association_cancel.clone(),
+                runtime_cancel.clone(),
+                counters.clone(),
+                MAX_UDP_DATAGRAM,
+            );
+            peer.send_to(b"queued", socket.local_addr().unwrap())
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(1), async {
+                while counters.snapshot().bytes_received == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if cancel_runtime {
+                runtime_cancel.cancel();
+            } else {
+                association_cancel.cancel();
+            }
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1433,14 +2123,15 @@ mod tests {
         });
         let (context, tunnel, _server_channel, tasks) = test_socks_context(protector.clone()).await;
         let direct = DirectUdpSockets::new(protector.as_ref());
-        let (response_tx, mut response_rx) = mpsc::channel(1);
         let association_cancel = CancellationToken::new();
+        let (response_tx, mut response_rx) = mpsc::channel(1);
         let receiver = spawn_direct_udp_receiver(
             Arc::clone(direct.v4.as_ref().unwrap()),
             response_tx,
             association_cancel.clone(),
             context.cancellation.clone(),
             Arc::clone(&context.counters),
+            MAX_UDP_DATAGRAM,
         );
 
         send_udp_routed(
@@ -1449,7 +2140,7 @@ mod tests {
             server.local_addr().unwrap().port(),
             b"direct",
             &direct,
-            TunnelUdpSockets {
+            TunnelUdpSockets::Stack {
                 v4: &tunnel,
                 v6: &tunnel,
             },
@@ -1468,7 +2159,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(response.source, server.local_addr().unwrap());
+        assert_eq!(
+            response.source.socket_address(),
+            Some(server.local_addr().unwrap())
+        );
         assert_eq!(&response.payload[..], b"return");
         association_cancel.cancel();
         let _ = receiver.await;
@@ -1508,7 +2202,7 @@ mod tests {
             53,
             b"fallback",
             &direct,
-            TunnelUdpSockets {
+            TunnelUdpSockets::Stack {
                 v4: &tunnel,
                 v6: &tunnel,
             },
@@ -1519,13 +2213,189 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(source.ip(), IpAddr::V4(context.assigned_ipv4));
+        assert_eq!(source.ip(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(&payload[..], b"fallback");
         for task in tasks {
             task.abort();
         }
         assert!(direct.v4.is_none());
         assert!(protector.protect_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn quic_hot_policy_preserves_geo_direct_socket_and_both_reply_families() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let server = TokioUdpSocket::bind(SocketAddr::new(ip, 0)).await.unwrap();
+            let direct_port = server.local_addr().unwrap().port();
+            let protector = Arc::new(TestProtector {
+                resolved: server.local_addr().unwrap(),
+                reject: false,
+                protect_calls: AtomicUsize::new(0),
+                resolve_calls: AtomicUsize::new(0),
+            });
+            let (mut context, tunnel, _, tasks) = test_socks_context(protector.clone()).await;
+            context.traffic_policy = Arc::new(
+                crate::application_traffic::ApplicationTrafficPolicy::for_loopback_quic(
+                    direct_port,
+                ),
+            );
+            let direct = DirectUdpSockets::new(protector.as_ref());
+            let (tx, mut rx) = mpsc::channel(4);
+            let cancel = CancellationToken::new();
+            let receiver = spawn_direct_udp_receiver(
+                direct
+                    .for_address(server.local_addr().unwrap())
+                    .unwrap()
+                    .clone(),
+                tx,
+                cancel.clone(),
+                context.cancellation.clone(),
+                context.counters.clone(),
+                MAX_UDP_DATAGRAM,
+            );
+            let mut original_peer = None;
+            for blocked in [false, true, false, true] {
+                context.traffic_policy.set_disable_quic(blocked);
+                assert_eq!(context.traffic_policy.blocks_udp(direct_port), blocked);
+                for target in [Target::Domain("direct.test".into()), Target::Address(ip)] {
+                    send_udp_routed(
+                        &context,
+                        &target,
+                        direct_port,
+                        b"quic",
+                        &direct,
+                        TunnelUdpSockets::Stack {
+                            v4: &tunnel,
+                            v6: &tunnel,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let mut buffer = [0; 16];
+                    let (len, peer) =
+                        timeout(Duration::from_secs(1), server.recv_from(&mut buffer))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(&buffer[..len], b"quic");
+                    assert_eq!(
+                        *original_peer.get_or_insert(peer),
+                        peer,
+                        "live GEO socket must be retained"
+                    );
+                    server.send_to(b"reply", peer).await.unwrap();
+                    let response = timeout(Duration::from_secs(1), rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(response.route, GeoRoute::Direct);
+                    assert_eq!(
+                        response.source.socket_address(),
+                        Some(server.local_addr().unwrap())
+                    );
+                    assert!(!response.blocked_by(&context.traffic_policy));
+                    assert_eq!(&response.payload[..], b"reply");
+                }
+            }
+            assert!(!context.cancellation.is_cancelled());
+            cancel.cancel();
+            receiver.await.unwrap();
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quic_fallback_is_blocked_without_closing_udp_context_or_resolving_tunnel_dns() {
+        let protector = Arc::new(TestProtector {
+            resolved: SocketAddr::from((Ipv4Addr::LOCALHOST, 443)),
+            reject: true,
+            protect_calls: AtomicUsize::new(0),
+            resolve_calls: AtomicUsize::new(0),
+        });
+        let (context, tunnel, channel, tasks) = test_socks_context(protector.clone()).await;
+        let target = Ipv4Addr::new(10, 0, 0, 2);
+        let server = channel
+            .udp_bind(SocketAddr::from((target, 443)))
+            .await
+            .unwrap();
+        let direct = DirectUdpSockets::new(protector.as_ref());
+        for blocked in [false, true, false] {
+            context.traffic_policy.set_disable_quic(blocked);
+            send_udp_routed(
+                &context,
+                &Target::Address(target.into()),
+                443,
+                b"quic",
+                &direct,
+                TunnelUdpSockets::Stack {
+                    v4: &tunnel,
+                    v6: &tunnel,
+                },
+            )
+            .await
+            .unwrap();
+            let received = timeout(Duration::from_millis(100), server.recv_from_bytes()).await;
+            assert_eq!(received.is_err(), blocked);
+            if let Ok(Ok((_, payload))) = received {
+                assert_eq!(&payload[..], b"quic");
+            }
+            let response = UdpResponse {
+                source: crate::tcp::TcpTarget::address(SocketAddr::from((target, 443))),
+                payload: bytes::Bytes::new(),
+                route: GeoRoute::Tunnel,
+            };
+            assert_eq!(response.blocked_by(&context.traffic_policy), blocked);
+        }
+        context.traffic_policy.set_disable_quic(true);
+        send_udp_routed(
+            &context,
+            &Target::Domain("unmatched.test".into()),
+            443,
+            b"quic",
+            &direct,
+            TunnelUdpSockets::Stack {
+                v4: &tunnel,
+                v6: &tunnel,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(protector.resolve_calls.load(Ordering::SeqCst), 0);
+        let dns = channel
+            .udp_bind(SocketAddr::from((target, 53)))
+            .await
+            .unwrap();
+        send_udp_routed(
+            &context,
+            &Target::Address(target.into()),
+            53,
+            b"dns",
+            &direct,
+            TunnelUdpSockets::Stack {
+                v4: &tunnel,
+                v6: &tunnel,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            &timeout(Duration::from_secs(1), dns.recv_from_bytes())
+                .await
+                .unwrap()
+                .unwrap()
+                .1[..],
+            b"dns"
+        );
+        assert!(!context.cancellation.is_cancelled());
+        for task in tasks {
+            task.abort();
+        }
     }
 
     #[tokio::test]

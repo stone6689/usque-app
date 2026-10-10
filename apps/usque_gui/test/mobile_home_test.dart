@@ -105,7 +105,7 @@ void main() {
       fixture.quality.markStreamUnavailable(true);
       await tester.pump();
       expectCaption('home_traffic_stale');
-      expect(download().semanticLabel, contains('Samples delayed'));
+      expect(download().semanticLabel, contains('Traffic updates delayed'));
 
       fixture.app.engineCapabilities = const EngineCapabilities();
       await tester.pump();
@@ -114,6 +114,83 @@ void main() {
       await tester.pump();
       expectCaption('home_traffic_idle');
       expect(fixture.engine.qualityRequests, 0);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.windows),
+  );
+
+  testWidgets(
+    'desktop traffic charts keep their height and show a dash while disconnected',
+    (tester) async {
+      final fixture = _Fixture()
+        ..sample(0)
+        ..sample(1);
+      await _show(tester, fixture, size: const Size(1280, 900));
+      Finder trace(String direction) =>
+          find.byKey(ValueKey('home-desktop-$direction-trace'));
+      String? rate(String direction) => tester
+          .widget<Text>(find.byKey(ValueKey('home-desktop-$direction-rate')))
+          .data;
+      final height = tester.getSize(trace('download')).height;
+      expect(height, inInclusiveRange(96, 240));
+      expect(tester.getSize(trace('upload')).height, height);
+      expect(rate('download'), '2.0 KB/s');
+      expect(rate('upload'), '1.0 KB/s');
+
+      fixture.app.snapshot = const EngineSnapshot();
+      await tester.pump();
+      for (final direction in ['download', 'upload']) {
+        expect(rate(direction), '—');
+        expect(tester.getSize(trace(direction)).height, height);
+      }
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.windows),
+  );
+
+  testWidgets(
+    'desktop traffic charts take the spare page height down to their minimum',
+    (tester) async {
+      final fixture = _Fixture()..sample(1);
+      await _show(tester, fixture, size: const Size(1200, 800));
+      final download = find.byKey(
+        const ValueKey('home-desktop-download-trace'),
+      );
+      final upload = find.byKey(const ValueKey('home-desktop-upload-trace'));
+      ScrollPosition page() => tester
+          .state<ScrollableState>(
+            find
+                .descendant(
+                  of: find.byType(PageFrame),
+                  matching: find.byType(Scrollable),
+                )
+                .first,
+          )
+          .position;
+
+      final open = tester.getSize(download).height;
+      expect(open, greaterThan(96));
+      expect(open, lessThanOrEqualTo(240));
+      expect(tester.getSize(upload).height, open);
+      expect(page().maxScrollExtent, 0);
+      expect(
+        tester.getRect(download).bottom,
+        moreOrLessEquals(tester.getRect(find.byType(PageFrame)).bottom - 34),
+      );
+
+      await tester.tap(
+        find.text(fixture.app.strings.get('connection_details')),
+      );
+      await tester.pumpAndSettle();
+      final expanded = tester.getSize(download).height;
+      expect(expanded, lessThan(open));
+      expect(expanded, greaterThanOrEqualTo(96));
+      expect(tester.getSize(upload).height, expanded);
+
+      tester.view.physicalSize = const Size(1200, 600);
+      await tester.pumpAndSettle();
+      expect(tester.getSize(download).height, 96);
+      expect(tester.getSize(upload).height, 96);
+      expect(page().maxScrollExtent, greaterThan(0));
+      expect(tester.takeException(), isNull);
     },
     variant: TargetPlatformVariant.only(TargetPlatform.windows),
   );
@@ -131,9 +208,10 @@ void main() {
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
       expect(find.byType(ErrorWidget), findsNothing);
-      final protocol = find.widgetWithText(SelectableText, 'HTTP/3');
-      expect(protocol, findsOneWidget);
-      expect(tester.getSize(protocol).height, lessThan(100));
+      final address = find.widgetWithText(SelectableText, '198.51.100.10');
+      expect(address, findsOneWidget);
+      expect(tester.getSize(address).height, lessThan(100));
+      expect(find.widgetWithText(SelectableText, 'HTTP/3'), findsNothing);
 
       final tile = find.byKey(const PageStorageKey('home-connection-details'));
       Object? expansionState() {
@@ -158,18 +236,18 @@ void main() {
           null,
         ),
       );
-      await tester.ensureVisible(protocol);
+      await tester.ensureVisible(address);
       await tester.pumpAndSettle();
-      await tester.longPress(protocol);
+      await tester.longPress(address);
       await tester.pumpAndSettle();
       final editable = tester.state<EditableTextState>(
-        find.descendant(of: protocol, matching: find.byType(EditableText)),
+        find.descendant(of: address, matching: find.byType(EditableText)),
       );
       expect(editable.widget.controller.selection.isCollapsed, isFalse);
       editable.selectAll(SelectionChangedCause.toolbar);
       editable.copySelection(SelectionChangedCause.toolbar);
       await tester.pump();
-      expect(copied, 'HTTP/3');
+      expect(copied, '198.51.100.10');
       FocusManager.instance.primaryFocus?.unfocus();
       await tester.pumpAndSettle();
       expect(expansionState(), isTrue);
@@ -183,34 +261,34 @@ void main() {
         await tester.tap(details);
         await tester.pumpAndSettle();
         expect(expansionState(), isFalse);
-        expect(protocol, findsNothing);
+        expect(address, findsNothing);
         await tester.tap(details);
         await tester.pumpAndSettle();
         expect(expansionState(), isTrue);
-        expect(protocol, findsOneWidget);
+        expect(address, findsOneWidget);
       }
       fixture.engine.current = const EngineSnapshot();
       await fixture.app.refreshSnapshot();
       await tester.pumpAndSettle();
-      expect(protocol, findsNothing);
+      expect(address, findsNothing);
       fixture.sample(8);
       await fixture.app.refreshSnapshot();
       await tester.pumpAndSettle();
-      expect(protocol, findsOneWidget);
+      expect(address, findsOneWidget);
       expect(expansionState(), isTrue);
       fixture.app.selectSection(AppSection.settings);
       await tester.pumpAndSettle();
       fixture.app.selectSection(AppSection.home);
       await tester.pumpAndSettle();
       expect(expansionState(), isTrue);
-      expect(protocol, findsOneWidget);
+      expect(address, findsOneWidget);
       // Recreate the compact subtree while retaining the route's PageStorage.
       tester.view.physicalSize = const Size(1280, 900);
       await tester.pumpAndSettle();
       tester.view.physicalSize = const Size(424, 924);
       await tester.pumpAndSettle();
       expect(expansionState(), isTrue);
-      expect(protocol, findsOneWidget);
+      expect(address, findsOneWidget);
       expect(find.byType(ErrorWidget), findsNothing);
       expect(tester.takeException(), isNull);
       expect(fixture.engine.qualityRequests, 0);
@@ -257,10 +335,13 @@ void main() {
                 await tester.pump(const Duration(milliseconds: 100));
                 expect(tester.takeException(), isNull);
                 await tester.pumpAndSettle();
-                final protocol = find.widgetWithText(SelectableText, 'HTTP/3');
-                await tester.ensureVisible(protocol);
+                final address = find.widgetWithText(
+                  SelectableText,
+                  '198.51.100.10',
+                );
+                await tester.ensureVisible(address);
                 await tester.pumpAndSettle();
-                expect(protocol.hitTestable(), findsOneWidget);
+                expect(address.hitTestable(), findsOneWidget);
                 for (final value in tester.widgetList<MonoValue>(
                   find.byType(MonoValue),
                 )) {
@@ -313,10 +394,14 @@ void main() {
       );
       expect(tester.getRect(protectionPanel).contains(ring.center), isTrue);
       for (final key in ['home-network-quality', 'home-diagnostics']) {
-        final button = find.byKey(ValueKey(key));
-        expect(tester.widget(button), isA<OutlinedButton>());
-        expect(tester.getSize(button).height, greaterThanOrEqualTo(48));
+        expect(find.byKey(ValueKey(key)), findsNothing);
       }
+      expect(find.text('Connection details'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      fixture.app.selectSection(AppSection.settings);
+      await tester.pumpAndSettle();
+      expect(find.text('Network quality'), findsOneWidget);
+      expect(find.text('Diagnostics'), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );
@@ -346,7 +431,7 @@ void main() {
       fixture.now = fixture.now.add(const Duration(seconds: 4));
       fixture.quality.markStreamUnavailable(true);
       await tester.pump();
-      expect(find.text('Samples delayed'), findsOneWidget);
+      expect(find.text('Traffic updates delayed'), findsOneWidget);
       expect(_trace(tester, 'download').samples.last, isNull);
       expect(_trace(tester, 'download').samples.whereType<int>().length, 3);
       fixture.app.snapshot = const EngineSnapshot();
@@ -355,8 +440,8 @@ void main() {
       expect(_trace(tester, 'download').samples, isEmpty);
       expect(_trace(tester, 'upload').samples, isEmpty);
       expect(find.text('Singapore'), findsNothing);
-      expect(find.text('Outputs enabled after connecting'), findsOneWidget);
-      expect(find.text('Starts after connecting'), findsOneWidget);
+      expect(find.text('Available after connecting'), findsOneWidget);
+      expect(find.text('Traffic appears after connecting'), findsOneWidget);
       expect(fixture.engine.qualityRequests, 0);
     },
   );
@@ -369,11 +454,11 @@ void main() {
       phase: ConnectionPhase.connected,
     );
     await _show(tester, fixture);
-    expect(find.text('Waiting for samples'), findsOneWidget);
+    expect(find.text('Waiting for traffic data'), findsOneWidget);
     expect(_trace(tester, 'download').samples.whereType<int>(), isEmpty);
     fixture.app.engineCapabilities = const EngineCapabilities();
     await tester.pumpAndSettle();
-    expect(find.text('History unavailable'), findsOneWidget);
+    expect(find.text('Traffic history unavailable'), findsOneWidget);
     expect(_trace(tester, 'download').samples.whereType<int>(), isEmpty);
     fixture.app.engineCapabilities = const EngineCapabilities(
       networkQuality: true,
@@ -406,11 +491,9 @@ void main() {
         tester.widget<ConnectionRing>(find.byType(ConnectionRing)).onPressed,
         isNull,
       );
-      final diagnostics = find.byKey(const ValueKey('home-diagnostics'));
-      await tester.ensureVisible(diagnostics);
-      await tester.pumpAndSettle();
-      expect(diagnostics.hitTestable(), findsOneWidget);
-      expect(tester.widget<OutlinedButton>(diagnostics).onPressed, isNotNull);
+      expect(find.byKey(const ValueKey('home-diagnostics')), findsNothing);
+      expect(find.byKey(const ValueKey('home-network-quality')), findsNothing);
+      expect(find.text('Connection details'), findsOneWidget);
       expect(_trace(tester, 'download').samples, isEmpty);
     },
   );
@@ -438,12 +521,12 @@ void main() {
       await tester.pumpWidget(workflowHost(fixture.app, scale: 2, dark: true));
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
-      final diagnostics = find.byKey(const ValueKey('home-diagnostics'));
-      await tester.ensureVisible(diagnostics);
+      final details = find.text('Connection details');
+      await tester.ensureVisible(details);
       await tester.pumpAndSettle();
-      expect(diagnostics.hitTestable(), findsOneWidget);
+      expect(details.hitTestable(), findsOneWidget);
       expect(
-        tester.getRect(diagnostics).bottom,
+        tester.getRect(details).bottom,
         lessThanOrEqualTo(tester.getTopLeft(find.byType(NavigationBar)).dy),
       );
       expect(
@@ -453,4 +536,60 @@ void main() {
       expect(tester.takeException(), isNull);
     },
   );
+
+  testWidgets('disconnected phone rates show a dash instead of zero', (
+    tester,
+  ) async {
+    final fixture = _Fixture();
+    await _show(tester, fixture);
+    for (final direction in ['download', 'upload']) {
+      expect(
+        tester.widget<Text>(find.byKey(ValueKey('home-$direction-rate'))).data,
+        '—',
+      );
+    }
+    expect(find.text('0 B/s'), findsNothing);
+  });
+
+  testWidgets('a stream outage without history is delayed, not waiting', (
+    tester,
+  ) async {
+    final fixture = _Fixture();
+    fixture.app.snapshot = const EngineSnapshot(
+      phase: ConnectionPhase.connected,
+      downloadBytesPerSecond: 2048,
+    );
+    await _show(tester, fixture);
+    final strings = fixture.app.strings;
+    expect(find.text(strings.get('home_traffic_waiting')), findsOneWidget);
+    fixture.quality.markStreamUnavailable(true);
+    await tester.pumpAndSettle();
+    expect(find.text(strings.get('home_traffic_waiting')), findsNothing);
+    expect(find.text(strings.get('home_traffic_stale')), findsOneWidget);
+    expect(_trace(tester, 'download').samples.whereType<int>(), isEmpty);
+  });
+
+  testWidgets('home error banner names only connection failures', (
+    tester,
+  ) async {
+    final fixture = _Fixture();
+    fixture.app.lastError = 'Saved accounts were reset.';
+    await _show(tester, fixture);
+    final strings = fixture.app.strings;
+    expect(find.text('Saved accounts were reset.'), findsOneWidget);
+    expect(find.text(strings.get('error_generic')), findsOneWidget);
+    expect(find.text(strings.get('error')), findsNothing);
+
+    fixture.app.snapshot = const EngineSnapshot(
+      phase: ConnectionPhase.error,
+      errorCode: 'TEST_FAILED',
+    );
+    fixture.app.lastError = 'The connection is unavailable.';
+    fixture.app.selectSection(AppSection.home);
+    await tester.pumpAndSettle();
+    expect(find.text('The connection is unavailable.'), findsOneWidget);
+    // The status heading names the failure; the banner adds only the message.
+    expect(find.text(strings.get('error')), findsOneWidget);
+    expect(find.text(strings.get('error_generic')), findsNothing);
+  });
 }

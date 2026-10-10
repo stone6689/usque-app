@@ -2,6 +2,8 @@
 //! material is serialized, and the full timeline never rides the 1 Hz event bus.
 
 use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(any(test, target_os = "android"))]
+use std::time::SystemTime;
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -10,23 +12,94 @@ use usque_transport::{ConnectionEventType, ConnectionTimelineSnapshot};
 
 const MAX_EVENTS: usize = 256;
 const MAX_JSON_BYTES: usize = 192 * 1024;
-static LATEST: OnceLock<Mutex<Arc<ConnectionTimelineSnapshot>>> = OnceLock::new();
+#[derive(Default)]
+struct PublishedTimeline {
+    snapshot: Arc<ConnectionTimelineSnapshot>,
+    generation: u64,
+    connection_id: Option<uuid::Uuid>,
+    retained: bool,
+    captured_at_milliseconds: u64,
+}
+
+static LATEST: OnceLock<Mutex<PublishedTimeline>> = OnceLock::new();
 
 #[cfg(any(test, target_os = "android"))]
-pub(super) fn publish(snapshot: ConnectionTimelineSnapshot) {
-    let slot = LATEST.get_or_init(|| Mutex::new(Arc::default()));
+pub(super) fn begin() -> u64 {
+    let slot = LATEST.get_or_init(Mutex::default);
+    let Ok(mut current) = slot.lock() else {
+        return 0;
+    };
+    let generation = current.generation.checked_add(1).unwrap_or(0);
+    *current = PublishedTimeline {
+        generation,
+        ..Default::default()
+    };
+    generation
+}
+
+#[cfg(any(test, target_os = "android"))]
+pub(super) fn publish_for(
+    generation: u64,
+    snapshot: ConnectionTimelineSnapshot,
+    connection_id: Option<uuid::Uuid>,
+    retained: bool,
+) {
+    let slot = LATEST.get_or_init(Mutex::default);
     if let Ok(mut current) = slot.lock() {
-        *current = Arc::new(snapshot);
+        current.update(generation, snapshot, connection_id, retained);
     }
 }
 
+impl PublishedTimeline {
+    #[cfg(any(test, target_os = "android"))]
+    fn update(
+        &mut self,
+        generation: u64,
+        snapshot: ConnectionTimelineSnapshot,
+        connection_id: Option<uuid::Uuid>,
+        retained: bool,
+    ) {
+        if generation == 0 || generation != self.generation {
+            return;
+        }
+        self.snapshot = Arc::new(snapshot);
+        self.connection_id = connection_id;
+        self.retained = retained;
+        self.captured_at_milliseconds = millis(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        );
+    }
+}
+
+#[cfg(test)]
+pub(super) fn publish(snapshot: ConnectionTimelineSnapshot) {
+    publish_for(begin(), snapshot, None, false);
+}
+
 pub(super) fn json_snapshot() -> String {
-    let snapshot = LATEST
+    let (snapshot, connection_id, retained, generation, captured_at) = LATEST
         .get()
         .and_then(|slot| slot.lock().ok())
-        .map(|slot| Arc::clone(&slot))
+        .map(|slot| {
+            (
+                Arc::clone(&slot.snapshot),
+                slot.connection_id,
+                slot.retained,
+                slot.generation,
+                slot.captured_at_milliseconds,
+            )
+        })
         .unwrap_or_default();
-    let result = to_value(&snapshot).to_string();
+    let mut value = to_value(&snapshot);
+    value["connection_instance_id"] = json!(connection_id);
+    value["retained"] = json!(retained);
+    value["session_generation"] = json!(generation);
+    value["captured_at_unix_milliseconds"] = json!(captured_at);
+    value["source"] = json!("runtime");
+    value["availability"] = json!("observed");
+    let result = value.to_string();
     if snapshot.events.is_empty() {
         return "{}".to_owned();
     }
@@ -55,6 +128,7 @@ fn to_value(snapshot: &ConnectionTimelineSnapshot) -> Value {
             "timestamp_unix_milliseconds": millis(event.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default()),
             "elapsed_from_attempt_start_milliseconds": millis(event.elapsed_from_attempt_start),
             "event_type": event_type(event.event_type),
+            "queue_kind": event.queue_kind.map(usque_transport::QueueKind::as_str),
             "stage": event.stage.map(|stage| stage.as_str()),
             "transport": event.transport.map(|transport| match transport { Transport::Http2 => "http2", Transport::Http3 => "http3" }),
             "address_family": event.address_family.map(|family| match family { AddressFamily::Ipv4 => "ipv4", AddressFamily::Ipv6 => "ipv6" }),
@@ -106,6 +180,7 @@ fn event_type(event: ConnectionEventType) -> &'static str {
         ConnectionEventType::MigrationPromoted => "migration_promoted",
         ConnectionEventType::MigrationFailed => "migration_failed",
         ConnectionEventType::QueueSaturated => "queue_saturated",
+        ConnectionEventType::QueueBackpressured => "queue_backpressured",
         ConnectionEventType::PmtuChanged => "pmtu_changed",
         ConnectionEventType::PmtuRevalidationStarted => "pmtu_revalidation_started",
         ConnectionEventType::PmtuRevalidationFailed => "pmtu_revalidation_failed",
@@ -121,6 +196,22 @@ mod tests {
     use usque_transport::{ConnectionEvent, ConnectionMetrics};
 
     #[test]
+    fn retired_publisher_cannot_replace_a_new_connection_or_its_identity() {
+        let id = uuid::Uuid::new_v4();
+        let mut published = PublishedTimeline {
+            generation: 2,
+            ..Default::default()
+        };
+        published.update(2, Default::default(), Some(id), false);
+        published.update(1, Default::default(), Some(uuid::Uuid::new_v4()), true);
+        assert_eq!(published.connection_id, Some(id));
+        assert!(!published.retained);
+        published.update(2, Default::default(), Some(id), true);
+        assert!(published.retained);
+        assert!(published.captured_at_milliseconds != 0);
+    }
+
+    #[test]
     fn native_timeline_is_numeric_allowlisted_and_bounded() {
         let mut failure = TransportFailure::new(
             TransportFailureCode::PmtuRevalidationExhausted,
@@ -128,6 +219,7 @@ mod tests {
         );
         failure.sanitized_detail = Some("private.example 192.0.2.1 SSID=private".to_owned());
         let event = ConnectionEvent {
+            queue_kind: None,
             sequence: 1,
             timestamp: UNIX_EPOCH + Duration::from_secs(1),
             elapsed_from_attempt_start: Duration::from_millis(8),

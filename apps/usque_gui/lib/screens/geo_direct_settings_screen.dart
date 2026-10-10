@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
@@ -7,27 +9,59 @@ import '../core/usque_theme.dart';
 import '../models/app_models.dart';
 import '../state/app_controller.dart';
 import '../widgets/common.dart';
+import '../widgets/country_flag.dart';
+import '../widgets/routing_rules_editor.dart';
+import '../widgets/save_changes_bar.dart';
+import '../widgets/unsaved_changes_guard.dart';
 
 class GeoDirectSettingsScreen extends StatefulWidget {
   const GeoDirectSettingsScreen({required this.controller, super.key});
-
   final AppController controller;
-
   @override
   State<GeoDirectSettingsScreen> createState() =>
       _GeoDirectSettingsScreenState();
 }
 
 class _GeoDirectSettingsScreenState extends State<GeoDirectSettingsScreen> {
-  final TextEditingController _search = TextEditingController();
+  final _search = TextEditingController();
   late Set<String> _enabled;
+  late RoutingSettings _routing;
+  late String _baseline;
+  late String _countriesBaseline;
+  late RoutingSettings _routingBaseline;
+  late String _accountId;
   bool _saving = false;
+  bool _saved = false;
+  String? _error;
+  List<String> _backendErrorIds = [];
+  String get _draft =>
+      '${_orderedCountries(_enabled).join(',')}|${jsonEncode(_routing.toMap())}';
+  bool get _dirty => _draft != _baseline;
+  bool get _customAvailable =>
+      widget.controller.engineCapabilities?.routingRules ?? false;
 
   @override
   void initState() {
     super.initState();
-    _enabled = widget.controller.activeProfile.geoDirectCountries.toSet();
+    final profile = widget.controller.activeProfile;
+    _accountId = profile.id;
+    _load(profile);
     widget.controller.refreshGeoRules();
+  }
+
+  void _load(UsqueProfile profile) {
+    _enabled = profile.geoDirectCountries.toSet();
+    _routing = profile.routing;
+    if (!_customAvailable && _routing.rules.isEmpty) {
+      _routing = RoutingSettings(
+        rules: [...profile.bypassCidrs, ...profile.bypassDomains]
+            .map((target) => RoutingRule.create(target, RoutingAction.direct))
+            .toList(),
+      );
+    }
+    _baseline = _draft;
+    _routingBaseline = _routing;
+    _countriesBaseline = _orderedCountries(_enabled).join(',');
   }
 
   @override
@@ -36,72 +70,243 @@ class _GeoDirectSettingsScreenState extends State<GeoDirectSettingsScreen> {
     super.dispose();
   }
 
+  void _edited(RoutingSettings value) => setState(() {
+    _routing = value;
+    _saved = false;
+    _error = null;
+    _backendErrorIds = [];
+  });
+
+  String _issue(String key, List<String> ids) {
+    final positions = ids
+        .map((id) => _routing.rules.indexWhere((rule) => rule.id == id) + 1)
+        .where((index) => index > 0)
+        .join(', ');
+    return '${widget.controller.strings.get(key)}${positions.isEmpty ? '' : ' ($positions)'}';
+  }
+
   Future<void> _save() async {
     if (_saving) return;
-    setState(() => _saving = true);
-    final profile = widget.controller.activeProfile;
-    await widget.controller.saveNetwork(
-      profile.copyWith(geoDirectCountries: _orderedCountries(_enabled)),
-      changedFields: const ['geo_direct_countries'],
+    final controller = widget.controller;
+    if (controller.activeProfile.id != _accountId) {
+      setState(() => _error = controller.strings.get('changes_failed'));
+      return;
+    }
+    RoutingSettings normalized;
+    try {
+      normalized = _routing.validate().settings;
+    } on RoutingRuleError catch (error) {
+      setState(() {
+        _error = _issue(error.key, error.ids);
+        _backendErrorIds = error.ids;
+      });
+      return;
+    }
+    if (!_customAvailable && _routing != _routingBaseline) return;
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    final saved = await controller.saveNetwork(
+      controller.activeProfile.copyWith(
+        routing: _customAvailable
+            ? normalized
+            : controller.activeProfile.routing,
+        geoDirectCountries: _orderedCountries(_enabled),
+      ),
+      changedFields: [
+        if (_orderedCountries(_enabled).join(',') != _countriesBaseline)
+          'geo_direct_countries',
+        if (_customAvailable && _routing != _routingBaseline) 'routing',
+      ],
     );
     if (!mounted) return;
-    setState(() => _saving = false);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          widget.controller.networkSettingsMessage ??
-              widget.controller.strings.get('settings_unknown'),
-        ),
-      ),
-    );
+    setState(() {
+      _saving = false;
+      _saved = saved;
+      if (saved) {
+        _load(controller.activeProfile);
+        _backendErrorIds = [];
+      } else {
+        _backendErrorIds = controller.networkSettings.routingErrorIds;
+        _error = _backendErrorIds.isEmpty
+            ? controller.lastError ?? controller.strings.get('changes_failed')
+            : _issue(
+                controller.networkSettings.routingErrorKey ??
+                    'routing_conflict',
+                _backendErrorIds,
+              );
+      }
+    });
   }
 
   @override
-  Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: widget.controller,
-      builder: (context, _) {
-        final strings = widget.controller.strings;
-        return SubPage(
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: widget.controller,
+    builder: (context, _) {
+      final controller = widget.controller;
+      final strings = controller.strings;
+      final appliedAds =
+          (controller.snapshot.isConnected ||
+              controller.snapshot.isTransitional) &&
+          (controller
+                  .networkSettings
+                  .state
+                  ?.appliedProfile
+                  ?.routing
+                  .adsEnabled ??
+              false);
+      final activeAds = controller.snapshot.adsRuleRevision;
+      final adsPending =
+          appliedAds &&
+          controller.geoRules.hasAds &&
+          activeAds != controller.geoRules.adsRevision;
+      String? validationError;
+      var errorIds = _backendErrorIds;
+      List<RoutingNotice> notices = [];
+      try {
+        notices = _routing.validate().notices;
+      } on RoutingRuleError catch (error) {
+        validationError = _issue(error.key, error.ids);
+        errorIds = error.ids;
+      }
+      return UnsavedChangesGuard(
+        strings: strings,
+        dirty: _dirty,
+        saving: _saving,
+        child: SubPage(
           contentWidth: 880,
           title: strings.get('geo_direct'),
           backLabel: strings.get('back'),
-          actions: <Widget>[
-            FilledButton.icon(
-              onPressed: _saving ? null : _save,
-              icon: const Icon(LucideIcons.save),
-              label: Text(strings.get('save')),
-            ),
-          ],
+          bottomBar: SaveChangesBar(
+            strings: strings,
+            dirty: _dirty,
+            saving: _saving,
+            saved: _saved,
+            error: _error,
+            validationError: validationError,
+            statusLabel:
+                controller.networkSettings.unconfirmed ||
+                    (_error == null &&
+                        (!_dirty ||
+                            controller.networkSettings.saveError != null))
+                ? controller.networkSettingsMessage
+                : null,
+            onReconnect: controller.networkSettingsCanReconnect
+                ? controller.retry
+                : null,
+            contentWidth: 880,
+            matchPageGutter: true,
+            onSave: validationError == null ? _save : null,
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[
+            children: [
               BannerSlot(
-                child: widget.controller.lastError == null
+                child: controller.lastError == null
                     ? null
                     : WarningBanner(
-                        title: strings.get('error'),
-                        message: widget.controller.lastError!,
+                        title: strings.get('error_generic'),
+                        message: controller.lastError!,
                         danger: true,
-                        onDismiss: widget.controller.clearError,
+                        onDismiss: controller.clearError,
                       ),
               ),
               BannerSlot(
-                child: widget.controller.lastNotice == null
+                child: controller.lastNotice == null
                     ? null
                     : WarningBanner(
                         title: strings.get('notice'),
-                        message: widget.controller.lastNotice!,
-                        onDismiss: widget.controller.clearNotice,
+                        message: controller.lastNotice!,
+                        onDismiss: controller.clearNotice,
                       ),
               ),
-              ContentSection(child: _buildRulesPanel(context)),
+              ContentSection(
+                child: RoutingRulesEditor(
+                  value: _routing,
+                  strings: strings,
+                  errorIds: errorIds,
+                  onChanged: _customAvailable && !_saving ? _edited : null,
+                ),
+              ),
+              for (final notice in notices.take(8))
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: HintText(_issue(notice.key, notice.ids)),
+                ),
+              const SizedBox(height: 24),
+              ContentSection(
+                child: RowTileTheme(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      SwitchListTile(
+                        key: const ValueKey('routing-ads'),
+                        contentPadding: EdgeInsets.zero,
+                        secondary: const Icon(LucideIcons.megaphoneOff),
+                        title: Text(strings.get('routing_ads')),
+                        subtitle: Text(
+                          strings.get(
+                            controller.geoRules.hasAds
+                                ? 'routing_ads_ready'
+                                : 'routing_ads_unavailable',
+                          ),
+                        ),
+                        value: _routing.adsEnabled,
+                        onChanged: _customAvailable && !_saving
+                            ? (value) => _edited(
+                                RoutingSettings(
+                                  rules: _routing.rules,
+                                  adsEnabled: value,
+                                ),
+                              )
+                            : null,
+                      ),
+                      // Status and the update action sit in the switch's text
+                      // column (20 px icon + 12 px gap).
+                      if (appliedAds)
+                        Padding(
+                          padding: const EdgeInsetsDirectional.only(start: 32),
+                          child: HintText(
+                            "${strings.get('routing_current')}: ${strings.get(activeAds.isEmpty ? 'routing_ads_unavailable' : 'active')}",
+                          ),
+                        ),
+                      if (adsPending)
+                        Padding(
+                          padding: const EdgeInsetsDirectional.only(start: 32),
+                          child: HintText(strings.get('routing_pending')),
+                        ),
+                      Align(
+                        alignment: AlignmentDirectional.centerStart,
+                        child: Padding(
+                          // TextButton.icon pads its icon by 12 px.
+                          padding: const EdgeInsetsDirectional.only(start: 20),
+                          child: TextButton.icon(
+                            onPressed: controller.geoProgress != null
+                                ? null
+                                : controller.updateAllGeoRules,
+                            icon: const Icon(LucideIcons.refreshCw),
+                            label: Text(strings.get('geo_update_all')),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 24),
+              ContentSection(
+                icon: LucideIcons.earth,
+                title: strings.get('bypass_countries'),
+                gap: 12,
+                child: _buildRulesPanel(context),
+              ),
             ],
           ),
-        );
-      },
-    );
-  }
+        ),
+      );
+    },
+  );
 
   Widget _buildRulesPanel(BuildContext context) {
     final controller = widget.controller;
@@ -165,6 +370,7 @@ class _GeoDirectSettingsScreenState extends State<GeoDirectSettingsScreen> {
           child: Divider(height: 1, color: UsqueTokens.of(context).hairline),
         ),
         TextField(
+          key: const ValueKey('bypass-country-search'),
           controller: _search,
           onChanged: (_) => setState(() {}),
           decoration: InputDecoration(
@@ -189,6 +395,7 @@ class _GeoDirectSettingsScreenState extends State<GeoDirectSettingsScreen> {
               final date = _entryDate(entry);
               return ListTile(
                 contentPadding: EdgeInsets.zero,
+                leading: CountryFlag(countryCode: country.code),
                 title: Text(
                   '${country.code}  ${country.name}',
                   maxLines: 1,
@@ -217,10 +424,13 @@ class _GeoDirectSettingsScreenState extends State<GeoDirectSettingsScreen> {
                     Semantics(
                       label: '${strings.get('geo_enable')} ${country.code}',
                       child: Switch(
+                        key: ValueKey('routing-country-${country.code}'),
                         value: enabled,
-                        onChanged: ready || enabled
+                        onChanged: !_saving && (ready || enabled)
                             ? (value) {
                                 setState(() {
+                                  _saved = false;
+                                  _error = null;
                                   if (value) {
                                     _enabled.add(country.code);
                                   } else {

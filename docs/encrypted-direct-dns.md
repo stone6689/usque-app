@@ -1,14 +1,97 @@
-# Encrypted direct DNS contract
+# Direct DNS: System, DoH and DoT
 
-Direct DNS is an explicit Profile choice: physical-system DNS (the legacy
-default), DNS over HTTPS, or DNS over TLS. It changes only Geo-selected direct
-queries. WARP/tunnel DNS, application-owned encrypted DNS, and unrelated
-traffic are not intercepted or decrypted. There are no vendor presets or
-embedded resolver bootstrap addresses.
+Direct DNS controls name lookups for destinations selected by country-based or custom domain
+direct rules. It is shared across accounts. It does not change other tunnel DNS,
+intercept an application's own encrypted DNS, or decrypt unrelated traffic.
 
-## Configuration and trust
+## Choose a mode
+
+| Mode in the app | Where matching queries go | What you need to configure |
+| --- | --- | --- |
+| Current network DNS (System, the default) | The DNS servers on your current network, outside the VPN. Those servers can see the queried names. | No custom resolver fields. |
+| DNS over HTTPS (DoH) | The encrypted resolver you choose, over HTTPS. | Complete HTTPS URL and bootstrap IP addresses. |
+| DNS over TLS (DoT) | The encrypted resolver you choose, over TLS. | TLS server name, port and bootstrap IP addresses. |
+
+The chosen DoH/DoT provider can see the names it resolves. Encryption protects
+the connection to that provider; it does not make queries anonymous to it.
+New encrypted DNS drafts prefill Cloudflare: DoH uses
+`https://cloudflare-dns.com/dns-query`, and DoT uses `one.one.one.one:853`.
+Both prefill `1.1.1.1`, `1.0.0.1`, `2606:4700:4700::1111` and
+`2606:4700:4700::1001`. Existing saved values are preserved. These are editable
+drafts and do not change the System default until you select and apply a mode.
+
+## Configure direct DNS
+
+1. In **Settings → Bypass settings**, select the countries and download
+   their GeoIP rules and the global GeoSite catalog, then save the selection.
+   Alternatively, add domains with the **DIRECT** action under **Custom routing
+   rules**; these do not need geographic downloads. If no country rule or DIRECT
+   domain rule matches, these DNS settings are not used.
+2. Open **Settings → Advanced network settings → Direct DNS**.
+3. Choose System, DoH or DoT. Keep the Cloudflare defaults for a new encrypted
+   draft, or enter your provider's values using the field guide below.
+4. Select **Apply changes**. Editing or resetting fields alone does not apply
+   them. Read the save result and pending-state message; reconnect manually if
+   the change is saved for the next connection.
+5. Check **Network quality → Direct DNS** while connected. To test reachability,
+   run a confirmed [Deep diagnostic](network-doctor.md).
+
+In Simplified Chinese, the bypass page is **设置 → 分流设置**. Direct DNS is under
+**设置 → 高级网络设置 → 直连 DNS**. The System option is currently labelled
+**当前网络的 DNS**.
+
+### Field guide
+
+| Field | What to enter | Format example |
+| --- | --- | --- |
+| DoH URL | Complete HTTPS URL with the provider's DNS name and path. An optional custom port belongs in the URL. No credentials, query string or fragment. | `https://cloudflare-dns.com/dns-query` |
+| DNS server name (DoT) | The provider's certificate name, without a scheme, port or path. Do not enter an IP here. | `one.one.one.one` |
+| Port (DoT; 0 uses the default) | `853`, or a custom port specified by the provider. | `853` |
+| DNS server IP addresses | One to eight distinct IP addresses for that resolver, preferably one per line. Usque connects to these addresses without first using system DNS to find the server. | `1.1.1.1` and `2606:4700:4700::1111` |
+
+The Cloudflare endpoints above are working defaults; use the provider's actual
+IP addresses if you choose another resolver. Direct DNS still requires 1–8
+bootstrap IPs. DoT has no HTTPS path. The TLS certificate must match the name
+even though the connection uses a numeric IP address.
+
+Saved DoH name, port and path fields automatically display as one URL, without
+rewriting the stored configuration. Custom ports, paths and bootstrap IPs are
+preserved. Switching modes retains separate drafts. Resetting Advanced settings
+clears these drafts; selecting an encrypted mode afterward prefills Cloudflare.
+All changes still require **Apply changes**.
+
+## If it does not work
+
+- A validation error usually identifies a malformed name, path, port or IP.
+  Correct the field; failed validation does not save a different DNS mode.
+- If the encrypted resolver cannot be reached or authenticated, matching
+  queries fail. Usque does not switch them to System or plaintext DNS.
+  Check the provider's name, IP addresses, path, port and network reachability.
+- If the Engine does not support encrypted direct DNS, saved custom values stay
+  visible but unavailable for use. Use a compatible Engine, or explicitly choose
+  System if that is your intended privacy policy.
+- Apps using their own encrypted DNS hide names from Usque, so country routing
+  uses IP rules. The direct-DNS selector does not control those apps' resolvers.
+
+Other remote VPN queries use the final exit's DNS: WARP® without a chain, or the
+active chain exit (custom OpenVPN or WireGuard, WARP via WireGuard, or VPN
+Gate). Ordinary WARP supports configurable Plain DNS, DoH and DoT; see
+[WARP exit DNS](WARP_DNS.md).
+See the [direct DNS threat model](direct-dns-threat-model.md) for platform
+protection and diagnostic limits.
+
+## Implementation reference
+
+A runtime `Profile` receives a copy of the shared network settings. It is not a
+separate per-account direct-DNS preference. The following sections specify input
+validation, protocol handling and resource ownership.
+
+### Configuration and trust
 
 `DirectDnsSettings` is validated in core before opening a connection. TLS
+server name, port and path remain the persisted and IPC representation; the
+editor splits the HTTPS URL into these fields without decoding its path.
+An omitted URL port uses `443`; an omitted path uses `/dns-query`. TLS
 server names are IDNA-normalized DNS names, at most 253 characters/ASCII bytes
 after normalization, and validated with rustls `ServerName`. URL syntax,
 wildcards, empty labels, control characters and whitespace are rejected rather
@@ -36,7 +119,7 @@ lease are dropped before retry. The two-address budget, total query deadline,
 and no-retry-on-timeout policy are unchanged. Both an outer deadline expiry
 and a transport-reported preface I/O timeout preserve the Timeout classification.
 
-## Protocol and semantic validation
+### Protocol and semantic validation
 
 DoH uses HTTP/2 POST, HTTPS authority derived from the configured name/port,
 the configured path and `application/dns-message` for Content-Type and Accept.
@@ -59,7 +142,7 @@ semantic parser is introduced. DNS name decoding is bounded before allocation
 can grow beyond the supported name length. The application's UDP response-size
 limit still applies, independently of encrypted upstream transport.
 
-## Bounds, cancellation and generations
+### Bounds, cancellation and generations
 
 - At most four encrypted DNS sockets/connections, including connecting,
   retiring and Happy Eyeballs losers. Permits live with actual I/O until its
@@ -91,7 +174,7 @@ limit still applies, independently of encrypted upstream transport.
   cannot reuse old connections. Profile shutdown rejects new work and cancels
   old work. Queued application replies recheck generation before injection.
 
-## No plaintext downgrade
+### No plaintext downgrade
 
 Only the physical-system variant can discover physical DNS servers or use
 plain UDP/TCP DNS. An encrypted resolver error returns a fixed error and Split
@@ -108,11 +191,13 @@ Disabling the internal encrypted-DNS capability rejects an encrypted Profile
 before connection. It never rewrites the saved mode or silently substitutes
 physical-system DNS. Users may explicitly change the Profile themselves.
 
-## Privacy and validation limits
+### Privacy and validation limits
 
-### Profile/config schema 13
+#### Profile/config schema 13 (introduction)
 
-`AppConfig.shared_network.direct_dns` is hydrated into each account's runtime
+Direct DNS was introduced in configuration schema 13; later
+[configuration migrations](../crates/usque-core/src/storage.rs) keep these fields.
+`AppConfig.network.direct_dns` is hydrated into each account's runtime
 Profile. Old schema-12 configurations and missing protobuf Profile field 17
 canonicalize to System. Shared settings, not per-account endpoint overlays,
 select DNS. `DirectDnsSettings` wire fields 1–5 are mode, server name, DoH path,
@@ -127,9 +212,22 @@ of that list. See the deployment-specific [threat model](direct-dns-threat-model
 and [capability rollback](network-quality-rollback.md).
 
 Metrics contain only protocol/mode, fixed phase/reason codes, RTT, counters and
-queue pressure. No QNAME, wire message, configured name, bootstrap/answer IP,
-certificate or physical DNS server is added to logs, metrics or diagnostics.
-Geo fallback logs no longer include raw target/error text. Metrics stay local.
+queue pressure. Direct-DNS code adds no QNAME, wire message, configured name,
+bootstrap/answer IP, certificate or physical DNS server to logs, metrics or
+diagnostics. Split DNS and proxy Geo fallback log events carry fixed reason
+codes, not raw target or error text. Metrics stay local.
+
+The TUN direct gateway is narrower. Its debug-level events `could not create
+GEO direct flow; using tunnel` and `GEO direct flow ended` carry the error text
+and the flow's `remote` address, which can be a direct answer IP. At the
+default Info level they are not written. If a user selects Debug, the desktop
+Engine writes them to its local `engine.jsonl` only after its log sanitizer
+replaces `remote` and other sensitive keys with `[REDACTED]` and replaces
+IP-, socket-address-, URL- and host-name-like tokens in strings. Other error
+text remains. Diagnostic export applies the same sanitizer again. This
+redaction is pattern-based, so do not treat Debug logs as free of private
+network details. The Android library installs no Rust log subscriber, so these
+events are not recorded there.
 
 Workstation tests use in-memory test CA material and loopback fake DoH/DoT
 servers. They cover protocol/PKI rejection, concurrency, reuse/recycle/idle
@@ -140,5 +238,22 @@ hostname resolution. Existing system-mode truncation/oracle fixtures remain.
 
 These tests are not external leak proof. Actual device/adapter binding,
 observer packet counts and controlled performance evidence require the
-protected environments in `AGENTS.md`. Unavailable runs are `not_run`, never
-pass, and do not become publication prerequisites.
+protected environments in [Contributing](../CONTRIBUTING.md#development-machines). Unavailable runs must be recorded as `not_run`; they do not establish leak or
+performance results.
+
+## Custom bypass targets / 自定义绕过目标
+
+Custom targets now use the [routing rule editor](ROUTING.md): select DIRECT,
+REJECT or PROXY for each domain, IP or CIDR. More-specific domains and longer
+prefixes win. Legacy targets migrate to DIRECT in schema 24; custom CIDRs no
+longer create OS-level bypass routes. Direct hostname resolution still uses the
+Direct DNS settings described above. Rejecting a hostname prevents its DNS
+query; explicit IP rejection is checked before opening a data socket.
+
+在 **设置 → 分流设置** 中为目标选择 DIRECT、REJECT 或 PROXY，点击 **应用修改**。
+旧绕过目标自动迁移为 DIRECT；更具体的域名和更长的网段前缀优先。Ads 开关、冲突提示、
+重连生效及可见性边界见[分流规则与 Ads](ROUTING.md)。直连域名继续使用本页的直连 DNS 设置。
+
+---
+
+WARP is a trademark and/or registered trademark of Cloudflare, Inc. in the United States and other jurisdictions.

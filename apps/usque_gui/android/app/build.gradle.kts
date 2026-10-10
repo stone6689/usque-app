@@ -16,7 +16,22 @@ android {
     }
 
     defaultConfig {
-        applicationId = "io.github.georgexie2333.usque"
+        // Release stays on the public id. Local validation sets
+        // USQUE_ANDROID_APPLICATION_ID so a sideload does not replace it.
+        val releaseApplicationId = "io.github.georgexie2333.usque"
+        val requestedApplicationId =
+            System.getenv("USQUE_ANDROID_APPLICATION_ID")?.trim().orEmpty()
+        if (requestedApplicationId.isNotEmpty()) {
+            val applicationIdPattern =
+                Regex("^[a-zA-Z][A-Za-z0-9_]*(\\.[a-zA-Z][A-Za-z0-9_]*)+$")
+            if (!applicationIdPattern.matches(requestedApplicationId)) {
+                throw GradleException(
+                    "USQUE_ANDROID_APPLICATION_ID is not an Android application id: $requestedApplicationId",
+                )
+            }
+        }
+        applicationId =
+            requestedApplicationId.ifEmpty { releaseApplicationId }
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = 26
@@ -68,6 +83,16 @@ android {
         // Windows paths. It is consumed correctly by Gradle and is not a
         // distributable project resource.
         disable += "PropertyEscape"
+    }
+}
+
+androidComponents {
+    onVariants(selector().withBuildType("release")) { variant ->
+        // Direct APK downloads prioritize compressed size. Android extracts
+        // these libraries at install time; retain identical library contents.
+        val jniPackaging = variant.packaging.jniLibs
+        jniPackaging.useLegacyPackaging.set(true)
+        jniPackaging.useLegacyPackagingFromBundle.set(true)
     }
 }
 

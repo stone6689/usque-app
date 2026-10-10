@@ -1,15 +1,18 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import '../core/connection_presentation.dart';
 import '../core/diagnostics_strings.dart';
 import '../core/usque_theme.dart';
+import '../models/app_models.dart';
 import '../models/diagnostics_models.dart';
 import '../state/app_controller.dart';
 import '../widgets/common.dart';
 import '../widgets/connection_timeline.dart';
+import '../widgets/desktop_shortcuts.dart';
 import '../widgets/diagnostic_check_tile.dart';
+import '../widgets/external_link.dart';
 import '../widgets/usque_dialog.dart';
 
 class DiagnosticsScreen extends StatefulWidget {
@@ -29,11 +32,27 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
   @override
   void initState() {
     super.initState();
+    controller.diagnostics.beginTimelineUpdates();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         controller.diagnostics.restore(silent: true);
       }
     });
+  }
+
+  @override
+  void didUpdateWidget(DiagnosticsScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != controller) {
+      oldWidget.controller.diagnostics.endTimelineUpdates();
+      controller.diagnostics.beginTimelineUpdates();
+    }
+  }
+
+  @override
+  void dispose() {
+    controller.diagnostics.endTimelineUpdates();
+    super.dispose();
   }
 
   @override
@@ -43,7 +62,13 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
         controller,
         controller.diagnostics,
       ]),
-      builder: (context, _) => _buildPage(context),
+      builder: (context, _) => PageShortcut(
+        activator: const SingleActivator(LogicalKeyboardKey.f5),
+        onInvoke: controller.diagnostics.timelineLoading
+            ? null
+            : controller.diagnostics.loadTimeline,
+        child: _buildPage(context),
+      ),
     );
   }
 
@@ -83,7 +108,7 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
               child: controller.lastError == null
                   ? null
                   : WarningBanner(
-                      title: strings.get('error'),
+                      title: strings.get('error_generic'),
                       message: controller.lastError!,
                       danger: true,
                       onDismiss: controller.clearError,
@@ -169,13 +194,6 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
                   icon: LucideIcons.info,
                   title: 'Usque',
                   subtitle: strings.get('unofficial'),
-                  trailing: InlineStatus(
-                    label: strings.get(presentation.labelKey),
-                    tone: presentation.tone,
-                    icon: controller.snapshot.isConnected
-                        ? LucideIcons.circleCheck
-                        : LucideIcons.circle,
-                  ),
                   children: <Widget>[
                     ReadoutRow(
                       icon: LucideIcons.tag,
@@ -183,20 +201,29 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
                       value: MonoValue(value: strings.get('app_version')),
                     ),
                     const SizedBox(height: 12),
-                    const ReadoutRow(
-                      icon: LucideIcons.monitor,
-                      label: 'IPC API',
-                      value: MonoValue(value: 'usque.v1'),
+                    ExpansionTile(
+                      key: const PageStorageKey<String>(
+                        'app-technical-details',
+                      ),
+                      title: Text(strings.get('technical_details')),
+                      tilePadding: EdgeInsets.zero,
+                      childrenPadding: const EdgeInsets.only(bottom: 16),
+                      expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: const <Widget>[
+                        SelectableText(
+                          'IPC API: usque.v1',
+                          key: PageStorageKey<String>('app-ipc-api'),
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 16),
                     Align(
                       alignment: AlignmentDirectional.centerEnd,
                       child: OutlinedButton.icon(
-                        onPressed: () => launchUrl(
-                          Uri.parse(
-                            'https://github.com/GeorgeXie2333/usque-app',
-                          ),
-                          mode: LaunchMode.externalApplication,
+                        onPressed: () => openExternalLink(
+                          context,
+                          strings,
+                          'https://github.com/GeorgeXie2333/usque-app',
                         ),
                         icon: const Icon(LucideIcons.code2),
                         label: Text(strings.get('source_code')),
@@ -342,6 +369,8 @@ class _DiagnosticControlPanel extends StatelessWidget {
         tone: presentation.tone,
         icon: controller.snapshot.isConnected
             ? LucideIcons.circleCheck
+            : controller.snapshot.phase == ConnectionPhase.error
+            ? LucideIcons.circleX
             : LucideIcons.circle,
       ),
       children: <Widget>[
@@ -451,6 +480,7 @@ class _SessionProgressPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = controller.strings;
     final summary = session.summary;
+    final activeChecks = session.runningCheckIds;
     return ContentSection(
       icon: LucideIcons.radio,
       title: strings.get('diag_session'),
@@ -474,10 +504,15 @@ class _SessionProgressPanel extends StatelessWidget {
           children: <Widget>[
             Expanded(
               child: Text(
-                session.currentCheck == null
+                activeChecks.isNotEmpty
+                    ? activeChecks
+                          .map((check) => diagnosticCheckLabel(strings, check))
+                          .join(' · ')
+                    : session.currentCheck == null
                     ? strings.get('diag_waiting_check')
                     : diagnosticCheckLabel(strings, session.currentCheck!),
                 overflow: TextOverflow.ellipsis,
+                maxLines: 2,
               ),
             ),
             const SizedBox(width: 12),

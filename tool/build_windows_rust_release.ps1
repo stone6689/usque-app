@@ -3,11 +3,19 @@ param(
     [ValidateSet("x64-v1", "x64-v2", "arm64")]
     [string]$Variant = "x64-v2",
     [ValidateSet("build", "test", "clippy")]
-    [string]$CargoAction = "build"
+    [string]$CargoAction = "build",
+    # Optional scoped iteration; omission retains the complete documented gates.
+    [ValidatePattern('^usque-[a-z0-9-]+$')]
+    [string]$Package,
+    # Matched release A/B measurement; shipped builds retain the default feature.
+    [switch]$DisableWireGuard
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+if ($DisableWireGuard -and $CargoAction -ne "build") {
+    throw "DisableWireGuard is only supported for compile-only release builds."
+}
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $platform = if ($Variant -eq "arm64") {
@@ -224,6 +232,20 @@ try {
         "clippy" {
             @("clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings")
         }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Package)) {
+        if ($CargoAction -eq "build") {
+            $cargoArguments = @("build", "--locked", "--release", "--target", $platform.RustTarget, "--package", $Package)
+        }
+        elseif ($CargoAction -eq "test") {
+            $cargoArguments = @("test", "--locked", "--package", $Package, "--all-targets")
+        }
+        else {
+            $cargoArguments = @("clippy", "--locked", "--package", $Package, "--all-targets", "--", "-D", "warnings")
+        }
+    }
+    if ($DisableWireGuard) {
+        $cargoArguments += "--no-default-features"
     }
     & cargo @cargoArguments
     if ($LASTEXITCODE -ne 0) {

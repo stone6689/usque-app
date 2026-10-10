@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
@@ -10,9 +11,12 @@ import '../models/app_models.dart';
 import '../state/app_controller.dart';
 import '../widgets/animated_index_stack.dart';
 import '../widgets/controller_selector.dart';
+import '../widgets/desktop_shortcuts.dart';
+import '../widgets/section_navigator.dart';
+import '../widgets/usque_logo.dart';
 import 'home_screen.dart';
 import 'profiles_screen.dart';
-import 'proxy_screen.dart';
+import 'proxy_section.dart';
 import 'settings_screen.dart';
 
 const double _railMinWidth = 78;
@@ -36,6 +40,126 @@ class ShellScreen extends StatefulWidget {
 
 class _ShellScreenState extends State<ShellScreen> {
   AppController get controller => widget.controller;
+  final _proxySection = GlobalKey<ProxySectionState>();
+  final _sectionNavigators = <AppSection, GlobalKey<SectionNavigatorState>>{
+    AppSection.proxy: GlobalKey<SectionNavigatorState>(),
+    AppSection.settings: GlobalKey<SectionNavigatorState>(),
+  };
+  final _subpageOpen = <AppSection>{};
+  bool _changingSection = false;
+  bool _openingChainProxy = false;
+
+  static const _sectionKeys = <LogicalKeyboardKey>[
+    LogicalKeyboardKey.digit1,
+    LogicalKeyboardKey.digit2,
+    LogicalKeyboardKey.digit3,
+    LogicalKeyboardKey.digit4,
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    if (desktopShortcutsSupported) {
+      HardwareKeyboard.instance.addHandler(_handleShortcut);
+    }
+  }
+
+  @override
+  void dispose() {
+    if (desktopShortcutsSupported) {
+      HardwareKeyboard.instance.removeHandler(_handleShortcut);
+    }
+    super.dispose();
+  }
+
+  /// Ctrl+1–4 select a section; Escape and Alt+Left leave a subpage.
+  bool _handleShortcut(KeyEvent event) {
+    if (event is! KeyDownEvent || !mounted || !routeChainIsCurrent(context)) {
+      return false;
+    }
+    final keyboard = HardwareKeyboard.instance;
+    final key = event.logicalKey;
+    final index = _sectionKeys.indexOf(key);
+    if (index >= 0 &&
+        keyboard.isControlPressed &&
+        !keyboard.isAltPressed &&
+        !keyboard.isShiftPressed &&
+        !keyboard.isMetaPressed) {
+      final sections = controller.availableSections;
+      if (index >= sections.length) return false;
+      unawaited(_selectSection(sections[index]));
+      return true;
+    }
+    final back =
+        key == LogicalKeyboardKey.escape &&
+            !keyboard.isControlPressed &&
+            !keyboard.isAltPressed &&
+            !textInputHasFocus ||
+        key == LogicalKeyboardKey.arrowLeft &&
+            keyboard.isAltPressed &&
+            !keyboard.isControlPressed &&
+            !keyboard.isShiftPressed;
+    return back && _leaveSubpage();
+  }
+
+  /// Pops the current section's subpage through its unsaved-changes guard.
+  bool _leaveSubpage() {
+    final section = controller.section;
+    if (!_subpageOpen.contains(section)) return false;
+    final sectionNavigator = _sectionNavigators[section]?.currentState;
+    final navigator = sectionNavigator?.navigator;
+    // A popup on the section navigator handles Escape itself.
+    if (navigator == null || sectionNavigator!.popupOpen) return false;
+    unawaited(navigator.maybePop());
+    return true;
+  }
+
+  ValueChanged<bool> _onSubpageChanged(AppSection section) => (open) {
+    if (!mounted) return;
+    setState(() {
+      if (open) {
+        _subpageOpen.add(section);
+      } else {
+        _subpageOpen.remove(section);
+      }
+    });
+  };
+
+  Future<void> _openChainProxy() async {
+    if (_openingChainProxy) return;
+    _openingChainProxy = true;
+    final selectedController = controller;
+    try {
+      if (!await _selectSection(AppSection.proxy)) return;
+      // Activate the section before its subpage starts foreground work.
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted ||
+          controller != selectedController ||
+          controller.section != AppSection.proxy) {
+        return;
+      }
+      unawaited(_proxySection.currentState?.openChainProxy());
+    } finally {
+      _openingChainProxy = false;
+    }
+  }
+
+  Future<bool> _selectSection(AppSection section) async {
+    if (_changingSection) return false;
+    _changingSection = true;
+    final selectedController = controller;
+    try {
+      final navigator = _sectionNavigators[controller.section]?.currentState;
+      if (navigator != null && !await navigator.closeSubpages()) {
+        return false;
+      }
+      if (!mounted || controller != selectedController) return false;
+      controller.selectSection(section);
+      return true;
+    } finally {
+      _changingSection = false;
+    }
+  }
 
   final _destinationKeys = <AppSection, GlobalKey<TooltipState>>{
     for (final section in AppSection.values) section: GlobalKey<TooltipState>(),
@@ -81,26 +205,30 @@ class _ShellScreenState extends State<ShellScreen> {
         sections.length;
     final selected = sections[next];
     final selectedController = controller;
-    controller.selectSection(selected);
-    if (vertical) {
-      // Selection alone does not reveal destinations in a scrollable rail.
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted ||
-            controller != selectedController ||
-            controller.section != selected) {
-          return;
+    unawaited(
+      _selectSection(selected).then((changed) {
+        if (changed && vertical) {
+          // Selection alone does not reveal destinations in a scrollable rail.
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted ||
+                controller != selectedController ||
+                controller.section != selected) {
+              return;
+            }
+            final destinationContext =
+                _destinationKeys[selected]?.currentContext;
+            if (destinationContext == null) return;
+            final destinationFocus = Focus.of(destinationContext);
+            destinationFocus.requestFocus();
+            unawaited(
+              Scrollable.ensureVisible(
+                destinationFocus.context ?? destinationContext,
+              ),
+            );
+          });
         }
-        final destinationContext = _destinationKeys[selected]?.currentContext;
-        if (destinationContext == null) return;
-        final destinationFocus = Focus.of(destinationContext);
-        destinationFocus.requestFocus();
-        unawaited(
-          Scrollable.ensureVisible(
-            destinationFocus.context ?? destinationContext,
-          ),
-        );
-      });
-    }
+      }),
+    );
     return KeyEventResult.handled;
   }
 
@@ -129,6 +257,7 @@ class _ShellScreenState extends State<ShellScreen> {
           HomeScreen(
             key: const ValueKey<String>('home-page'),
             controller: controller,
+            onOpenChainProxy: () => unawaited(_openChainProxy()),
           ),
           ControllerSelector<
             ({
@@ -149,52 +278,61 @@ class _ShellScreenState extends State<ShellScreen> {
             ),
             builder: (context, _) => ProfilesScreen(controller: controller),
           ),
-          ControllerSelector<UsqueProfile>(
-            key: const ValueKey<String>('proxy-controller-selector'),
+          ProxySection(
+            key: _proxySection,
+            navigatorKey: _sectionNavigators[AppSection.proxy]!,
             controller: controller,
-            active: (controller) => controller.section == AppSection.proxy,
-            selector: (controller) => controller.activeProfile,
-            builder: (context, _) => ProxyScreen(controller: controller),
+            active: section == AppSection.proxy,
+            onSubpageChanged: _onSubpageChanged(AppSection.proxy),
           ),
-          ControllerSelector<
-            ({
-              ThemePreference theme,
-              LocalePreference locale,
-              bool networkQualitySupported,
-              bool updateChecksEnabled,
-              UpdateCheckResult? updateResult,
-              UpdateOperationPhase updatePhase,
-              int updateDownloadedBytes,
-              int updateTotalBytes,
-              String? updateError,
-              String? downloadedUpdatePath,
-              bool busy,
-              String? error,
-              String? notice,
-              UsqueProfile profile,
-            })
-          >(
-            key: const ValueKey<String>('settings-controller-selector'),
-            controller: controller,
-            active: (controller) => controller.section == AppSection.settings,
-            selector: (controller) => (
-              theme: controller.themePreference,
-              locale: controller.localePreference,
-              networkQualitySupported:
-                  controller.engineCapabilities?.networkQuality ?? false,
-              updateChecksEnabled: controller.updateChecksEnabled,
-              updateResult: controller.updateResult,
-              updatePhase: controller.updatePhase,
-              updateDownloadedBytes: controller.updateDownloadedBytes,
-              updateTotalBytes: controller.updateTotalBytes,
-              updateError: controller.updateError,
-              downloadedUpdatePath: controller.downloadedUpdatePath,
-              busy: controller.busy,
-              error: controller.lastError,
-              notice: controller.lastNotice,
-              profile: controller.activeProfile,
-            ),
-            builder: (context, _) => SettingsScreen(controller: controller),
+          SectionNavigator(
+            key: _sectionNavigators[AppSection.settings],
+            active: section == AppSection.settings,
+            rootName: '/settings',
+            onSubpageChanged: _onSubpageChanged(AppSection.settings),
+            builder: (context) =>
+                ControllerSelector<
+                  ({
+                    ThemePreference theme,
+                    LocalePreference locale,
+                    bool networkQualitySupported,
+                    bool updateChecksEnabled,
+                    UpdateCheckResult? updateResult,
+                    UpdateOperationPhase updatePhase,
+                    int updateDownloadedBytes,
+                    int updateTotalBytes,
+                    String? updateError,
+                    String? downloadedUpdatePath,
+                    bool busy,
+                    String? error,
+                    String? notice,
+                    UsqueProfile profile,
+                  })
+                >(
+                  key: const ValueKey<String>('settings-controller-selector'),
+                  controller: controller,
+                  active: (controller) =>
+                      controller.section == AppSection.settings,
+                  selector: (controller) => (
+                    theme: controller.themePreference,
+                    locale: controller.localePreference,
+                    networkQualitySupported:
+                        controller.engineCapabilities?.networkQuality ?? false,
+                    updateChecksEnabled: controller.updateChecksEnabled,
+                    updateResult: controller.updateResult,
+                    updatePhase: controller.updatePhase,
+                    updateDownloadedBytes: controller.updateDownloadedBytes,
+                    updateTotalBytes: controller.updateTotalBytes,
+                    updateError: controller.updateError,
+                    downloadedUpdatePath: controller.downloadedUpdatePath,
+                    busy: controller.busy,
+                    error: controller.lastError,
+                    notice: controller.lastNotice,
+                    profile: controller.activeProfile,
+                  ),
+                  builder: (context, _) =>
+                      SettingsScreen(controller: controller),
+                ),
           ),
         ];
         final selected = sections
@@ -205,7 +343,7 @@ class _ShellScreenState extends State<ShellScreen> {
           builder: (context, constraints) {
             final useRail = constraints.maxWidth >= _railBreakpoint;
             final extended = constraints.maxWidth >= _extendedBreakpoint;
-            return Scaffold(
+            final scaffold = Scaffold(
               body: SafeArea(
                 bottom: false,
                 child: Row(
@@ -222,7 +360,7 @@ class _ShellScreenState extends State<ShellScreen> {
                           minExtendedWidth: _railMinExtendedWidth,
                           selectedIndex: selected,
                           onDestinationSelected: (index) =>
-                              controller.selectSection(sections[index]),
+                              unawaited(_selectSection(sections[index])),
                           labelType: extended
                               ? NavigationRailLabelType.none
                               : NavigationRailLabelType.all,
@@ -262,6 +400,7 @@ class _ShellScreenState extends State<ShellScreen> {
                       ),
                     ],
                     Expanded(
+                      key: const ValueKey('shell-content'),
                       child: AnimatedIndexStack(
                         index: selected,
                         children: pages,
@@ -270,7 +409,7 @@ class _ShellScreenState extends State<ShellScreen> {
                   ],
                 ),
               ),
-              bottomNavigationBar: useRail
+              bottomNavigationBar: useRail || _subpageOpen.contains(section)
                   ? null
                   : DecoratedBox(
                       decoration: BoxDecoration(
@@ -289,7 +428,7 @@ class _ShellScreenState extends State<ShellScreen> {
                           child: NavigationBar(
                             selectedIndex: selected,
                             onDestinationSelected: (index) =>
-                                controller.selectSection(sections[index]),
+                                unawaited(_selectSection(sections[index])),
                             destinations: List<NavigationDestination>.generate(
                               labels.length,
                               (index) => NavigationDestination(
@@ -303,6 +442,14 @@ class _ShellScreenState extends State<ShellScreen> {
                         ),
                       ),
                     ),
+            );
+            if (!desktopShortcutsSupported) return scaffold;
+            return Listener(
+              behavior: HitTestBehavior.translucent,
+              onPointerDown: (event) {
+                if (event.buttons & kBackMouseButton != 0) _leaveSubpage();
+              },
+              child: scaffold,
             );
           },
         );
@@ -345,14 +492,7 @@ class _RailLeading extends StatelessWidget {
           children: <Widget>[
             SizedBox(
               width: _railMinWidth,
-              child: Center(
-                child: Image.asset(
-                  'assets/branding/usque-ui-icon.png',
-                  width: 30,
-                  height: 30,
-                  filterQuality: FilterQuality.medium,
-                ),
-              ),
+              child: Center(child: const UsqueLogo(size: 30)),
             ),
             Expanded(
               child: Text(

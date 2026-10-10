@@ -27,6 +27,7 @@ class NetworkSettingsState {
     this.operationId,
     this.sessionId,
     this.storedProfile,
+    this.sharedNetwork,
     this.appliedProfile,
     this.status = NetworkSettingsApplyStatus.unknown,
     this.deferredFields = const [],
@@ -49,6 +50,7 @@ class NetworkSettingsState {
       operationId: map['operation_id'] as String?,
       sessionId: map['session_id'] as String?,
       storedProfile: profile('stored_profile'),
+      sharedNetwork: profile('shared_network_profile'),
       appliedProfile: profile('applied_profile'),
       status: NetworkSettingsApplyStatus.parse(map['apply_status']),
       deferredFields:
@@ -63,6 +65,7 @@ class NetworkSettingsState {
   final String? operationId;
   final String? sessionId;
   final UsqueProfile? storedProfile;
+  final UsqueProfile? sharedNetwork;
   final UsqueProfile? appliedProfile;
   final NetworkSettingsApplyStatus status;
   final List<String> deferredFields;
@@ -94,7 +97,10 @@ Map<String, Object?> _fields(UsqueProfile p) => {
   'frontends.http': p.frontends.http,
   'transport': p.transport,
   'data_plane': p.dataPlane,
+  'vpn_gate': p.vpnGate,
+  'chain_exit': p.chainExit,
   'congestion_control': p.congestionControl,
+  'endpoint.selection': p.endpointSelection,
   'endpoint.ipv4': p.endpointIpv4,
   'endpoint.ipv6': p.endpointIpv6,
   'endpoint.port': p.endpointPort,
@@ -104,21 +110,17 @@ Map<String, Object?> _fields(UsqueProfile p) => {
   'dns_mode': p.dnsMode,
   'dns_servers': [p.dnsIpv4, p.dnsIpv6],
   'allow_lan': p.allowLan,
+  'disable_quic': p.disableQuic,
   'split_exclusions': p.bypassCidrs,
   'kill_switch': p.killSwitch,
   'auto_connect': p.autoConnect,
   'geo_direct_countries': p.geoDirectCountries,
+  'bypass_domains': p.bypassDomains,
+  'routing': p.routing,
   'direct_dns': p.directDns,
-  'proxy.socks5_listeners': [
-    p.proxy.socksIpv4,
-    p.proxy.socksIpv6,
-    p.proxy.socksPort,
-  ],
-  'proxy.http_listeners': [
-    p.proxy.httpIpv4,
-    p.proxy.httpIpv6,
-    p.proxy.httpPort,
-  ],
+  'warp_dns': p.warpDns,
+  'proxy.socks5_listeners': p.proxy.socksListeners,
+  'proxy.http_listeners': p.proxy.httpListeners,
   'proxy.system_proxy': p.proxy.systemProxy,
   'proxy.dns_mode': p.proxy.dnsMode,
   'proxy.dns_servers': [p.proxy.dnsIpv4, p.proxy.dnsIpv6],

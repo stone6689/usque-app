@@ -1,13 +1,14 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use crate::logging::{log_directory, sanitize_log_bytes};
+use crate::logging::{self, LogHealthSnapshot, log_directory, project_public_log};
 
 use chrono::Utc;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -19,11 +20,41 @@ use usque_core::{
 use usque_transport::{ConnectionEventType, ConnectionTimelineSnapshot};
 
 const MAX_DIAGNOSTIC_LOG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DIAGNOSTIC_LOG_RECORD_BYTES: usize = 256 * 1024;
+
+#[derive(Default, Serialize)]
+struct LogExportMetadata {
+    source_status: &'static str,
+    byte_limit: usize,
+    source_bytes_available: u64,
+    source_bytes_read: usize,
+    exported_bytes: usize,
+    files_available: usize,
+    files_read: usize,
+    unreadable_files: usize,
+    records_exported: usize,
+    invalid_records: usize,
+    partial_records: usize,
+    oversized_records: usize,
+    rejected_records: usize,
+    truncated: bool,
+    omission_reasons: Vec<&'static str>,
+    capture_status: &'static str,
+    writer_health: Option<LogHealthSnapshot>,
+}
+
+struct CollectedLogs {
+    bytes: Vec<u8>,
+    metadata: LogExportMetadata,
+}
 
 #[derive(Default)]
 pub struct DiagnosticTransportContext {
     pub timeline: ConnectionTimelineSnapshot,
+    pub network_quality: Option<usque_transport::NetworkQualitySnapshot>,
     pub socket_receive: Option<usque_transport::SocketReceiveQuality>,
+    pub platform_state: Option<usque_ipc::agent_v1::PlatformState>,
+    pub capture: Option<crate::connection_evidence::CaptureMetadata>,
 }
 
 pub struct Maintenance {
@@ -101,7 +132,7 @@ impl Maintenance {
             if flag_cache_directory.is_dir() {
                 fs::remove_dir_all(&flag_cache_directory)?;
             }
-            clear_engine_logs(&log_directory)
+            logging::clear_logs(&log_directory, Duration::from_secs(5))
         })
         .await
         .map_err(|error| MaintenanceError::Worker(error.to_string()))??;
@@ -115,32 +146,6 @@ fn remove_file_if_present(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
-}
-
-fn clear_engine_logs(directory: &Path) -> io::Result<()> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if !metadata.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == "engine.jsonl" {
-            OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(entry.path())?;
-        } else if name.starts_with("engine-") && name.ends_with(".jsonl") {
-            fs::remove_file(entry.path())?;
-        }
-    }
-    Ok(())
 }
 
 fn write_diagnostic_bundle(
@@ -165,7 +170,7 @@ fn write_diagnostic_bundle(
         return Err(MaintenanceError::InvalidDestination(destination.to_owned()));
     }
 
-    let log = collect_sanitized_logs(log_directory)?;
+    let log = collect_logs_with_owner(log_directory);
     let configuration = configuration_summary(config);
     let connection = connection_summary(snapshot);
     let timeline = connection_timeline_summary(&transport.timeline);
@@ -178,6 +183,10 @@ fn write_diagnostic_bundle(
     );
 
     let mut entries = vec![
+        (
+            "log-export.json".to_owned(),
+            serde_json::to_vec_pretty(&log.metadata)?.into_boxed_slice(),
+        ),
         (
             "configuration-summary.json".to_owned(),
             serde_json::to_vec_pretty(&configuration)?.into_boxed_slice(),
@@ -199,6 +208,28 @@ fn write_diagnostic_bundle(
             readme.as_bytes().to_vec().into_boxed_slice(),
         ),
     ];
+    if let Some(capture) = &transport.capture {
+        entries.push((
+            "capture.json".to_owned(),
+            serde_json::to_vec_pretty(capture)?.into_boxed_slice(),
+        ));
+    }
+    if let Some(quality) = &transport.network_quality {
+        let value = serde_json::json!({
+            "connection_instance_id": quality.connection_id.map(|id| id.0.to_string()),
+            "transport_performance": quality.transport_performance.as_ref().map(usque_transport::TransportPerformanceSnapshot::to_json),
+            "queues": quality.queues.iter().map(|queue| serde_json::json!({
+                "kind": queue.kind.as_str(), "current_items": queue.current_items,
+                "current_bytes": queue.current_bytes, "drop_items": queue.drop_items,
+                "drop_bytes": queue.drop_bytes,
+                "backpressure": queue.backpressure.as_ref().map(usque_transport::QueueBackpressureSnapshot::to_json),
+            })).collect::<Vec<_>>(),
+        });
+        entries.push((
+            "transport-performance.json".to_owned(),
+            serde_json::to_vec_pretty(&value)?.into_boxed_slice(),
+        ));
+    }
     if snapshot.transport == Some(usque_core::Transport::Http3)
         && let Some(socket) = &transport.socket_receive
     {
@@ -207,14 +238,31 @@ fn write_diagnostic_bundle(
             serde_json::to_vec_pretty(&socket_receive_summary(socket))?.into_boxed_slice(),
         ));
     }
+    if cfg!(windows) || transport.platform_state.is_some() {
+        entries.push((
+            "windows-recovery.json".to_owned(),
+            serde_json::to_vec_pretty(&crate::recovery_diagnostics::summary(
+                transport.platform_state.as_ref(),
+            ))?
+            .into_boxed_slice(),
+        ));
+    }
     if let Some(session) = diagnostic_session {
         entries.push((
             "diagnostic-session.json".to_owned(),
-            serde_json::to_vec_pretty(&diagnostic_session_summary(session))?.into_boxed_slice(),
+            serde_json::to_vec_pretty(&diagnostic_session_summary(
+                session,
+                transport
+                    .network_quality
+                    .as_ref()
+                    .and_then(|quality| quality.connection_id)
+                    .map(|id| id.0),
+            ))?
+            .into_boxed_slice(),
         ));
     }
-    if !log.is_empty() {
-        entries.push(("logs/engine.jsonl".to_owned(), log.into_boxed_slice()));
+    if !log.bytes.is_empty() {
+        entries.push(("logs/engine.jsonl".to_owned(), log.bytes.into_boxed_slice()));
     }
     let contents = entries
         .iter()
@@ -239,7 +287,7 @@ fn write_diagnostic_bundle(
         "diagnostic_cancelled": diagnostic_session.is_some_and(|session| {
             session.state == usque_core::DiagnosticSessionState::Cancelled
         }),
-        "sanitization_policy": "allowlist-v2",
+        "sanitization_policy": "typed-summaries-v2-public-logs-v1",
         "contents": contents,
         "excluded": [
             "WARP Secret",
@@ -390,6 +438,7 @@ fn connection_timeline_summary(timeline: &ConnectionTimelineSnapshot) -> serde_j
                     event.elapsed_from_attempt_start,
                 ),
                 "event_type": connection_event_type_name(event.event_type),
+                "queue_kind": event.queue_kind.map(usque_transport::QueueKind::as_str),
                 "stage": event.stage.map(usque_core::TransportStage::as_str),
                 "transport": event.transport,
                 "address_family": event.address_family,
@@ -441,7 +490,33 @@ fn platform_health_summary(snapshot: &ConnectionSnapshot) -> serde_json::Value {
     })
 }
 
-fn diagnostic_session_summary(session: &DiagnosticSession) -> serde_json::Value {
+fn diagnostic_session_summary(
+    session: &DiagnosticSession,
+    expected_connection: Option<uuid::Uuid>,
+) -> serde_json::Value {
+    let mut projected = session.clone();
+    for finding in &mut projected.findings {
+        if finding
+            .observation
+            .as_ref()
+            .and_then(|observation| observation.connection_instance_id)
+            .is_some_and(|id| Some(id) != expected_connection)
+        {
+            finding.status = usque_core::DiagnosticCheckStatus::Skipped;
+            finding.severity = usque_core::FailureSeverity::Info;
+            finding.summary_key = "nq_finding_stale".into();
+            finding.remediation_key = "nq_retry".into();
+            finding.failure = None;
+            finding.sanitized_evidence.clear();
+            finding.evidence.clear();
+            if let Some(observation) = &mut finding.observation {
+                observation.availability = usque_core::DiagnosticObservationAvailability::Stale;
+            }
+        }
+    }
+    projected.summary = usque_core::DiagnosticSummary::from_findings(&projected.findings);
+    projected.current_check = projected.active_checks().first().cloned();
+    let session = &projected;
     let completed_after_milliseconds = session.completed_at.map(|completed| {
         completed
             .signed_duration_since(session.started_at)
@@ -453,6 +528,8 @@ fn diagnostic_session_summary(session: &DiagnosticSession) -> serde_json::Value 
         "session_id": session.session_id,
         "state": session.state,
         "mode": session.mode,
+        "revision": session.revision,
+        "active_checks": session.active_checks().iter().filter(|id| known_diagnostic_check(id)).collect::<Vec<_>>(),
         "completed_after_milliseconds": completed_after_milliseconds,
         "current_check": session.current_check.as_deref().filter(|id| known_diagnostic_check(id)),
         "progress_percent": session.progress_percent,
@@ -475,6 +552,8 @@ fn diagnostic_session_summary(session: &DiagnosticSession) -> serde_json::Value 
                 "severity": finding.severity,
                 "summary_key": safe_summary_key(&finding.summary_key),
                 "remediation_key": safe_remediation_key(&finding.remediation_key),
+                "observation": finding.observation,
+                "evidence": finding.evidence.iter().filter(|evidence| evidence.is_export_safe()).take(16).collect::<Vec<_>>(),
                 "sanitized_evidence": finding.sanitized_evidence.iter()
                     .filter(|value| safe_evidence(value))
                     .take(16)
@@ -505,234 +584,23 @@ fn sanitized_failure_summary(failure: &TransportFailure) -> serde_json::Value {
 }
 
 fn safe_remediation_key(value: &str) -> Option<&str> {
-    matches!(
-        value,
-        "none"
-            | "nq_profile"
-            | "nq_retry"
-            | "nq_network"
-            | "nq_reconnect"
-            | "retry"
-            | "try_http2"
-            | "check_physical_network"
-            | "refresh_or_replace_identity"
-            | "replace_identity"
-            | "review_configuration"
-            | "restore_platform_state"
-            | "resolve_dependency"
-            | "run_deep_diagnostics"
-            | "run_release_leak_gate"
-            | "inspect_platform_state"
-            | "generate_tunnel_traffic"
-            | "export_diagnostics"
-            | "not_configured"
-            | "platform_capability_unavailable"
-            | "connect_or_run_deep_diagnostics"
-            | "active_probe_requires_disconnected_deep_mode"
-            | "http2_fallback_active"
-            | "h3_not_active"
-            | "h3_active"
-            | "no_transport_handshake"
-            | "no_active_runtime"
-            | "no_active_tunnel"
-            | "payload_family_unavailable"
-    )
-    .then_some(value)
+    usque_core::diagnostics_contract_generated::REMEDIATION_KEYS
+        .contains(&value)
+        .then_some(value)
 }
 
 fn safe_summary_key(value: &str) -> Option<&str> {
-    matches!(
-        value,
-        "diagnostic_address_assignment_missing"
-            | "nq_finding_unavailable"
-            | "nq_finding_invalid_configuration"
-            | "nq_finding_dns_system"
-            | "nq_finding_unsupported"
-            | "nq_finding_dns_custom_valid"
-            | "nq_finding_stale"
-            | "nq_finding_rtt_high"
-            | "nq_finding_healthy"
-            | "nq_finding_loss_high"
-            | "nq_finding_queue_pressure"
-            | "nq_finding_pmtu_degraded"
-            | "nq_finding_migration_reconnect"
-            | "nq_finding_dns_changed"
-            | "nq_finding_dns_runtime"
-            | "nq_finding_dns_degraded"
-            | "nq_finding_probe_unsafe"
-            | "nq_finding_probe_success"
-            | "nq_finding_probe_cancelled"
-            | "nq_finding_probe_timeout"
-            | "nq_finding_probe_failed"
-            | "diagnostic_address_assignment_unknown"
-            | "diagnostic_address_assignment_valid"
-            | "diagnostic_cancelled"
-            | "diagnostic_capabilities_ok"
-            | "diagnostic_check_failed_internally"
-            | "diagnostic_check_timed_out"
-            | "diagnostic_configuration_invalid"
-            | "diagnostic_configuration_ok"
-            | "diagnostic_dependency_failed"
-            | "diagnostic_dns_path_actual_state_unknown"
-            | "diagnostic_dns_path_consistent"
-            | "diagnostic_dns_path_mismatch"
-            | "diagnostic_dns_path_not_tunnel"
-            | "diagnostic_egress_family_unavailable"
-            | "diagnostic_endpoint_pin_mismatch"
-            | "diagnostic_endpoint_pin_not_tested"
-            | "diagnostic_endpoint_pin_valid"
-            | "diagnostic_engine_control_ok"
-            | "diagnostic_event_stream_ok"
-            | "diagnostic_fallback_policy_valid"
-            | "diagnostic_fallback_policy_violation"
-            | "diagnostic_first_packet_not_observed"
-            | "diagnostic_first_packet_observed"
-            | "diagnostic_first_packet_unknown"
-            | "diagnostic_frontend_disabled"
-            | "diagnostic_frontend_listener_failed"
-            | "diagnostic_frontend_listener_ok"
-            | "diagnostic_frontend_not_configured"
-            | "diagnostic_h2_not_required"
-            | "diagnostic_h2_not_tested"
-            | "diagnostic_h2_stage_ready"
-            | "diagnostic_h3_connected"
-            | "diagnostic_h3_datagram_available"
-            | "diagnostic_h3_datagram_not_tested"
-            | "diagnostic_h3_not_active"
-            | "diagnostic_h3_not_tested"
-            | "diagnostic_ipv4_egress_requires_external_observer"
-            | "diagnostic_ipv4_route_available"
-            | "diagnostic_ipv4_route_unavailable"
-            | "diagnostic_ipv4_route_unknown"
-            | "diagnostic_ipv6_egress_requires_external_observer"
-            | "diagnostic_ipv6_route_available"
-            | "diagnostic_ipv6_route_unavailable"
-            | "diagnostic_ipv6_route_unknown"
-            | "diagnostic_kill_switch_actual_state_unknown"
-            | "diagnostic_kill_switch_disabled"
-            | "diagnostic_kill_switch_state_consistent"
-            | "diagnostic_kill_switch_state_mismatch"
-            | "diagnostic_network_generation_observed"
-            | "diagnostic_physical_dns_available"
-            | "diagnostic_physical_dns_unavailable"
-            | "diagnostic_physical_dns_unknown"
-            | "diagnostic_physical_network_not_observed"
-            | "diagnostic_physical_network_present"
-            | "diagnostic_recovery_journal_agent_unavailable"
-            | "diagnostic_recovery_journal_consistent"
-            | "diagnostic_recovery_journal_not_supported"
-            | "diagnostic_recovery_journal_pending_cleanup"
-            | "diagnostic_requires_deep_mode"
-            | "diagnostic_route_ownership_actual_state_unknown"
-            | "diagnostic_route_ownership_consistent"
-            | "diagnostic_route_ownership_mismatch"
-            | "diagnostic_route_ownership_not_supported"
-            | "diagnostic_secure_storage_available"
-            | "diagnostic_secure_storage_not_supported"
-            | "diagnostic_system_proxy_actual_state_unknown"
-            | "diagnostic_system_proxy_disabled"
-            | "diagnostic_system_proxy_lease_missing"
-            | "diagnostic_system_proxy_lease_only"
-            | "diagnostic_system_proxy_runtime_mismatch"
-            | "diagnostic_tunnel_dns_configured"
-            | "diagnostic_tunnel_dns_disabled"
-            | "diagnostic_tunnel_dns_unknown"
-            | "diagnostic_tunnel_routes_consistent"
-            | "diagnostic_tunnel_routes_unknown"
-    )
-    .then_some(value)
+    usque_core::diagnostics_contract_generated::SUMMARY_KEYS
+        .contains(&value)
+        .then_some(value)
 }
 
 fn safe_evidence(value: &str) -> bool {
-    if let Some((key, number)) = value.split_once('=') {
-        return matches!(
-            key,
-            "rtt_ms"
-                | "loss_basis_points"
-                | "queue_percent"
-                | "queue_drops"
-                | "pmtu_bytes"
-                | "pmtu_failures"
-                | "migration_failures"
-                | "dns_successes"
-                | "dns_failures"
-                | "dns_timeouts"
-                | "plaintext_fallback"
-                | "probe_ms"
-                | "automatic_recovery_phase"
-                | "automatic_recovery_attempts_completed"
-                | "automatic_recovery_attempt_limit"
-        ) && !number.is_empty()
-            && number.bytes().all(|byte| byte.is_ascii_digit())
-            && number.parse::<u64>().is_ok();
-    }
-    matches!(
-        value,
-        "responsive"
-            | "recoverable"
-            | "append_only_api"
-            | "schema_valid"
-            | "metadata_only"
-            | "runtime_path"
-            | "payload_family"
-            | "runtime_started"
-            | "stable"
-            | "changed"
-            | "active_path"
-            | "verified_before_ready"
-            | "typed_matrix"
-            | "family_flags"
-            | "configuration_consistent_not_leak_test"
-            | "bidirectional"
-            | "internal_state_only"
-            | "agent_read_only_inspection"
-            | "listener_active"
-    )
+    usque_core::DiagnosticEvidence::from_legacy(value).is_some()
 }
 
 fn known_diagnostic_check(value: &str) -> bool {
-    matches!(
-        value,
-        "engine.control_channel"
-            | "quality.rtt"
-            | "quality.packet_loss"
-            | "quality.queue_pressure"
-            | "quality.pmtu"
-            | "transport.migration_capability"
-            | "dns.direct_encrypted_configuration"
-            | "dns.direct_encrypted_runtime_state"
-            | "dns.direct_encrypted_reachability"
-            | "transport.h3_path_validation_probe"
-            | "engine.event_stream"
-            | "engine.capabilities"
-            | "engine.configuration"
-            | "engine.secure_storage_metadata"
-            | "frontend.socks_port"
-            | "frontend.http_port"
-            | "frontend.system_proxy_state"
-            | "physical.network_present"
-            | "physical.ipv4_route"
-            | "physical.ipv6_route"
-            | "physical.dns_available"
-            | "physical.network_generation"
-            | "transport.h3_connect"
-            | "transport.h3_datagram"
-            | "transport.h2_tcp"
-            | "transport.h2_tls"
-            | "transport.h2_connect"
-            | "transport.endpoint_pin"
-            | "transport.fallback_policy"
-            | "tunnel.address_assignment"
-            | "tunnel.routes"
-            | "tunnel.dns"
-            | "tunnel.first_packet"
-            | "tunnel.ipv4_egress"
-            | "tunnel.ipv6_egress"
-            | "protection.kill_switch"
-            | "protection.dns_path"
-            | "protection.route_ownership"
-            | "protection.recovery_journal"
-    )
+    usque_core::diagnostics_contract_generated::CHECK_IDS.contains(&value)
 }
 
 const fn connection_event_type_name(event: ConnectionEventType) -> &'static str {
@@ -760,6 +628,7 @@ const fn connection_event_type_name(event: ConnectionEventType) -> &'static str 
         ConnectionEventType::MigrationPromoted => "migration_promoted",
         ConnectionEventType::MigrationFailed => "migration_failed",
         ConnectionEventType::QueueSaturated => "queue_saturated",
+        ConnectionEventType::QueueBackpressured => "queue_backpressured",
         ConnectionEventType::PmtuChanged => "pmtu_changed",
         ConnectionEventType::PmtuRevalidationStarted => "pmtu_revalidation_started",
         ConnectionEventType::PmtuRevalidationFailed => "pmtu_revalidation_failed",
@@ -860,72 +729,201 @@ fn write_stored_zip(
     Ok(())
 }
 
-fn collect_sanitized_logs(directory: &Path) -> Result<Vec<u8>, MaintenanceError> {
-    let mut files = match fs::read_dir(directory) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if !(name == "engine.jsonl"
-                    || (name.starts_with("engine-") && name.ends_with(".jsonl")))
-                {
-                    return None;
-                }
-                let metadata = fs::symlink_metadata(entry.path()).ok()?;
-                metadata.file_type().is_file().then_some((
-                    entry.path(),
-                    metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    metadata.len(),
-                ))
-            })
-            .collect::<Vec<_>>(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    files.sort_by_key(|(_, modified, _)| *modified);
+fn collect_logs_with_owner(directory: &Path) -> CollectedLogs {
+    let owned_directory = directory.to_owned();
+    match logging::capture_logs(directory, Duration::from_secs(5), move || {
+        collect_sanitized_logs(&owned_directory)
+    }) {
+        Ok(logs) => logs,
+        Err(error) => {
+            let capture_status = match error.kind() {
+                io::ErrorKind::TimedOut => "timeout",
+                io::ErrorKind::WouldBlock => "busy",
+                _ => "unavailable",
+            };
+            CollectedLogs {
+                bytes: Vec::new(),
+                metadata: LogExportMetadata {
+                    source_status: "unavailable",
+                    capture_status,
+                    byte_limit: MAX_DIAGNOSTIC_LOG_BYTES,
+                    omission_reasons: vec![capture_status],
+                    writer_health: logging::log_health(directory),
+                    ..Default::default()
+                },
+            }
+        }
+    }
+}
 
-    let mut selected = Vec::new();
-    let mut selected_bytes = 0_u64;
-    for file in files.into_iter().rev() {
-        if selected_bytes >= MAX_DIAGNOSTIC_LOG_BYTES as u64 {
+fn collect_sanitized_logs(directory: &Path) -> CollectedLogs {
+    let writer_health = logging::log_health(directory);
+    let mut metadata = LogExportMetadata {
+        source_status: "available",
+        byte_limit: MAX_DIAGNOSTIC_LOG_BYTES,
+        capture_status: if writer_health.as_ref().is_some_and(|health| health.running) {
+            "coordinated"
+        } else {
+            "no_live_writer"
+        },
+        writer_health,
+        ..Default::default()
+    };
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            metadata.source_status = if error.kind() == io::ErrorKind::NotFound {
+                "missing"
+            } else {
+                "unavailable"
+            };
+            metadata.omission_reasons.push(metadata.source_status);
+            return CollectedLogs {
+                bytes: Vec::new(),
+                metadata,
+            };
+        }
+    };
+    let mut files = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= logging::MAX_LOG_DIRECTORY_ENTRIES {
+            metadata.truncated = true;
+            metadata.source_status = "partial";
+            metadata.omission_reasons.push("directory_entry_limit");
             break;
         }
-        selected_bytes = selected_bytes.saturating_add(file.2);
-        selected.push(file);
+        let Ok(entry) = entry else {
+            metadata.unreadable_files += 1;
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name == "engine.jsonl" || (name.starts_with("engine-") && name.ends_with(".jsonl"))) {
+            continue;
+        }
+        let Ok(file_metadata) = fs::symlink_metadata(entry.path()) else {
+            metadata.unreadable_files += 1;
+            continue;
+        };
+        if !file_metadata.file_type().is_file() {
+            continue;
+        }
+        metadata.files_available += 1;
+        metadata.source_bytes_available = metadata
+            .source_bytes_available
+            .saturating_add(file_metadata.len());
+        files.push((
+            entry.path(),
+            name == "engine.jsonl",
+            file_metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        ));
     }
-    selected.reverse();
-
-    let mut output = Vec::new();
-    for (path, _, length) in selected {
-        let remaining = MAX_DIAGNOSTIC_LOG_BYTES.saturating_sub(output.len());
+    // The active file is newest even when timestamps are tied or the wall clock
+    // moved backwards. Reserve the budget for its newest complete records first.
+    files.sort_by_key(|(path, active, modified)| (*active, *modified, path.clone()));
+    let mut records = Vec::new();
+    let mut output_bytes = 0_usize;
+    let mut output_limit_hit = false;
+    'files: for (path, _, _) in files.into_iter().rev() {
+        let remaining = MAX_DIAGNOSTIC_LOG_BYTES.saturating_sub(metadata.source_bytes_read);
         if remaining == 0 {
             break;
         }
-        let mut file = File::open(path)?;
-        if length > remaining as u64 {
-            file.seek(SeekFrom::End(-(remaining as i64)))?;
+        let source = read_log_tail(&path, remaining);
+        let Ok((source, starts_mid_record)) = source else {
+            metadata.unreadable_files += 1;
+            continue;
+        };
+        metadata.files_read += 1;
+        metadata.source_bytes_read += source.len();
+        let mut source = source.as_slice();
+        if starts_mid_record {
+            metadata.partial_records += 1;
+            source = source
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(&[], |newline| &source[newline + 1..]);
         }
-        let mut source = Vec::with_capacity(remaining);
-        file.take(remaining as u64).read_to_end(&mut source)?;
-        if length > remaining as u64
-            && let Some(first_newline) = source.iter().position(|byte| *byte == b'\n')
-        {
-            source.drain(..=first_newline);
+        if !source.is_empty() && !source.ends_with(b"\n") {
+            metadata.partial_records += 1;
+            source = source
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(&[], |newline| &source[..=newline]);
         }
-        for line in source.split(|byte| *byte == b'\n') {
-            let sanitized = sanitize_log_bytes(line);
-            if sanitized.is_empty() {
+        for line in source.rsplit(|byte| *byte == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            if output.len().saturating_add(sanitized.len() + 1) > MAX_DIAGNOSTIC_LOG_BYTES {
-                return Ok(output);
+            if line.len() > MAX_DIAGNOSTIC_LOG_RECORD_BYTES {
+                metadata.oversized_records += 1;
+                continue;
             }
-            output.extend_from_slice(&sanitized);
-            output.push(b'\n');
+            if serde_json::from_slice::<serde_json::Value>(line).is_err() {
+                metadata.invalid_records += 1;
+                continue;
+            }
+            let sanitized = project_public_log(line);
+            if sanitized.is_empty() {
+                metadata.rejected_records += 1;
+                continue;
+            }
+            if output_bytes.saturating_add(sanitized.len() + 1) > MAX_DIAGNOSTIC_LOG_BYTES {
+                metadata.truncated = true;
+                output_limit_hit = true;
+                break 'files;
+            }
+            output_bytes += sanitized.len() + 1;
+            records.push(sanitized);
         }
     }
-    Ok(output)
+    let byte_limit_hit = output_limit_hit
+        || (metadata.source_bytes_available > metadata.source_bytes_read as u64
+            && metadata.source_bytes_read == MAX_DIAGNOSTIC_LOG_BYTES);
+    metadata.truncated |= byte_limit_hit;
+    if byte_limit_hit {
+        metadata.omission_reasons.push("byte_limit");
+    }
+    if metadata.unreadable_files != 0 {
+        metadata.omission_reasons.push("unreadable_files");
+    }
+    if metadata.partial_records != 0 {
+        metadata.omission_reasons.push("partial_records");
+    }
+    if metadata.invalid_records != 0 {
+        metadata.omission_reasons.push("invalid_records");
+    }
+    if metadata.oversized_records != 0 {
+        metadata.omission_reasons.push("oversized_records");
+    }
+    if metadata.rejected_records != 0 {
+        metadata.omission_reasons.push("rejected_records");
+    }
+    metadata.records_exported = records.len();
+    let mut bytes = Vec::with_capacity(output_bytes);
+    for record in records.into_iter().rev() {
+        bytes.extend_from_slice(&record);
+        bytes.push(b'\n');
+    }
+    metadata.exported_bytes = bytes.len();
+    CollectedLogs { bytes, metadata }
+}
+
+/// Read a bounded tail plus one boundary byte. Never serialize an incomplete
+/// record from either end, including an in-progress concurrent append.
+fn read_log_tail(path: &Path, limit: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(limit as u64);
+    file.seek(SeekFrom::Start(start.saturating_sub(1)))?;
+    let mut source = Vec::with_capacity(limit + usize::from(start != 0));
+    file.take(limit as u64 + u64::from(start != 0))
+        .read_to_end(&mut source)?;
+    let starts_mid_record = start != 0 && source.first().is_some_and(|byte| *byte != b'\n');
+    if start != 0 && !source.is_empty() {
+        source.remove(0);
+    }
+    Ok((source, starts_mid_record))
 }
 
 fn write_u16(writer: &mut impl Write, value: u16) -> io::Result<()> {
@@ -1006,6 +1004,168 @@ pub enum MaintenanceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_masks_findings_from_another_connection_without_changing_the_session() {
+        let mut finding =
+            DiagnosticFinding::pending("quality.rtt", usque_core::DiagnosticCategory::Transport);
+        finding.status = usque_core::DiagnosticCheckStatus::Passed;
+        finding.sanitized_evidence = vec!["rtt_ms=42".into()];
+        finding.evidence = vec![usque_core::DiagnosticEvidence::from_legacy("rtt_ms=42").unwrap()];
+        finding.observation = Some(usque_core::DiagnosticObservation {
+            source: usque_core::DiagnosticObservationSource::Runtime,
+            availability: usque_core::DiagnosticObservationAvailability::Observed,
+            connection_instance_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        });
+        let mut session =
+            DiagnosticSession::pending(usque_core::DiagnosticMode::Standard, vec![finding]);
+        session.recompute_summary();
+        let projected = diagnostic_session_summary(&session, Some(uuid::Uuid::new_v4()));
+        assert_eq!(projected["findings"][0]["status"], "skipped");
+        assert_eq!(
+            projected["findings"][0]["observation"]["availability"],
+            "stale"
+        );
+        assert_eq!(projected["findings"][0]["evidence"], serde_json::json!([]));
+        assert_eq!(projected["summary"]["passed"], 0);
+        assert_eq!(projected["summary"]["skipped"], 1);
+        assert_eq!(
+            session.findings[0].status,
+            usque_core::DiagnosticCheckStatus::Passed
+        );
+        assert_eq!(session.findings[0].evidence.len(), 1);
+    }
+
+    #[test]
+    fn log_export_flushes_preceding_events_and_reports_writer_health() {
+        use tracing_subscriber::fmt::MakeWriter;
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.json");
+        let factory = logging::LogWriterFactory::open(&config).unwrap();
+        factory
+            .make_writer()
+            .write_all(br#"{"level":"INFO","sequence":12,"message":"private"}"#)
+            .unwrap();
+        let logs = collect_logs_with_owner(&log_directory(&config));
+        assert_eq!(logs.metadata.capture_status, "coordinated");
+        assert_eq!(logs.metadata.records_exported, 1);
+        assert_eq!(logs.metadata.writer_health.unwrap().written_events, 1);
+        assert!(!String::from_utf8_lossy(&logs.bytes).contains("private"));
+        factory.shutdown(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn log_export_marks_failed_writer_as_unavailable_without_failing_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.json");
+        fs::write(log_directory(&config), b"inert path blocker").unwrap();
+        let factory = logging::LogWriterFactory::open(&config).unwrap();
+        let logs = collect_logs_with_owner(&log_directory(&config));
+        assert_eq!(logs.metadata.source_status, "unavailable");
+        assert!(!logs.metadata.writer_health.unwrap().writer_available);
+        assert!(logs.bytes.is_empty());
+        write_diagnostic_bundle(
+            &directory.path().join("diagnostics.zip"),
+            &AppConfig::default(),
+            &ConnectionSnapshot::default(),
+            None,
+            &DiagnosticTransportContext::default(),
+            &log_directory(&config),
+        )
+        .unwrap();
+        assert!(factory.shutdown(Duration::from_secs(5)).is_err());
+    }
+
+    fn fixed_log_record(sequence: u64) -> Vec<u8> {
+        let mut value = serde_json::json!({"level": "INFO", "event_type": "failed", "sequence": sequence, "padding": ""});
+        let padding_length = 255 - serde_json::to_vec(&value).unwrap().len();
+        value["padding"] = serde_json::Value::String("x".repeat(padding_length));
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        assert_eq!(bytes.len(), 256);
+        bytes
+    }
+
+    #[test]
+    fn log_export_reserves_tail_budget_for_all_latest_active_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let older = fixed_log_record(999);
+        fs::write(
+            directory.path().join("engine-1-0.jsonl"),
+            older.repeat(16_384),
+        )
+        .unwrap();
+        let latest = (0..256).flat_map(fixed_log_record).collect::<Vec<_>>();
+        fs::write(directory.path().join("engine.jsonl"), latest).unwrap();
+
+        let collected = collect_sanitized_logs(directory.path());
+        let sequences = String::from_utf8(collected.bytes)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["fields"]["sequence"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &sequences[sequences.len() - 256..],
+            (0..256).collect::<Vec<_>>().as_slice()
+        );
+        assert!(
+            sequences[..sequences.len() - 256]
+                .iter()
+                .all(|sequence| *sequence == 999)
+        );
+        assert_eq!(
+            collected.metadata.source_bytes_read,
+            MAX_DIAGNOSTIC_LOG_BYTES
+        );
+        assert!(collected.metadata.exported_bytes <= MAX_DIAGNOSTIC_LOG_BYTES);
+        assert_eq!(collected.metadata.records_exported, 8_192);
+        assert!(collected.metadata.truncated);
+        assert_eq!(collected.metadata.omission_reasons, ["byte_limit"]);
+    }
+
+    #[test]
+    fn log_export_omits_incomplete_tail_and_invalid_records_without_invented_events() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("engine.jsonl"),
+            b"{\"message\":\"ready\"}\nnot-json\n{\"message\":\"unfinished\"",
+        )
+        .unwrap();
+        let collected = collect_sanitized_logs(directory.path());
+        assert!(!collected.bytes.is_empty());
+        assert!(!String::from_utf8_lossy(&collected.bytes).contains("ready"));
+        assert_eq!(collected.metadata.records_exported, 1);
+        assert_eq!(collected.metadata.partial_records, 1);
+        assert_eq!(collected.metadata.invalid_records, 1);
+        assert!(!collected.metadata.truncated);
+        assert_eq!(
+            collected.metadata.omission_reasons,
+            ["partial_records", "invalid_records"]
+        );
+    }
+
+    #[test]
+    fn log_tail_distinguishes_aligned_and_partial_first_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("engine.jsonl");
+        fs::write(&path, b"first\nsecond\n").unwrap();
+        assert_eq!(
+            read_log_tail(&path, 7).unwrap(),
+            (b"second\n".to_vec(), false)
+        );
+        assert_eq!(
+            read_log_tail(&path, 6).unwrap(),
+            (b"econd\n".to_vec(), true)
+        );
+        let missing = collect_sanitized_logs(&directory.path().join("missing"));
+        assert_eq!(missing.metadata.source_status, "missing");
+        assert!(missing.bytes.is_empty());
+    }
 
     #[test]
     fn quality_doctor_export_allowlist_accepts_numbers_but_no_private_text() {
@@ -1126,6 +1286,13 @@ mod tests {
         let mut config = AppConfig::default();
         config.profiles[0].name = "private hotel name".to_owned();
         config.network.endpoint.sni = "private.example".to_owned();
+        config.network.warp_dns = usque_core::WarpDnsSettings {
+            mode: usque_core::WarpDnsMode::Doh,
+            server_name: "private-resolver.example".into(),
+            doh_path: "/private-dns-path".into(),
+            bootstrap_ips: vec!["198.51.100.74".parse().unwrap()],
+            port: 9443,
+        };
         let log_directory = directory.path().join("logs");
         fs::create_dir_all(&log_directory).unwrap();
         fs::write(
@@ -1146,10 +1313,37 @@ mod tests {
         let combined = String::from_utf8_lossy(&fs::read(destination).unwrap()).into_owned();
         assert!(!combined.contains("private hotel name"));
         assert!(!combined.contains("private.example"));
+        assert!(!combined.contains("private-resolver.example"));
+        assert!(!combined.contains("private-dns-path"));
+        assert!(!combined.contains("198.51.100.74"));
+        assert!(!combined.contains("9443"));
         assert!(!combined.contains("192.0.2.1"));
         assert!(!combined.contains("example.com"));
         assert!(combined.contains("uses_default_sni"));
         assert!(combined.contains("WARP Secret"));
+    }
+
+    #[test]
+    fn diagnostic_archive_includes_versioned_recovery_evidence_for_an_old_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("recovery.zip");
+        write_diagnostic_bundle(
+            &destination,
+            &AppConfig::default(),
+            &ConnectionSnapshot::default(),
+            None,
+            &DiagnosticTransportContext {
+                platform_state: Some(usque_ipc::agent_v1::PlatformState::default()),
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap();
+        let bytes = fs::read(&destination).unwrap();
+        let archive = String::from_utf8_lossy(&bytes);
+        assert!(archive.contains("windows-recovery.json"));
+        assert!(archive.contains("extension_unavailable"));
+        assert!(archive.contains("current_observation") && archive.contains("schema_version"));
     }
 
     #[test]
@@ -1234,6 +1428,7 @@ mod tests {
         fs::create_dir_all(&logs).unwrap();
         fs::write(logs.join("engine.jsonl"), b"active").unwrap();
         fs::write(logs.join("engine-1-0.jsonl"), b"rotated").unwrap();
+        fs::write(logs.join("windows-recovery-cache-v1.json"), b"historical").unwrap();
 
         maintenance.clear_local_state().await.unwrap();
 
@@ -1242,5 +1437,6 @@ mod tests {
         assert!(!flag_cache.exists());
         assert_eq!(fs::read(logs.join("engine.jsonl")).unwrap(), b"");
         assert!(!logs.join("engine-1-0.jsonl").exists());
+        assert!(!logs.join("windows-recovery-cache-v1.json").exists());
     }
 }

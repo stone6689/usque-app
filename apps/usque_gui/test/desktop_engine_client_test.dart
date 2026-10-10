@@ -13,6 +13,7 @@ import 'package:usque/services/engine_client.dart';
 const UsqueProfile _goldenProfile = UsqueProfile(
   id: 'p',
   name: 'X',
+  endpointSelection: EndpointSelection.custom,
   endpointIpv4: 'a',
   endpointIpv6: 'b',
   endpointPort: 1,
@@ -41,11 +42,12 @@ const List<int> _goldenProfileBytes = <int>[
   0x12, 0x01, 0x58, // name "X"
   0x18, 0x01, // mode VPN
   0x20, 0x01, // transport AUTO
-  0x2a, 0x0b, // endpoint { (11 bytes)
+  0x2a, 0x0d, // endpoint { (13 bytes)
   0x0a, 0x01, 0x61, //   ipv4 "a"
   0x12, 0x01, 0x62, //   ipv6 "b"
   0x18, 0x01, //   port 1
   0x22, 0x01, 0x63, //   sni "c"
+  0x28, 0x02, //   selection CUSTOM (appended field 5)
   // }
   0x30, 0x01, // ip policy AUTO
   0x38, 0x80, 0x0a, // mtu 1280
@@ -68,6 +70,9 @@ const List<int> _goldenProfileBytes = <int>[
   0x10, 0x01, //   socks5 true
   0x18, 0x01, //   http true
   // }
+  0xca,
+  0x01,
+  0x00, // routing {} (field 25 present even when explicitly clearing rules)
   0x8a, 0x01, 0x02, // direct_dns { (field 17, 2 bytes)
   0x08, 0x01, //   mode PHYSICAL_SYSTEM
   // }
@@ -77,6 +82,15 @@ const List<int> _goldenProfileBytes = <int>[
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  test('LAN bypass defaults on but preserves saved settings', () {
+    const profile = UsqueProfile(
+      id: UsqueProfile.defaultProfileId,
+      name: 'Default',
+    );
+    expect(profile.allowLan, isTrue);
+    final saved = profile.copyWith(allowLan: false).toMap();
+    expect(UsqueProfile.fromMap(saved).allowLan, isFalse);
+  });
   test(
     'settings submission bypasses a pending connection and connect never upserts',
     () async {
@@ -212,6 +226,7 @@ void main() {
       expect(catalog.profiles.single.sni, 'c');
       expect(catalog.profiles.single.mtu, 1280);
       expect(catalog.profiles.single.killSwitch, isTrue);
+      expect(catalog.profiles.single.allowLan, isFalse);
       expect(catalog.profiles.single.proxy.socksPort, 1);
       expect(catalog.profiles.single.proxy.httpPort, 1);
       expect(catalog.profiles.single.proxy.dnsIpv4, 'j.j');
@@ -256,6 +271,26 @@ void main() {
         'r3',
       );
       expect(catalog.profiles.single.geoDirectCountries, <String>['CN']);
+    });
+    test('bypass_domains field 23 round-trips', () {
+      const profile = UsqueProfile(
+        id: 'p',
+        name: 'X',
+        bypassDomains: <String>['example.com'],
+      );
+      final encoded = codec.encodeProfile(profile);
+      expect(encoded, containsAllInOrder(<int>[0xba, 0x01, 11]));
+      final catalogBody = ControlPayloadWriter()
+        ..message(1, encoded)
+        ..string(2, 'p');
+      final responseBody = ControlPayloadWriter()
+        ..string(1, 'r3')
+        ..message(12, catalogBody.takeBytes());
+      final catalog = debugDecodeProfileCatalogFrame(
+        codec.frame(responseBody.takeBytes()),
+        'r3',
+      );
+      expect(catalog.profiles.single.bypassDomains, <String>['example.com']);
     });
   });
 
@@ -494,6 +529,29 @@ void main() {
       },
     );
 
+    test('failed startup can retry without retaining its future', () async {
+      var starts = 0;
+      final failure = StateError('startup failed');
+      final transport = DesktopEngineTransport.forTest(
+        exchange: (_) async => _statusResponse('1'),
+        ensureStarted: () async {
+          if (++starts == 1) throw failure;
+        },
+      );
+      addTearDown(transport.dispose);
+
+      await expectLater(transport.ensureStarted(), throwsA(same(failure)));
+      expect(transport.startCount, 0);
+
+      await transport.ensureStarted();
+      expect(starts, 2);
+      expect(transport.startCount, 1);
+
+      await transport.ensureStarted();
+      expect(starts, 2);
+      expect(transport.startCount, 1);
+    });
+
     test('client requests share a single transport start', () async {
       var starts = 0;
       var idSeq = 0;
@@ -551,18 +609,18 @@ void main() {
         final client = DesktopEngineClient.forTest(transport: transport);
         final pending = client.snapshot();
         await entered.future;
+        final waiting = transport.ensureStarted();
+        final closed = throwsA(
+          isA<EngineException>().having((e) => e.code, 'code', 'ENGINE_CLOSED'),
+        );
+        final expectations = Future.wait(<Future<void>>[
+          expectLater(pending, closed),
+          expectLater(waiting, closed),
+        ]);
         client.dispose();
         release.complete();
-        await expectLater(
-          pending,
-          throwsA(
-            isA<EngineException>().having(
-              (e) => e.code,
-              'code',
-              'ENGINE_CLOSED',
-            ),
-          ),
-        );
+        await expectations;
+        expect(transport.startCount, 0);
       },
     );
 
@@ -788,17 +846,24 @@ void main() {
       },
     );
 
-    test('production timeout table matches the pre-split contract', () {
-      expect(requestTimeoutForPayload(12), const Duration(seconds: 55));
-      expect(requestTimeoutForPayload(23), const Duration(seconds: 60));
-      expect(requestTimeoutForPayload(26), const Duration(seconds: 60));
-      expect(requestTimeoutForPayload(20), const Duration(seconds: 20));
-      expect(requestTimeoutForPayload(21), const Duration(seconds: 15));
-      expect(requestTimeoutForPayload(22), const Duration(seconds: 30));
-      expect(requestTimeoutForPayload(34), const Duration(seconds: 90));
-      expect(requestTimeoutForPayload(35), const Duration(seconds: 180));
-      expect(requestTimeoutForPayload(10), const Duration(seconds: 5));
-    });
+    test(
+      'connection deadlines cover automatic selection and legacy rollback',
+      () {
+        expect(requestTimeoutForPayload(12), const Duration(seconds: 715));
+        expect(requestTimeoutForPayload(14), const Duration(seconds: 715));
+        expect(requestTimeoutForPayload(27), const Duration(seconds: 1415));
+        expect(requestTimeoutForPayload(23), const Duration(seconds: 60));
+        expect(requestTimeoutForPayload(26), const Duration(seconds: 60));
+        expect(requestTimeoutForPayload(20), const Duration(seconds: 20));
+        expect(requestTimeoutForPayload(21), const Duration(seconds: 15));
+        expect(requestTimeoutForPayload(22), const Duration(seconds: 30));
+        expect(requestTimeoutForPayload(34), const Duration(seconds: 90));
+        expect(requestTimeoutForPayload(35), const Duration(seconds: 180));
+        expect(requestTimeoutForPayload(10), const Duration(seconds: 5));
+        expect(requestTimeoutForPayload(41), const Duration(seconds: 5));
+        expect(requestTimeoutForPayload(42), const Duration(seconds: 5));
+      },
+    );
 
     test(
       'disconnect is not blocked by an in-flight serialized request',

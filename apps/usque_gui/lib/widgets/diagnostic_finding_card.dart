@@ -20,12 +20,15 @@ class DiagnosticFindingCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final failure = finding.failure;
+    final observation = finding.observation;
+    final evidence = finding.publicEvidence;
     final theme = Theme.of(context);
     final tokens = UsqueTokens.of(context);
     final color = _statusColor(tokens, finding.status);
-    final remediation = failure?.remediationKey.isNotEmpty == true
-        ? failure!.remediationKey
-        : finding.remediationKey;
+    final remediation =
+        finding.remediationKey.isNotEmpty && finding.remediationKey != 'none'
+        ? finding.remediationKey
+        : failure?.remediationKey ?? finding.remediationKey;
     final emphasized =
         finding.status == DiagnosticCheckStatus.warning ||
         finding.status == DiagnosticCheckStatus.failed;
@@ -42,6 +45,15 @@ class DiagnosticFindingCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
+          if (observation != null) ...<Widget>[
+            Text(
+              '${diagnosticObservationSourceLabel(strings, observation.source)} · ${diagnosticObservationAvailabilityLabel(strings, observation.availability)}',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 10),
+          ],
           if (failure != null) ...<Widget>[
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -110,30 +122,36 @@ class DiagnosticFindingCard extends StatelessWidget {
             ),
           ] else ...<Widget>[
             Text(
-              _summaryText(strings, finding),
+              finding.status == DiagnosticCheckStatus.skipped &&
+                      finding.dependencyReason?.isNotEmpty == true
+                  ? diagnosticSkipReason(strings, finding)
+                  : _summaryText(strings, finding),
               style: theme.textTheme.bodyMedium,
             ),
-            if (finding.dependencyReason?.isNotEmpty == true) ...<Widget>[
-              const SizedBox(height: 8),
+            if (remediation.isNotEmpty && remediation != 'none') ...<Widget>[
+              const SizedBox(height: 12),
               Text(
-                finding.dependencyReason!,
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant,
-                  fontFamily: UsqueFonts.mono,
-                  fontFamilyFallback: UsqueFonts.monoFallback,
-                ),
+                diagnosticRemediation(strings, remediation),
+                style: theme.textTheme.bodyMedium,
               ),
             ],
           ],
-          if (finding.sanitizedEvidence.isNotEmpty) ...<Widget>[
+          if (evidence.isNotEmpty) ...<Widget>[
             const SizedBox(height: 10),
-            Wrap(
-              spacing: 6,
-              runSpacing: 6,
-              children: finding.sanitizedEvidence
+            ExpansionTile(
+              key: PageStorageKey<String>('evidence-${finding.checkId}'),
+              title: Text(strings.get('technical_details')),
+              expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
+              childrenPadding: const EdgeInsets.all(12),
+              children: evidence.indexed
                   .map(
-                    (value) =>
-                        Text(value, style: UsqueTheme.mono(context, size: 12)),
+                    (entry) => SelectableText(
+                      key: PageStorageKey<String>(
+                        'evidence-value-${finding.checkId}-${entry.$1}',
+                      ),
+                      entry.$2,
+                      style: UsqueTheme.mono(context, size: 12),
+                    ),
                   )
                   .toList(growable: false),
             ),

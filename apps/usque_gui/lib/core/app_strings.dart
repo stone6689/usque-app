@@ -3,10 +3,14 @@ import 'package:flutter/widgets.dart';
 
 import '../models/app_models.dart';
 import 'l10n/catalogs.dart';
+import 'l10n/chain.dart';
+import 'l10n/diagnostics.dart';
 import 'l10n/l4.dart';
 import 'l10n/network_quality.dart';
 import 'l10n/network_settings.dart';
+import 'l10n/onboarding.dart';
 import 'l10n/ui_workflow.dart';
+import 'l10n/vpngate.dart';
 import 'l10n/windows_recovery.dart';
 
 class AppStrings {
@@ -17,6 +21,9 @@ class AppStrings {
       );
 
   final String catalogId;
+
+  String get vpnGateUnsupported =>
+      get('l4_unsupported').replaceAll('L4', 'VPN Gate');
 
   String? windowsRecoveryError(String? code, {String? details}) {
     final message =
@@ -33,7 +40,24 @@ class AppStrings {
   String get languageCode =>
       catalogId.startsWith('zh') ? 'zh' : catalogId.split('_').first;
 
-  String get(String key) {
+  String get(String key, {TargetPlatform? platform}) {
+    final text = _raw(key);
+    return text.contains('{tunnel}')
+        ? text.replaceAll(
+            '{tunnel}',
+            tunnelOutputLabel(platform ?? defaultTargetPlatform),
+          )
+        : text;
+  }
+
+  String _raw(String key) {
+    final onboarding = kOnboardingCatalogs[catalogId] ?? kOnboardingEn;
+    if (onboarding.containsKey(key)) return onboarding[key]!;
+    final diagnostics =
+        kDiagnosticsCatalogs[catalogId] ?? kDiagnosticsCatalogs['en']!;
+    if (diagnostics.containsKey(key)) return diagnostics[key]!;
+    final gate = kVpnGateCatalogs[catalogId] ?? kVpnGateEn;
+    if (gate.containsKey(key)) return gate[key]!;
     final l4 = kL4Catalogs[catalogId] ?? kL4En;
     if (l4.containsKey(key)) return l4[key]!;
     final settings = kNetworkSettingsCatalogs[catalogId] ?? kNetworkSettingsEn;
@@ -48,10 +72,13 @@ class AppStrings {
 
   String tunnelOutputLabel(TargetPlatform platform) =>
       platform == TargetPlatform.android
-      ? get('vpn_mode')
-      : get('tunnel_output');
+      ? _raw('vpn_mode')
+      : _raw('tunnel_output');
 
-  /// Feature-table keys whose English value may be reused (protocol/product).
+  /// Feature-table keys whose English value may be reused.
+  ///
+  /// Protocol names, product names, placeholder-only templates, and loanwords
+  /// that the main catalog also spells in English.
   @visibleForTesting
   static const Set<String> kFeatureEnglishAllowlist = <String>{
     'nq_doh',
@@ -59,15 +86,25 @@ class AppStrings {
     'nq_bytes',
     'nq_stream_window',
     'home_kill_switch',
+    'dns',
+    'error_field',
+    'password',
   };
 
   @visibleForTesting
   static bool get debugCatalogsAreComplete {
-    if (!_featureTablesComplete(kUiWorkflowCatalogs, kUiWorkflowEn) ||
+    if (!_featureTablesComplete(
+          kDiagnosticsCatalogs,
+          kDiagnosticsCatalogs['en']!,
+        ) ||
+        !_featureTablesComplete(kUiWorkflowCatalogs, kUiWorkflowEn) ||
+        !_featureTablesComplete(kOnboardingCatalogs, kOnboardingEn) ||
         !_featureTablesComplete(kWindowsRecoveryCatalogs, kWindowsRecoveryEn) ||
         !_featureTablesComplete(kNetworkQualityCatalogs, kNetworkQualityEn) ||
         !_featureTablesComplete(kL4Catalogs, kL4En) ||
-        !_featureTablesComplete(kNetworkSettingsCatalogs, kNetworkSettingsEn)) {
+        !_featureTablesComplete(kVpnGateCatalogs, kVpnGateEn) ||
+        !_featureTablesComplete(kNetworkSettingsCatalogs, kNetworkSettingsEn) ||
+        !_featureTablesComplete(kChainCatalogs, kChainEn)) {
       return false;
     }
     if (!setEquals(
@@ -149,11 +186,15 @@ class AppStrings {
       }
     }
 
+    scan(kDiagnosticsCatalogs, kDiagnosticsCatalogs['en']!);
     scan(kUiWorkflowCatalogs, kUiWorkflowEn);
+    scan(kOnboardingCatalogs, kOnboardingEn);
     scan(kNetworkQualityCatalogs, kNetworkQualityEn);
     scan(kWindowsRecoveryCatalogs, kWindowsRecoveryEn);
     scan(kL4Catalogs, kL4En);
+    scan(kVpnGateCatalogs, kVpnGateEn);
     scan(kNetworkSettingsCatalogs, kNetworkSettingsEn);
+    scan(kChainCatalogs, kChainEn);
     for (final catalogEntry in kWindowsAdapterCleanupCatalogs.entries) {
       if (catalogEntry.key == 'en') {
         continue;
@@ -169,7 +210,12 @@ class AppStrings {
   @visibleForTesting
   static bool get debugPlaceholdersArePreserved {
     if (!_placeholdersPreserved(kEnCatalog, kCatalogs.values) ||
+        !_placeholdersPreserved(
+          kDiagnosticsCatalogs['en']!,
+          kDiagnosticsCatalogs.values,
+        ) ||
         !_placeholdersPreserved(kUiWorkflowEn, kUiWorkflowCatalogs.values) ||
+        !_placeholdersPreserved(kOnboardingEn, kOnboardingCatalogs.values) ||
         !_placeholdersPreserved(
           kNetworkQualityEn,
           kNetworkQualityCatalogs.values,
@@ -179,10 +225,12 @@ class AppStrings {
           kWindowsRecoveryCatalogs.values,
         ) ||
         !_placeholdersPreserved(kL4En, kL4Catalogs.values) ||
+        !_placeholdersPreserved(kVpnGateEn, kVpnGateCatalogs.values) ||
         !_placeholdersPreserved(
           kNetworkSettingsEn,
           kNetworkSettingsCatalogs.values,
-        )) {
+        ) ||
+        !_placeholdersPreserved(kChainEn, kChainCatalogs.values)) {
       return false;
     }
     return true;

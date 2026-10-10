@@ -1,3 +1,9 @@
+mod send_progress;
+use send_progress::{
+    BatchProgress, BatchStop, DatagramHeader, ReadyAdmission, WireProgress, WireStop,
+    claim_ready_batch,
+};
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
@@ -48,6 +54,25 @@ use crate::socket::{
 use crate::telemetry::{ConnectionAttemptTelemetry, ConnectionEventType};
 use crate::udp_io::{SendDatagram, UDP_ACTOR_DRAIN_LIMIT, UdpReceivePool, is_message_too_long};
 
+// Keep cancellation bounded without giving a continuously ready receive path
+// priority over wire sends and timers. The actor and its scheduling regressions
+// share this select policy; each branch still owns its existing bounded work.
+macro_rules! select_h3_actor_work {
+    ($cancel:expr; $($branches:tt)*) => {{
+        if ($cancel).is_cancelled() {
+            return Err(TransportError::TunnelClosed);
+        }
+        tokio::select! {
+            _ = ($cancel).cancelled() => return Err(TransportError::TunnelClosed),
+            $($branches)*
+        }
+    }};
+}
+
+#[cfg(test)]
+mod actor_fairness_tests;
+#[cfg(test)]
+mod burst_fairness_tests;
 pub(crate) mod diagnostic;
 #[cfg(test)]
 mod diagnostic_tests;
@@ -97,6 +122,17 @@ pub struct H3Tunnel {
 }
 
 impl H3Tunnel {
+    pub(crate) async fn shutdown(self) {
+        self.driver.shutdown().await;
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.driver
+            .task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
     pub fn into_parts(
         self,
     ) -> (
@@ -232,9 +268,17 @@ impl H3ReceiveHalf {
 
 pub struct H3Driver {
     task: Option<JoinHandle<Result<(), TransportError>>>,
+    cancellation: CancellationToken,
 }
 
 impl H3Driver {
+    pub(crate) async fn shutdown(mut self) {
+        self.cancellation.cancel();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+
     pub async fn wait(mut self) -> Result<(), TransportError> {
         let task = self
             .task
@@ -254,6 +298,7 @@ impl H3Driver {
 
 impl Drop for H3Driver {
     fn drop(&mut self) {
+        self.cancellation.cancel();
         if let Some(task) = &self.task {
             task.abort();
         }
@@ -319,7 +364,7 @@ async fn prepare_udp_for_generation(
     crate::udp_options::configure_quic_socket(&std_socket)?;
     std_socket.set_nonblocking(true)?;
     let egress_lease = protector
-        .protect_for_target_generation(
+        .protect_masque_endpoint_generation(
             socket_handle(&std_socket),
             target,
             DirectProtocol::Udp,
@@ -389,6 +434,31 @@ pub(crate) async fn connect_h3_with_protector(
     protector: Arc<dyn SocketProtector>,
     attempt: Option<&ConnectionAttemptTelemetry>,
 ) -> Result<H3Tunnel, TransportError> {
+    connect_h3_with_cancellation(
+        endpoint,
+        sni,
+        identity,
+        settings,
+        protector,
+        attempt,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the endpoint race carries protected path settings and cooperative cancellation together"
+)]
+pub(crate) async fn connect_h3_with_cancellation(
+    endpoint: SocketAddr,
+    sni: &str,
+    identity: &MasqueTlsIdentity,
+    settings: H3ConnectSettings,
+    protector: Arc<dyn SocketProtector>,
+    attempt: Option<&ConnectionAttemptTelemetry>,
+    cancellation: CancellationToken,
+) -> Result<H3Tunnel, TransportError> {
     let first = connect_h3_once(
         endpoint,
         sni,
@@ -396,18 +466,35 @@ pub(crate) async fn connect_h3_with_protector(
         settings,
         Arc::clone(&protector),
         attempt,
+        cancellation.clone(),
     )
     .await;
     match first {
         Err(TransportError::Http3ProtocolViolation(_)) => {
             // The Go oracle retries this specific Cloudflare interoperability
             // failure once. All other failures preserve normal fallback rules.
-            connect_h3_once(endpoint, sni, identity, settings, protector, attempt).await
+            if cancellation.is_cancelled() {
+                return Err(TransportError::TunnelClosed);
+            }
+            connect_h3_once(
+                endpoint,
+                sni,
+                identity,
+                settings,
+                protector,
+                attempt,
+                cancellation,
+            )
+            .await
         }
         result => result,
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one QUIC startup retains the exact endpoint, identity, settings and cancellation scope"
+)]
 async fn connect_h3_once(
     endpoint: SocketAddr,
     sni: &str,
@@ -415,17 +502,33 @@ async fn connect_h3_once(
     settings: H3ConnectSettings,
     protector: Arc<dyn SocketProtector>,
     attempt: Option<&ConnectionAttemptTelemetry>,
+    cancellation: CancellationToken,
 ) -> Result<H3Tunnel, TransportError> {
-    connect_h3_application(endpoint, sni, identity, settings, protector, attempt, None).await
+    connect_h3_application(
+        endpoint,
+        sni,
+        identity,
+        settings,
+        protector,
+        attempt,
+        None,
+        cancellation,
+    )
+    .await
 }
 
-pub(crate) async fn connect_l4_h3(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "L4 candidates retain their actor and protected startup cancellation scope"
+)]
+pub(crate) async fn connect_l4_h3_with_cancellation(
     endpoint: SocketAddr,
     identity: &MasqueTlsIdentity,
     settings: H3ConnectSettings,
     protector: Arc<dyn SocketProtector>,
     attempt: Option<&ConnectionAttemptTelemetry>,
     actor: crate::l4::L4Actor,
+    cancellation: CancellationToken,
 ) -> Result<H3Tunnel, TransportError> {
     let provider = identity
         .provider
@@ -439,6 +542,7 @@ pub(crate) async fn connect_l4_h3(
         protector,
         attempt,
         Some(actor),
+        cancellation,
     )
     .await
 }
@@ -455,14 +559,17 @@ async fn connect_h3_application(
     protector: Arc<dyn SocketProtector>,
     attempt: Option<&ConnectionAttemptTelemetry>,
     l4: Option<crate::l4::L4Actor>,
+    cancellation: CancellationToken,
 ) -> Result<H3Tunnel, TransportError> {
     let H3ConnectSettings {
         inner_mtu: profile_inner_mtu,
         congestion_control,
     } = settings;
-    let prepared = prepare_initial_udp_socket(endpoint, protector.as_ref())
-        .await
-        .map_err(SocketPrepareError::into_transport_error)?;
+    let prepared = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(TransportError::TunnelClosed),
+        result = prepare_initial_udp_socket(endpoint, protector.as_ref()) => result.map_err(SocketPrepareError::into_transport_error)?,
+    };
     let local_address = prepared.local_addr;
     let initial_generation = prepared.network_generation;
     let migration_generation = protector.network_generation().map(|_| initial_generation);
@@ -546,6 +653,7 @@ async fn connect_h3_application(
     )?;
     let path_sockets = PathSocketSet::with_active(active_path)
         .map_err(|error| TransportError::Http3(error.to_string()))?;
+    let actor_cancellation = cancellation.child_token();
     let task = AbortOnDropHandle::new(tokio::spawn(run_h3_actor(
         path_sockets,
         connection,
@@ -564,9 +672,17 @@ async fn connect_h3_application(
         family_ceiling,
         PmtuPathKey::new(local_address, endpoint),
         l4,
+        actor_cancellation.clone(),
     )));
 
-    let startup = timeout(CONNECT_TIMEOUT, startup_rx).await;
+    let startup = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            let _ = task.await;
+            return Err(TransportError::TunnelClosed);
+        }
+        result = timeout(CONNECT_TIMEOUT, startup_rx) => result,
+    };
     match startup {
         Ok(Ok(Ok(()))) => Ok(H3Tunnel {
             send: H3SendHalf {
@@ -578,6 +694,7 @@ async fn connect_h3_application(
             },
             driver: H3Driver {
                 task: Some(task.detach()),
+                cancellation: actor_cancellation,
             },
             control: control_rx,
             migration: H3MigrationHandle::new(
@@ -589,7 +706,7 @@ async fn connect_h3_application(
             attempt: attempt.cloned(),
         }),
         Ok(Ok(Err(failure))) => {
-            task.abort();
+            actor_cancellation.cancel();
             let _ = task.await;
             if pin_state.rejected() {
                 Err(TransportError::EndpointPinMismatch)
@@ -613,7 +730,7 @@ async fn connect_h3_application(
             }
         }
         Err(_) => {
-            task.abort();
+            actor_cancellation.cancel();
             let _ = task.await;
             if pin_state.rejected() {
                 Err(TransportError::EndpointPinMismatch)
@@ -810,10 +927,15 @@ async fn run_h3_actor(
     family_ceiling: usize,
     initial_path: PmtuPathKey,
     l4: Option<crate::l4::L4Actor>,
+    cancellation: CancellationToken,
 ) -> Result<(), TransportError> {
     let mut startup_tx = Some(startup_tx);
     // Do not free a session slot until the QUIC actor AND protected paths stop.
     let _l4_slot = l4.as_ref().and_then(|actor| actor.session_slot.clone());
+    let _l4_startup_slot = l4.as_ref().and_then(|actor| actor.startup_slot.clone());
+    let _l4_startup_admission = l4
+        .as_ref()
+        .and_then(|actor| actor.handle.startup_admission.clone());
     let result = drive_h3_actor(
         &mut path_sockets,
         connection,
@@ -832,6 +954,7 @@ async fn run_h3_actor(
         family_ceiling,
         initial_path,
         l4,
+        cancellation,
     )
     .await;
     path_sockets.shutdown_all().await;
@@ -869,6 +992,7 @@ async fn drive_h3_actor(
     family_ceiling: usize,
     initial_path: PmtuPathKey,
     mut l4: Option<crate::l4::L4Actor>,
+    cancellation: CancellationToken,
 ) -> Result<(), TransportError> {
     let mut http3 = None;
     let mut request_stream_id = None;
@@ -882,7 +1006,7 @@ async fn drive_h3_actor(
     let mut datagram_entries = VecDeque::with_capacity(DATAGRAM_SEND_QUEUE_CAPACITY);
     let encode_pool = DatagramEncodePool::new(quality.clone());
     let mut free_wire_buffers = Vec::new();
-    let io_cancel = CancellationToken::new();
+    let io_cancel = cancellation;
     let mut incoming_batch = PacketBatch::new();
     let mut inbound_queue_drop_count = 0_u64;
     let mut pmtu = PmtuController::with_automatic(initial_path, quality.features().automatic_pmtu);
@@ -910,6 +1034,9 @@ async fn drive_h3_actor(
     quality_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
+        if io_cancel.is_cancelled() {
+            return Err(TransportError::TunnelClosed);
+        }
         goaway.check_deadline(Instant::now())?;
         if ready && migration_commands_open {
             match migration_rx.try_recv() {
@@ -961,8 +1088,17 @@ async fn drive_h3_actor(
                     &mut connection,
                     migration.allows_application_injection(),
                 )?;
-                if !ready {
+                if !ready
+                    && connection.application_proto() == b"h3"
+                    && http3.peer_settings_raw().is_some()
+                {
                     ready = true;
+                    if let Some(attempt) = attempt {
+                        attempt.record(
+                            ConnectionEventType::PeerSettingsReceived,
+                            TransportStage::PeerSettings,
+                        );
+                    }
                     if let Some(startup_tx) = startup_tx.take() {
                         let _ = startup_tx.send(Ok(()));
                     }
@@ -1039,6 +1175,19 @@ async fn drive_h3_actor(
             )?;
         }
 
+        // Claim at most one ready batch before generating this round's wire
+        // work. Empty channels still use the recv branch below for wakeups.
+        if claim_ready_batch(
+            &mut outgoing_rx,
+            &mut pending_batch,
+            ready && !is_l4 && request_stream_id.is_some(),
+            migration.allows_application_injection(),
+            quality,
+        ) == ReadyAdmission::Closed
+        {
+            return Ok(());
+        }
+
         if ready
             && migration.allows_application_injection()
             && let Some(stream_id) = request_stream_id
@@ -1098,13 +1247,17 @@ async fn drive_h3_actor(
         let migration_wakeup = migration.next_wakeup();
         let preparing_migration = migration.is_preparing();
 
-        tokio::select! {
+        select_h3_actor_work! { &io_cancel;
             received = path_sockets.recv_any() => {
                 match received {
                     PathReceiveEvent::Batch { path_id, mut batch }
                         if path_sockets.contains(path_id) =>
                     {
+                        let mut incoming_fairness = IncomingBurstFairness::default();
                         for mut datagram in batch.drain() {
+                            if let Some(actor) = l4.as_ref() {
+                                actor.admit_startup_datagram(datagram.payload_mut().len())?;
+                            }
                             let source = datagram.source;
                             let destination = datagram.destination;
                             let dropped = receive_and_drain_quic_datagram(
@@ -1116,6 +1269,14 @@ async fn drive_h3_actor(
                                 &mut incoming_batch,
                             )?;
                             record_inbound_queue_drops(dropped, &mut inbound_queue_drop_count);
+                            incoming_fairness
+                                .yield_once_if_blocked(
+                                    &mut connection,
+                                    request_stream_id.filter(|_| ready),
+                                    &incoming_tx,
+                                    &mut incoming_batch,
+                                )
+                                .await?;
                         }
                     }
                     PathReceiveEvent::Failed { path_id, error }
@@ -1134,7 +1295,10 @@ async fn drive_h3_actor(
                 && pending_batch.is_none()
                 && migration.allows_application_injection() => {
                 match batch {
-                    Some(batch) => pending_batch = Some(batch),
+                    Some(batch) => {
+                        observe_outgoing_batch(quality, &batch);
+                        pending_batch = Some(batch);
+                    },
                     None => return Ok(()),
                 }
             }
@@ -1166,8 +1330,13 @@ async fn drive_h3_actor(
                 quality,
                 &io_cancel,
             ), if wire_is_due && wire_fits_quantum && pmtu_suppressed_until.is_none() => {
-                if sent? == WireSendOutcome::MessageTooLarge {
-                    handle_pmtu_send_too_large(&mut connection, &mut pmtu, attempt, quality)?;
+                if let WireSendOutcome::MessageTooLarge { payload_len, from, to } = sent? {
+                    let probe_only = is_discovery_probe_rejection(&connection, payload_len, quality)
+                        && connection.on_pmtu_probe_send_error(from, to, payload_len);
+                    if !probe_only {
+                        discard_pending_wire_datagrams(&mut wire_datagrams, &mut free_wire_buffers, wire_queue, quality);
+                    }
+                    handle_pmtu_send_too_large(&mut connection, &mut pmtu, attempt, quality, probe_only)?;
                 }
             }
             _ = sleep_until(wire_deadline), if !wire_datagrams.is_empty() && !wire_is_due => {}
@@ -1223,11 +1392,28 @@ async fn wait_l4_work(actor: &Option<crate::l4::L4Actor>) {
     }
 }
 
+fn is_discovery_probe_rejection(
+    connection: &H3QuicConnection,
+    payload_len: usize,
+    quality: &NetworkQualityTelemetry,
+) -> bool {
+    // Ordinary QUIC packetization is capped at this path's current PMTU.
+    // A larger packet during discovery is a size probe, not evidence that the
+    // current ordinary-send bound failed. Never infer this for a stable path.
+    quality.features().automatic_pmtu
+        && connection.pmtu().is_none()
+        && connection
+            .path_stats()
+            .find(|path| path.active)
+            .is_some_and(|path| payload_len > path.pmtu)
+}
+
 fn handle_pmtu_send_too_large(
     connection: &mut H3QuicConnection,
     pmtu: &mut PmtuController,
     attempt: Option<&ConnectionAttemptTelemetry>,
     quality: &NetworkQualityTelemetry,
+    probe_only: bool,
 ) -> Result<(), TransportError> {
     let Some(path) = connection.path_stats().find(|path| path.active) else {
         return Err(TransportError::Http3(
@@ -1236,7 +1422,11 @@ fn handle_pmtu_send_too_large(
     };
     let key = PmtuPathKey::new(path.local_addr, path.peer_addr);
     quality.record_pmtu_send_too_large();
-    let action = pmtu.on_send_too_large(key, connection.pmtu(), StdInstant::now());
+    let action = if probe_only {
+        pmtu.on_probe_send_too_large(key, StdInstant::now())
+    } else {
+        pmtu.on_send_too_large(key, connection.pmtu(), StdInstant::now())
+    };
     #[cfg(any(test, feature = "fault-injection"))]
     let action = if quality
         .take_fault(crate::fault_injection::FaultPoint::Pmtu)
@@ -1551,7 +1741,7 @@ fn queue_pending_batch(
     quality: &NetworkQualityTelemetry,
     encode_pool: &DatagramEncodePool,
     profile_inner_mtu: usize,
-) -> Result<(), TransportError> {
+) -> Result<BatchProgress, TransportError> {
     if pending_batch
         .as_ref()
         .is_some_and(|outgoing| outgoing.completion.is_closed())
@@ -1559,30 +1749,40 @@ fn queue_pending_batch(
         // A send timeout/cancellation must release a batch waiting on PMTUD
         // and let the actor observe a closed producer without waiting for ACKs.
         pending_batch.take();
-        return Ok(());
+        return Ok(BatchProgress {
+            stop: BatchStop::ProducerCancelled,
+            ..Default::default()
+        });
     }
+    let mut progress = BatchProgress {
+        stop: BatchStop::DrainBudget,
+        ..Default::default()
+    };
+    let mut header_copies = 0;
     let completed = {
         let Some(outgoing) = pending_batch.as_mut() else {
-            return Ok(());
+            return Ok(BatchProgress::default());
         };
+        let header = DatagramHeader::new(stream_id)?;
+        let (maximum_packet_size, datagram_overhead) =
+            connect_ip_payload_limit_with_overhead(connection, header.len, profile_inner_mtu)?;
+        let awaiting_pmtu = quality.features().automatic_pmtu
+            && connection.pmtu().is_none()
+            && maximum_packet_size < crate::pmtu::IPV6_MINIMUM_INNER_MTU;
         // Visit each original entry at most once. Deferred IPv6 entries rotate
         // behind smaller packets without adding a queue or spinning on them.
         for _ in 0..outgoing.batch.len().min(UDP_ACTOR_DRAIN_LIMIT) {
             if connection.is_dgram_send_queue_full() {
+                progress.stop = BatchStop::DatagramFull;
                 break;
             }
             let Some(packet) = outgoing.batch.front() else {
                 break;
             };
             let packet_len = packet.len();
-            let (maximum_packet_size, datagram_overhead) =
-                connect_ip_payload_limit(connection, stream_id, profile_inner_mtu)?;
             if packet_len > maximum_packet_size {
-                if quality.features().automatic_pmtu
-                    && connection.pmtu().is_none()
-                    && maximum_packet_size < crate::pmtu::IPV6_MINIMUM_INNER_MTU
-                    && packet.first().is_some_and(|byte| byte >> 4 == 6)
-                {
+                if awaiting_pmtu && packet.first().is_some_and(|byte| byte >> 4 == 6) {
+                    progress.deferred += 1;
                     // A probing floor is not evidence that IPv6's minimum MTU
                     // is unavailable. Keep the original packet for a later
                     // probe ACK; a completed low PMTU still uses the existing
@@ -1603,15 +1803,19 @@ fn queue_pending_batch(
                     .result
                     .oversized
                     .push((packet, maximum_packet_size));
+                progress.rejected += 1;
                 continue;
             }
-            let Some(datagram) = encode_http_datagram(encode_pool, stream_id, packet)? else {
+            let Some(datagram) = encode_validated_http_datagram(encode_pool, &header, packet)?
+            else {
+                progress.stop = BatchStop::EncodePoolExhausted;
                 break;
             };
             let datagram_len = datagram.as_ref().len();
-            quality.record_datagram_header_copy(datagram_overhead);
+            header_copies += datagram_overhead;
             match connection.dgram_send_buf(datagram) {
                 Ok(()) => {
+                    progress.accepted += 1;
                     datagram_entries.push_back(datagram_queue.start_entry(datagram_len));
                     let packet = outgoing
                         .batch
@@ -1620,8 +1824,12 @@ fn queue_pending_batch(
                     outgoing.result.accepted_bytes =
                         outgoing.result.accepted_bytes.saturating_add(packet.len());
                 }
-                Err(quiche::Error::Done) => break,
+                Err(quiche::Error::Done) => {
+                    progress.stop = BatchStop::DatagramFull;
+                    break;
+                }
                 Err(quiche::Error::BufferTooShort) => {
+                    progress.rejected += 1;
                     let packet = outgoing
                         .batch
                         .pop_front()
@@ -1640,14 +1848,28 @@ fn queue_pending_batch(
         }
         outgoing.batch.is_empty()
     };
+    if header_copies != 0 {
+        quality.record_datagram_header_copy(header_copies);
+    }
     if completed {
+        progress.stop = BatchStop::Completed;
         let outgoing = pending_batch
             .take()
             .expect("completed outgoing batch remains present");
         let _ = outgoing.completion.send(outgoing.result);
     }
-    Ok(())
+    if progress.stop == BatchStop::DrainBudget && progress.deferred != 0 {
+        progress.stop = BatchStop::PmtuDeferred;
+    }
+    progress.observe(quality);
+    Ok(progress)
 }
+
+#[cfg(test)]
+thread_local! { static PAYLOAD_LIMIT_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+#[path = "h3/send_progress_tests.rs"]
+mod send_progress_tests;
 
 fn connect_ip_payload_limit(
     connection: &H3QuicConnection,
@@ -1656,6 +1878,16 @@ fn connect_ip_payload_limit(
 ) -> Result<(usize, usize), TransportError> {
     let datagram_overhead = encoded_varint_len(stream_id / 4)?
         + encoded_varint_len(usque_protocol::DEFAULT_CONTEXT_ID)?;
+    connect_ip_payload_limit_with_overhead(connection, datagram_overhead, profile_inner_mtu)
+}
+
+fn connect_ip_payload_limit_with_overhead(
+    connection: &H3QuicConnection,
+    datagram_overhead: usize,
+    profile_inner_mtu: usize,
+) -> Result<(usize, usize), TransportError> {
+    #[cfg(test)]
+    PAYLOAD_LIMIT_LOOKUPS.with(|count| count.set(count.get() + 1));
     let maximum_datagram_size = connection.dgram_max_writable_len().ok_or_else(|| {
         TransportError::Http3("HTTP Datagram writable length became unavailable".to_owned())
     })?;
@@ -1757,6 +1989,7 @@ fn check_pmtu_blackhole(
         lost: path.lost,
         lost_datagrams: path.dgram_lost,
         pto_count: path.total_pto_count,
+        loss_detection_timeout_count: path.loss_detection_timeout_count,
         rtt: path.rtt,
     };
     if let Some(observation) = pmtu.on_loss_sample(
@@ -1801,6 +2034,43 @@ fn record_pmtu_change_if_needed(
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[derive(Default)]
+struct IncomingBurstFairness {
+    yielded: bool,
+}
+
+impl IncomingBurstFairness {
+    async fn yield_once_if_blocked(
+        &mut self,
+        connection: &mut H3QuicConnection,
+        ready_stream_id: Option<u64>,
+        incoming_tx: &mpsc::Sender<PacketBatch>,
+        incoming_batch: &mut PacketBatch,
+    ) -> Result<(), TransportError> {
+        let Some(stream_id) = ready_stream_id else {
+            return Ok(());
+        };
+        if self.yielded || connection.dgram_recv_front_len().is_none() {
+            return Ok(());
+        }
+        // The preceding drain leaves queued DATAGRAMs only when the retained
+        // application batch cannot be flushed. Give the consumer one chance
+        // before decoding more wire packets into the bounded QUIC receive queue.
+        // One yield per UDP batch bounds the delay to transmit/control work;
+        // permanent backpressure still uses the existing bounded drop policy.
+        self.yielded = true;
+        tokio::task::yield_now().await;
+        drain_received_datagrams_buffered(
+            connection,
+            stream_id,
+            true,
+            incoming_tx,
+            incoming_batch,
+            false,
+        )
+    }
 }
 
 fn receive_and_drain_quic_datagram(
@@ -1890,8 +2160,10 @@ fn generate_wire_datagrams(
     wire_queue: &Arc<QueueMetrics>,
     quality: &NetworkQualityTelemetry,
     active: crate::path_socket::PathBinding,
-) -> Result<(), TransportError> {
+) -> Result<WireProgress, TransportError> {
     let mut generated_bytes = 0usize;
+    let initial_packets = pending.len();
+    let mut stop = WireStop::QueueFull;
     while pending.len() < MAX_PENDING_WIRE_DATAGRAMS {
         // The allocation ceiling is not the next packet's required size.
         // BBRv2 can budget one 1200-byte QUIC packet during the handshake or
@@ -1900,6 +2172,7 @@ fn generate_wire_datagrams(
         let packet_capacity =
             wire_payload_capacity.min(send_quantum.saturating_sub(generated_bytes));
         if packet_capacity < quiche::MIN_CLIENT_INITIAL_LEN {
+            stop = WireStop::Quantum;
             break;
         }
         let mut bytes = take_wire_buffer(free_buffers, wire_payload_capacity, quality);
@@ -1919,6 +2192,9 @@ fn generate_wire_datagrams(
                 });
             }
             Err(quiche::Error::Done) => {
+                stop = WireStop::Done {
+                    backlog: connection.dgram_send_queue_len() != 0,
+                };
                 recycle_wire_buffer(free_buffers, bytes, quality);
                 break;
             }
@@ -1929,13 +2205,31 @@ fn generate_wire_datagrams(
             }
         }
     }
-    Ok(())
+    let progress = WireProgress {
+        packets: pending.len() - initial_packets,
+        bytes: generated_bytes,
+        stop,
+    };
+    progress.observe(quality);
+    Ok(progress)
+}
+
+fn observe_outgoing_batch(quality: &NetworkQualityTelemetry, batch: &OutgoingBatch) {
+    let counters = quality.performance();
+    crate::transport_performance::add(&counters.h3.application_batches, 1);
+    crate::transport_performance::add(&counters.h3.application_packets, batch.batch.len() as u64);
+    crate::transport_performance::add(&counters.h3.application_bytes, batch.batch.bytes() as u64);
+    crate::transport_performance::record_batch(&counters.h3_batch_sizes, batch.batch.len());
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WireSendOutcome {
     Sent,
-    MessageTooLarge,
+    MessageTooLarge {
+        payload_len: usize,
+        from: SocketAddr,
+        to: SocketAddr,
+    },
 }
 
 #[expect(
@@ -1998,8 +2292,18 @@ async fn send_due_wire_datagrams(
     let sent = match send_result {
         Ok(sent) => sent,
         Err(error) if is_message_too_long(&error) => {
-            discard_pending_wire_datagrams(pending, free_buffers, wire_queue, quality);
-            return Ok(WireSendOutcome::MessageTooLarge);
+            crate::transport_performance::add(&quality.performance().h3.udp_message_too_large, 1);
+            // Both backends return a successful prefix before surfacing a
+            // later error. An error here rejects exactly the first remaining
+            // datagram. Retain the tail until the caller classifies the path;
+            // it can contain DNS, TLS or ACK packets behind a PMTU probe.
+            let payload_len = pending.front().expect("nonempty send batch").bytes.len();
+            complete_wire_sends(pending, free_buffers, 1, wire_queue, quality);
+            return Ok(WireSendOutcome::MessageTooLarge {
+                payload_len,
+                from: source,
+                to: destination,
+            });
         }
         Err(error) => return Err(error.into()),
     };
@@ -2009,6 +2313,7 @@ async fn send_due_wire_datagrams(
         ));
     }
     if sent < batch_len {
+        crate::transport_performance::add(&quality.performance().h3.udp_partial_sends, 1);
         quality.record_udp_partial_batch();
     }
     complete_wire_sends(pending, free_buffers, sent, wire_queue, quality);
@@ -2088,18 +2393,27 @@ fn recycle_wire_buffer(
     }
 }
 
+#[cfg(test)]
 fn encode_http_datagram(
     pool: &DatagramEncodePool,
     stream_id: u64,
     packet: &[u8],
 ) -> Result<Option<PooledDatagramBuffer>, TransportError> {
     validate_ip_packet(packet)?;
+    encode_validated_http_datagram(pool, &DatagramHeader::new(stream_id)?, packet)
+}
+
+/// `packet` has passed H3SendHalf::start_owned_batch validation. Only the actor
+/// calls this path; network receives and public sends retain full validation.
+fn encode_validated_http_datagram(
+    pool: &DatagramEncodePool,
+    header: &DatagramHeader,
+    packet: &[u8],
+) -> Result<Option<PooledDatagramBuffer>, TransportError> {
     let Some(mut encoded) = pool.take() else {
         return Ok(None);
     };
-    let required = encoded_varint_len(stream_id / 4)?
-        .saturating_add(encoded_varint_len(usque_protocol::DEFAULT_CONTEXT_ID)?)
-        .saturating_add(packet.len());
+    let required = header.len.saturating_add(packet.len());
     if required > HTTP_DATAGRAM_BUFFER_CAPACITY {
         return Err(TransportError::Http3(
             "HTTP Datagram exceeded the bounded encode buffer".to_owned(),
@@ -2107,8 +2421,7 @@ fn encode_http_datagram(
     }
     let target = encoded.bytes_mut();
     debug_assert!(target.is_empty());
-    encode_varint(stream_id / 4, target)?;
-    encode_varint(usque_protocol::DEFAULT_CONTEXT_ID, target)?;
+    target.extend_from_slice(header.as_bytes());
     target.extend_from_slice(packet);
     Ok(Some(encoded))
 }
@@ -2157,6 +2470,7 @@ fn decode_varint(buffer: &[u8]) -> Result<Option<(u64, usize)>, TransportError> 
     Ok(Some((value, length)))
 }
 
+#[cfg(test)]
 fn encode_varint(value: u64, target: &mut Vec<u8>) -> Result<(), TransportError> {
     let length = encoded_varint_len(value)?;
     let prefix = match length {
@@ -2464,7 +2778,10 @@ pub(crate) mod tests {
             std::future::pending::<Result<(), TransportError>>().await
         });
         started_rx.await.unwrap();
-        let driver = H3Driver { task: Some(task) };
+        let driver = H3Driver {
+            task: Some(task),
+            cancellation: CancellationToken::new(),
+        };
         let mut wait = Box::pin(driver.wait());
         tokio::select! {
             result = &mut wait => panic!("driver wait completed early: {result:?}"),

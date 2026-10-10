@@ -62,7 +62,7 @@ void main() {
       expect(table.keys.toSet(), kL4En.keys.toSet());
       final hint = table['l4_transport_hint']!;
       expect(hint.length, lessThan(table['l4_explanation']!.length));
-      for (final term in ['TCP', 'TUN', 'DNS', 'Auto', 'L4']) {
+      for (final term in ['TCP', 'UDP', 'L4']) {
         expect(hint, contains(term));
       }
     }
@@ -161,6 +161,7 @@ void main() {
         final controller = AppController(FakeEngineClient())
           ..localePreference = LocalePreference.simplifiedChinese
           ..engineCapabilities = EngineCapabilities(
+            automaticEndpoints: true,
             l4Tcp: supported,
             l4TunTcp: supported,
             l4DnsConversion: supported,
@@ -212,6 +213,17 @@ void main() {
             findsOneWidget,
           );
           expect(controller.sharedNetwork.sni, 'legacy.example.com');
+          final help = find.byTooltip(controller.strings.get('l4_mode'));
+          await Scrollable.ensureVisible(tester.element(help), alignment: 0.3);
+          await tester.pumpAndSettle();
+          await tester.tap(help);
+          await tester.pumpAndSettle();
+          expect(
+            find.text(controller.strings.get('l4_explanation')),
+            findsOneWidget,
+          );
+          await tester.tap(find.text(controller.strings.get('close')));
+          await tester.pumpAndSettle();
           tester
               .widget<SegmentedButton<String>>(
                 find.byType(SegmentedButton<String>),
@@ -247,6 +259,7 @@ void main() {
               ? LocalePreference.simplifiedChinese
               : LocalePreference.english
           ..engineCapabilities = const EngineCapabilities(
+            automaticEndpoints: true,
             l4Tcp: true,
             l4TunTcp: true,
             l4DnsConversion: true,
@@ -373,6 +386,7 @@ void main() {
         addTearDown(tester.view.resetDevicePixelRatio);
         final controller = AppController(FakeEngineClient())
           ..engineCapabilities = const EngineCapabilities(
+            automaticEndpoints: true,
             l4Tcp: true,
             l4TunTcp: true,
             l4DnsConversion: true,

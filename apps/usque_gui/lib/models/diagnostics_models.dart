@@ -1,4 +1,145 @@
 import 'package:flutter/foundation.dart';
+import '../core/diagnostics_contract_generated.dart';
+
+enum DiagnosticObservationSource {
+  unknown,
+  config,
+  runtime,
+  platform,
+  activeProbe,
+  frontend,
+}
+
+enum DiagnosticObservationAvailability {
+  unknown,
+  observed,
+  inferred,
+  unavailable,
+  stale,
+  notApplicable,
+}
+
+@immutable
+class DiagnosticObservation {
+  const DiagnosticObservation({
+    this.source = DiagnosticObservationSource.unknown,
+    this.availability = DiagnosticObservationAvailability.unknown,
+    this.ageMilliseconds,
+    this.connectionInstanceId,
+    this.networkGeneration,
+  });
+
+  final DiagnosticObservationSource source;
+  final DiagnosticObservationAvailability availability;
+  final int? ageMilliseconds;
+  final String? connectionInstanceId;
+  final int? networkGeneration;
+
+  factory DiagnosticObservation.fromMap(Map<Object?, Object?> map) {
+    final identity = map['connection_instance_id'];
+    return DiagnosticObservation(
+      source: _enumByName(
+        DiagnosticObservationSource.values,
+        map['source'] is String ? map['source'] as String : null,
+        DiagnosticObservationSource.unknown,
+      ),
+      availability: _enumByName(
+        DiagnosticObservationAvailability.values,
+        map['availability'] is String ? map['availability'] as String : null,
+        DiagnosticObservationAvailability.unknown,
+      ),
+      ageMilliseconds: _unsignedValue(map['age_milliseconds']),
+      connectionInstanceId:
+          identity is String && _connectionIdentity.hasMatch(identity)
+          ? identity
+          : null,
+      networkGeneration: _unsignedValue(map['network_generation']),
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is DiagnosticObservation &&
+          source == other.source &&
+          availability == other.availability &&
+          ageMilliseconds == other.ageMilliseconds &&
+          connectionInstanceId == other.connectionInstanceId &&
+          networkGeneration == other.networkGeneration;
+
+  @override
+  int get hashCode => Object.hash(
+    source,
+    availability,
+    ageMilliseconds,
+    connectionInstanceId,
+    networkGeneration,
+  );
+}
+
+@immutable
+class DiagnosticEvidence {
+  const DiagnosticEvidence({required this.key, this.number, this.token});
+
+  final String key;
+  final int? number;
+  final String? token;
+
+  bool get isValid => number != null
+      ? token == null &&
+            number! >= 0 &&
+            DiagnosticsContract.evidenceKeys.contains(key)
+      : key == 'fact' &&
+            token != null &&
+            DiagnosticsContract.evidenceTokens.contains(token);
+
+  String get publicText => key == 'fact' ? token! : '$key=$number';
+
+  static DiagnosticEvidence? fromMap(Map<Object?, Object?> map) {
+    final key = map['key'];
+    if (key is! String) return null;
+    final rawToken = map['token'];
+    final rawNumber = map['number'];
+    if (rawNumber != null && _unsignedValue(rawNumber) == null) return null;
+    if (rawToken != null && rawToken is! String) return null;
+    final result = DiagnosticEvidence(
+      key: key,
+      number: _unsignedValue(rawNumber),
+      token: rawToken is String && rawToken.isNotEmpty ? rawToken : null,
+    );
+    return result.isValid ? result : null;
+  }
+
+  static DiagnosticEvidence? fromLegacy(String value) {
+    if (DiagnosticsContract.evidenceTokens.contains(value)) {
+      return DiagnosticEvidence(key: 'fact', token: value);
+    }
+    final separator = value.indexOf('=');
+    if (separator <= 0) return null;
+    final key = value.substring(0, separator);
+    final digits = value.substring(separator + 1);
+    if (!RegExp(r'^[0-9]+$').hasMatch(digits)) return null;
+    final result = DiagnosticEvidence(key: key, number: int.tryParse(digits));
+    return result.isValid ? result : null;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is DiagnosticEvidence &&
+          key == other.key &&
+          number == other.number &&
+          token == other.token;
+
+  @override
+  int get hashCode => Object.hash(key, number, token);
+}
+
+final _connectionIdentity = RegExp(
+  r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$',
+);
+
+int? _unsignedValue(Object? value) => value is int && value >= 0 ? value : null;
 
 enum DiagnosticMode { standard, deep }
 
@@ -126,6 +267,8 @@ class DiagnosticFinding {
     this.startedAt,
     this.durationMilliseconds,
     this.dependencyReason,
+    this.observation,
+    this.evidence = const <DiagnosticEvidence>[],
   });
 
   final String checkId;
@@ -139,9 +282,29 @@ class DiagnosticFinding {
   final DateTime? startedAt;
   final int? durationMilliseconds;
   final String? dependencyReason;
+  final DiagnosticObservation? observation;
+  final List<DiagnosticEvidence> evidence;
+
+  /// Both new and legacy senders pass through the same public allowlist.
+  List<String> get publicEvidence {
+    final facts = evidence
+        .where((value) => value.isValid)
+        .map((value) => value.publicText)
+        .toList(growable: false);
+    if (facts.isNotEmpty) return List.unmodifiable(facts.take(32));
+    return List.unmodifiable(
+      sanitizedEvidence
+          .map(DiagnosticEvidence.fromLegacy)
+          .whereType<DiagnosticEvidence>()
+          .map((value) => value.publicText)
+          .take(32),
+    );
+  }
 
   factory DiagnosticFinding.fromMap(Map<Object?, Object?> map) {
     final failure = map['failure'];
+    final observation = map['observation'];
+    final evidence = map['evidence'];
     return DiagnosticFinding(
       checkId: map['check_id'] as String? ?? '',
       category: _enumByName(
@@ -172,6 +335,24 @@ class DiagnosticFinding {
       startedAt: _dateFromMilliseconds(map['started_at_unix_milliseconds']),
       durationMilliseconds: (map['duration_milliseconds'] as num?)?.toInt(),
       dependencyReason: map['dependency_reason'] as String?,
+      observation: observation is Map
+          ? DiagnosticObservation.fromMap(
+              Map<Object?, Object?>.from(observation),
+            )
+          : null,
+      evidence: evidence is List
+          ? List.unmodifiable(
+              evidence
+                  .whereType<Map<Object?, Object?>>()
+                  .take(32)
+                  .map(
+                    (value) => DiagnosticEvidence.fromMap(
+                      Map<Object?, Object?>.from(value),
+                    ),
+                  )
+                  .whereType<DiagnosticEvidence>(),
+            )
+          : const <DiagnosticEvidence>[],
     );
   }
 
@@ -189,7 +370,9 @@ class DiagnosticFinding {
             listEquals(sanitizedEvidence, other.sanitizedEvidence) &&
             startedAt == other.startedAt &&
             durationMilliseconds == other.durationMilliseconds &&
-            dependencyReason == other.dependencyReason;
+            dependencyReason == other.dependencyReason &&
+            observation == other.observation &&
+            listEquals(evidence, other.evidence);
   }
 
   @override
@@ -205,6 +388,8 @@ class DiagnosticFinding {
     startedAt,
     durationMilliseconds,
     dependencyReason,
+    observation,
+    Object.hashAll(evidence),
   ]);
 }
 
@@ -261,6 +446,8 @@ class DiagnosticSession {
     this.progressPercent = 0,
     this.findings = const <DiagnosticFinding>[],
     this.summary = const DiagnosticSummary(),
+    this.activeChecks = const <String>[],
+    this.revision,
   });
 
   final String sessionId;
@@ -272,6 +459,15 @@ class DiagnosticSession {
   final int progressPercent;
   final List<DiagnosticFinding> findings;
   final DiagnosticSummary summary;
+  final List<String> activeChecks;
+  final int? revision;
+
+  List<String> get runningCheckIds => activeChecks.isNotEmpty
+      ? activeChecks
+      : findings
+            .where((finding) => finding.status == DiagnosticCheckStatus.running)
+            .map((finding) => finding.checkId)
+            .toList(growable: false);
 
   bool get isActive =>
       state == DiagnosticSessionState.pending ||
@@ -314,6 +510,15 @@ class DiagnosticSession {
       summary: summary is Map
           ? DiagnosticSummary.fromMap(Map<Object?, Object?>.from(summary))
           : const DiagnosticSummary(),
+      activeChecks: map['active_checks'] is List
+          ? List.unmodifiable(
+              (map['active_checks'] as List)
+                  .whereType<String>()
+                  .where(DiagnosticsContract.checkIds.contains)
+                  .take(4),
+            )
+          : const <String>[],
+      revision: _unsignedValue(map['revision']),
     );
   }
 
@@ -329,7 +534,9 @@ class DiagnosticSession {
             currentCheck == other.currentCheck &&
             progressPercent == other.progressPercent &&
             listEquals(findings, other.findings) &&
-            summary == other.summary;
+            summary == other.summary &&
+            listEquals(activeChecks, other.activeChecks) &&
+            revision == other.revision;
   }
 
   @override
@@ -343,6 +550,8 @@ class DiagnosticSession {
     progressPercent,
     Object.hashAll(findings),
     summary,
+    Object.hashAll(activeChecks),
+    revision,
   ]);
 }
 
@@ -366,6 +575,7 @@ enum ConnectionTimelineEventType {
   recoveryProbeFailed,
   pathPromoted,
   queueSaturated,
+  queueBackpressured,
   disconnected,
   failed,
   migrationStarted,
@@ -391,6 +601,7 @@ class ConnectionTimelineEvent {
     this.transport,
     this.addressFamily,
     this.durationMilliseconds,
+    this.queueKind,
     this.failure,
   });
 
@@ -402,6 +613,7 @@ class ConnectionTimelineEvent {
   final String? transport;
   final String? addressFamily;
   final int? durationMilliseconds;
+  final String? queueKind;
   final TransportFailureInfo? failure;
 
   @override
@@ -415,6 +627,7 @@ class ConnectionTimelineEvent {
             stage == other.stage &&
             transport == other.transport &&
             addressFamily == other.addressFamily &&
+            queueKind == other.queueKind &&
             durationMilliseconds == other.durationMilliseconds &&
             failure == other.failure;
   }
@@ -429,6 +642,7 @@ class ConnectionTimelineEvent {
     transport,
     addressFamily,
     durationMilliseconds,
+    queueKind,
     failure,
   );
 }
@@ -440,11 +654,11 @@ class ConnectionMetrics {
     this.lastH3HandshakeDurationMilliseconds,
     this.lastH2HandshakeDurationMilliseconds,
     this.currentSmoothedRttMilliseconds,
-    this.reconnectCount = 0,
-    this.fallbackCount = 0,
-    this.networkChangeCount = 0,
-    this.sendQueueHighWatermark = 0,
-    this.sendQueueDropCount = 0,
+    this.reconnectCount,
+    this.fallbackCount,
+    this.networkChangeCount,
+    this.sendQueueHighWatermark,
+    this.sendQueueDropCount,
     this.lastFailureCode,
     this.lastReconnectCode,
   });
@@ -453,11 +667,11 @@ class ConnectionMetrics {
   final int? lastH3HandshakeDurationMilliseconds;
   final int? lastH2HandshakeDurationMilliseconds;
   final int? currentSmoothedRttMilliseconds;
-  final int reconnectCount;
-  final int fallbackCount;
-  final int networkChangeCount;
-  final int sendQueueHighWatermark;
-  final int sendQueueDropCount;
+  final int? reconnectCount;
+  final int? fallbackCount;
+  final int? networkChangeCount;
+  final int? sendQueueHighWatermark;
+  final int? sendQueueDropCount;
   final String? lastFailureCode;
   final String? lastReconnectCode;
 }
@@ -468,14 +682,40 @@ class ConnectionTimeline {
     this.events = const <ConnectionTimelineEvent>[],
     this.metrics = const ConnectionMetrics(),
     this.droppedEventCount = 0,
+    this.connectionInstanceId,
+    this.retained = false,
+    this.sessionGeneration,
+    this.observation,
   });
 
   final List<ConnectionTimelineEvent> events;
   final ConnectionMetrics metrics;
   final int droppedEventCount;
+  final String? connectionInstanceId;
+  final bool retained;
+  final int? sessionGeneration;
+  final DiagnosticObservation? observation;
 }
 
 ConnectionTimeline connectionTimelineFromMap(Map<Object?, Object?> map) {
+  final identity = map['connection_instance_id'];
+  final rawObservation = map['observation'];
+  final observationFields = rawObservation is Map
+      ? Map<Object?, Object?>.from(rawObservation)
+      : map['source'] is String || map['availability'] is String
+      ? <Object?, Object?>{
+          'source': map['source'],
+          'availability': map['availability'],
+        }
+      : null;
+  if (observationFields != null &&
+      observationFields['age_milliseconds'] == null) {
+    final captured = _unsignedValue(map['captured_at_unix_milliseconds']);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (captured != null && captured > 0 && captured <= now) {
+      observationFields['age_milliseconds'] = now - captured;
+    }
+  }
   final metricsMap = map['metrics'];
   final metrics = metricsMap is Map
       ? Map<Object?, Object?>.from(metricsMap)
@@ -508,6 +748,7 @@ ConnectionTimeline connectionTimelineFromMap(Map<Object?, Object?> map) {
               stage: event['stage'] as String?,
               transport: event['transport'] as String?,
               addressFamily: event['address_family'] as String?,
+              queueKind: event['queue_kind'] as String?,
               durationMilliseconds: (event['duration_milliseconds'] as num?)
                   ?.toInt(),
               failure: failure is Map
@@ -535,18 +776,25 @@ ConnectionTimeline connectionTimelineFromMap(Map<Object?, Object?> map) {
           metrics['current_smoothed_rtt_known'] == true
           ? (metrics['current_smoothed_rtt_milliseconds'] as num?)?.toInt()
           : null,
-      reconnectCount: (metrics['reconnect_count'] as num?)?.toInt() ?? 0,
-      fallbackCount: (metrics['fallback_count'] as num?)?.toInt() ?? 0,
-      networkChangeCount:
-          (metrics['network_change_count'] as num?)?.toInt() ?? 0,
-      sendQueueHighWatermark:
-          (metrics['send_queue_high_watermark'] as num?)?.toInt() ?? 0,
-      sendQueueDropCount:
-          (metrics['send_queue_drop_count'] as num?)?.toInt() ?? 0,
+      reconnectCount: (metrics['reconnect_count'] as num?)?.toInt(),
+      fallbackCount: (metrics['fallback_count'] as num?)?.toInt(),
+      networkChangeCount: (metrics['network_change_count'] as num?)?.toInt(),
+      sendQueueHighWatermark: (metrics['send_queue_high_watermark'] as num?)
+          ?.toInt(),
+      sendQueueDropCount: (metrics['send_queue_drop_count'] as num?)?.toInt(),
       lastFailureCode: metrics['last_failure_code'] as String?,
       lastReconnectCode: metrics['last_reconnect_code'] as String?,
     ),
     droppedEventCount: (map['dropped_event_count'] as num?)?.toInt() ?? 0,
+    connectionInstanceId:
+        identity is String && _connectionIdentity.hasMatch(identity)
+        ? identity
+        : null,
+    retained: map['retained'] == true,
+    sessionGeneration: _unsignedValue(map['session_generation']),
+    observation: observationFields == null
+        ? null
+        : DiagnosticObservation.fromMap(observationFields),
   );
 }
 

@@ -8,6 +8,8 @@ mod client;
 mod client_tests;
 pub(crate) mod performance;
 mod pool;
+#[cfg(test)]
+mod quic_fallback_tests;
 mod receive_history;
 mod relay;
 mod runtime;
@@ -15,10 +17,11 @@ pub(crate) mod stream;
 #[cfg(test)]
 pub(crate) mod test_options;
 mod tun;
-mod tun_stream;
+mod tun_reject;
 #[cfg(test)]
 mod tun_tests;
-mod tun_wire;
+mod tun_udp;
+pub(crate) mod tun_wire;
 
 pub(crate) use actor::{L4Actor, SessionHandle};
 pub(crate) use client::L4Client;

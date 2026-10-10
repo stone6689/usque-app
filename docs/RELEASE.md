@@ -5,13 +5,15 @@ record that the current checkout has been published. The authoritative
 executable contracts are [release.yml](../.github/workflows/release.yml) and
 [release_contract.py](../tool/release_contract.py).
 
-The workflow currently accepts only `v0.2.6` and requires that tag to point at
-the current `main` commit when its gate runs. The tag is maintainer-only.
+The current release candidate is `v0.3.1`. The checked-in application metadata
+and workflow target `v0.3.1` / `0.3.1+25`; this does not establish publication.
+The workflow accepts only `v0.3.1`. Its accepted tag must point at the current
+`main` commit when the gate runs. Only the release maintainer creates the tag.
 Signing and publish jobs run in GitHub Environments that need approval. If a
 required file, signing input, or CI result is missing, the workflow fails. A
 local bundle, MSI, or APK cannot replace a failed Actions build.
 
-The v0.2.6 candidate retains the newer-Agent-first Windows upgrade sequence
+The current source retains the newer-Agent-first Windows upgrade sequence
 and complete payload replacement introduced in v0.2.5. Those fixes are not part
 of the original v0.2.4 release. The multilingual EXE installer and hidden-bundle
 uninstall lifecycle are new in v0.2.6, not the original v0.2.5 MSI-only release.
@@ -21,15 +23,102 @@ published tag; a subsequent release needs a separately reviewed version and
 workflow update and the existing approval gates. Static and compile-only
 checks are not evidence of a successful real-machine upgrade.
 
+## Preparing v0.3.1
+
+The [v0.3.1 readiness review](RELEASE_V0.3.1_READINESS.md) records the reviewed
+source, completed documentation checks and open release requirements. It is
+not final-candidate certification. The coordinated candidate inputs are:
+
+| Input | Previous v0.3.0 value | Current v0.3.1 value |
+| --- | --- | --- |
+| Cargo workspace and first-party `Cargo.lock` package entries | `0.3.0` | `0.3.1` |
+| Flutter `pubspec.yaml` | `0.3.0+24` | `0.3.1+25` |
+| All 21 registered Dart `app_version` catalogs | `Usque 0.3.0` | `Usque 0.3.1` |
+| Release tag trigger and `RELEASE_TAG` | `v0.3.0` | `v0.3.1` |
+| Release `ANDROID_VERSION_CODE` and CI version gate | `24`, `v0.3.0` | `25`, `v0.3.1` |
+
+Then run the exact version check from the repository root:
+
+```shell
+python tool/release_contract.py verify-version --root . --tag v0.3.1 --android-version-code 25
+```
+
+This command must pass for the final candidate. The
+helper checks Cargo's workspace version, Flutter, registered locale catalogs
+and the release workflow. Review first-party `Cargo.lock` entries and the CI
+invocation separately because the helper does not inspect them. Recheck this
+guide, [GitHub governance](GITHUB_GOVERNANCE.md), signing and reliability
+references, six root READMEs and [Installation](INSTALLATION.md) after updating
+the executable contract. Do not move or reuse the published `v0.3.0` tag.
+
+The Android base versionCode `25` follows v0.3.0's `24`. Derived
+codes will be 1025 (ARMv7), 2025 (ARM64), 4025 (x86_64) and 25 (universal),
+advancing 1024/2024/4024/24. Verify these values in the actual signed APKs,
+including all ABI-specific update paths and universal-to-ABI updates. A split
+APK has a higher code than the same release's universal APK; switching from
+split to universal may be rejected. Do not bypass Android's monotonic version
+check or treat source arithmetic as a device-upgrade result.
+
+The v0.3.0 tag uses configuration schema 23; current source uses schema 24.
+Schema 24 migrates custom bypass domains and CIDRs to DIRECT routing rules,
+retains countries, and adds REJECT/PROXY actions and optional Ads. Custom CIDRs
+now route in the application data plane instead of creating physical bypass
+routes. Once migrated, v0.3.0 and older engines reject the configuration. Keep
+recoverable pre-upgrade data when rollback is required; never lower schema
+numbers or replace recovery records to bypass validation. Recovery journal 5,
+Agent protocol 3 and sanitized recovery export schema 2 remain unchanged and
+do not prove downgrade compatibility.
+
+Review [.github/RELEASE_NOTES_TEMPLATE.md](../.github/RELEASE_NOTES_TEMPLATE.md)
+against `v0.3.0..HEAD`: routing/Ads, LAN access across outputs, H3 PMTU startup,
+DoH URL editing, removal of local-proxy DNS controls, reorganized settings and
+the single chain-proxy VPN Gate editor, Android tile recovery, hidden UI polling
+and opaque adaptive-icon backgrounds. WARP encrypted DNS, experimental Zero
+Trust endpoint editing, native Windows setup/removal and desktop shortcuts
+already existed in v0.3.0; do not advertise them as newly introduced here.
+
+The final candidate commit must equal current `main` and have successful required
+CI before tagging. Rerun applicable checks after the final change, retain
+commit and Actions run identities, preserve immutable candidate and approval
+requirements, and keep historical validation records unchanged.
+
+For this release, the maintainer authorized direct fast-forward promotion of
+the fully validated dev candidate through the existing owner exception, without
+a PR or Squash. Record `PR Check / gate` as `not_run`, not passed. Save main/dev
+backup refs, verify main remains an ancestor, and bind the push lease to its
+exact observed old SHA. Stop on concurrent changes or protection rejection;
+do not change repository rules. Require final-candidate CI, Build and CodeQL,
+then exact-SHA main push CI and CodeQL before tagging. Keep local main unchanged.
+
+## Preparing v0.3.0
+
+This anchor is retained for historical review links. v0.3.0 was published on
+2026-10-07 from `274bc3c2a51f78d141972ea78d0828b7d43f8f8e`, using `0.3.0+24`
+and configuration schema 23. Its [tagged release guide](https://github.com/GeorgeXie2333/usque-app/blob/v0.3.0/docs/RELEASE.md)
+and [published release](https://github.com/GeorgeXie2333/usque-app/releases/tag/v0.3.0)
+define that version's scope. The earlier [readiness review](RELEASE_V0.3.0_READINESS.md)
+retains its original source and unavailable checks; later publication does not
+retroactively make that review final-candidate validation.
+
 Which signatures count as official, how fingerprints are published, and what happens if a key is lost or leaked are in [CODE_SIGNING.md](CODE_SIGNING.md). Repository rules around this workflow are in [GITHUB_GOVERNANCE.md](GITHUB_GOVERNANCE.md).
 
 ## Before signing starts
 
-- The tag must be `v0.2.6` and must point at the current `main` commit.
+- For `v0.3.1`, complete the version and workflow changes above first. The
+  accepted tag must match `release.yml` and point at the current `main` commit.
 - That commit must already have a successful `ci.yml` push run, including `CI / gate`.
 - `release-signing` and `release-publish` both require approval.
 - Android Developer Console must show `io.github.georgexie2333.usque` and the certificate fingerprint in `ANDROID_SIGNER_SHA256` as **Registered**.
 - Signing material stays in environment secrets. Do not put it in repository variables, files, artifacts, logs, or caches.
+
+Review the live `main` ruleset, tag restrictions and both environment approval
+settings before tagging. A checked-in document cannot establish their current
+GitHub configuration. `PR Check / gate`, `CI / gate` and `Build / gate` are the
+documented merge checks. The release gate separately requires a successful
+`ci.yml` **push** run for the exact tagged current `main` SHA; an earlier PR
+run or local check is insufficient. `publish` depends only on `stage-candidate`
+and requires `release-publish` approval; protected reliability jobs are not
+dependencies of publication.
 
 ## Signing inputs
 
@@ -53,29 +142,56 @@ These non-secret variables come from the repository or the same environments:
 
 Keep encrypted offline backups of both signing identities. Pre-1.0 packages use these fixed self-signed identities. A v1.0.0 signing change is a separate release.
 
-The Windows job imports the private identity only into the runner user's personal certificate store. It does not add the certificate to Root or TrustedPublisher. Verification accepts the expected untrusted-root result and checks the DER SHA-256 fingerprint. An `always()` step removes the private identity. The workflow never re-signs the official Wintun DLL. The Android job deletes its temporary keystore the same way.
+The Windows job imports the private identity only into the runner user's personal certificate store. It does not add the certificate to Root or TrustedPublisher. It records the imported identity before checking the fingerprint or locating SignTool, so those failures still reach cleanup. Verification accepts the expected untrusted-root result and checks the DER SHA-256 fingerprint. An `always()` step removes both the certificate and its private key with `-DeleteKey`; its `finally` block deletes the temporary PFX even if certificate removal fails. Cleanup errors fail the job. The workflow never re-signs the official Wintun DLL. The Android job deletes its temporary keystore afterward.
 
 Android builds verify the Gradle 9.5.1 distribution against its published SHA-256, use the checked-in `app/gradle.lockfile`, and check resolved artifacts against `gradle/verification-metadata.xml`. Updating an Android dependency means reviewing and regenerating both files by hand. CI and release jobs must not use `--write-locks` or `--write-verification-metadata`.
 
-The Windows bundle and MSI do not install the publisher certificate into the machine Root or TrustedPublisher stores. At runtime the Agent accepts only the `CERT_E_UNTRUSTEDROOT` result expected for this self-signed identity, after Windows has checked the Authenticode digest and signature, and then requires the embedded certificate fingerprint to match `WINDOWS_SIGNER_SHA256`. Any other trust result is fatal.
+The Windows bundle and MSI do not install the publisher certificate into the
+machine Root or TrustedPublisher stores. At runtime the Agent accepts Windows'
+successful Authenticode result (`0`) or the `CERT_E_UNTRUSTEDROOT` result
+expected for this self-signed identity, after the digest and signature checks.
+It then requires the embedded certificate fingerprint to match
+`WINDOWS_SIGNER_SHA256`. Every other trust result is fatal; success never
+bypasses the fingerprint check.
 
 ## Artifact flow
 
 1. The tag job builds signed x64-v2 and ARM64 installer bundles, their signed update MSIs, and signed arm64-v8a, x86_64, armeabi-v7a, and universal APKs in the signing environment.
 2. Each platform job checks the certificate identity and creates GitHub build provenance.
+   Both Build and Release use the shared read-only APK packaging validator:
+   native libraries must be compressed, the application must explicitly enable
+   extraction, 64-bit ELF LOAD segments must support 16 KiB alignment, and ZIP
+   alignment must pass. Wrong ABIs, duplicate entries, shipped symbols and native
+   debug information are rejected before candidate upload. No APK is installed.
 3. A staging job downloads those artifacts, rejects missing or extra EXE/MSI/APK files, writes an internal release manifest, generates SPDX SBOMs, and records SBOM attestations.
 4. The publish job rechecks every primary package against the immutable manifest, calculates final package checksums, and creates the GitHub release with six user-facing installers, two update-only MSIs, the manifest, checksums, and per-package SBOMs.
-5. When repository variable `RUN_PROTECTED_RELEASE_VALIDATION` is exactly `true`, four protected self-hosted runner classes separately exercise the staged candidate: a Windows snapshot VM, a dedicated Android device, an independent network observer, and a controlled performance lab.
-6. Protected validation is supplemental and does not gate publication. The aggregator emits `reliability-report.json` and `device-matrix.md` as a protected Actions artifact only when every required report and evidence file passes its exact-candidate and isolation checks. Missing infrastructure, `failed`, and `not_run` remain visible non-passes and never become release approval.
+   Separately retain the three matching Flutter symbol artifacts for the
+   supported lifetime of this release, following [Flutter release symbols](FLUTTER_SYMBOLS.md).
+   Verify their source SHA, version, AOT/build-ID and symbol hashes against the
+   actual packages. Symbols stay outside the 18 public Release assets and must
+   not be deleted with temporary package-verification downloads.
+5. Only in a private repository, and when repository variable `RUN_PROTECTED_RELEASE_VALIDATION` is exactly `true`, four protected self-hosted runner classes separately exercise the staged candidate: a Windows snapshot VM, a dedicated Android device, an independent network observer, and a controlled performance lab. The public repository skips these jobs even if the variable is enabled; its Actions artifacts cannot provide a restricted evidence store.
+6. Protected validation is supplemental and does not gate publication. In the private execution context, the aggregator emits `reliability-report.json` and `device-matrix.md` only when every required report and evidence file passes its exact-candidate and isolation checks. These artifacts inherit the private repository's read permissions. Skipped or unavailable validation is `not_run`, not a pass. Missing infrastructure, `failed`, and `not_run` never become release approval.
 
 ## Release-note format
 
 `.github/RELEASE_NOTES_TEMPLATE.md` is the publication source for the GitHub
 Release body. Before creating a new release tag, replace the **Highlights**
-items with that release's user-visible changes. Every statement is written in
+items and version summary with that release's user-visible changes. Keep the
+upgrade notes and folded technical and DNS details in sync with that version,
+and recheck versioned facts such as configuration schema, Agent protocol, and
+recovery journal and export schema numbers against the source. Every statement is written in
 English first, followed immediately by its Simplified Chinese translation.
+Separate each bilingual list item from the next with a blank line so GitHub
+renders paragraph spacing after the Chinese text as well as before it.
 Keep the standard sections for official downloads, installation requirements,
 signature and evidence verification, and issue feedback.
+Keep the version summary, highlights, download table, official-source warning,
+and Windows EXE guidance visible. Put supplementary installation guidance,
+upgrade notes, technical and DNS details, verification instructions and evidence,
+and feedback guidance in separate, default-collapsed `details` blocks with
+English-first bilingual summaries. Keep the standard section headings outside
+the blocks so readers can find them without expanding the content.
 
 The release renderer accepts only the version, official repository URL, and
 the two validated signer fingerprints as template values. It rejects missing
@@ -86,16 +202,22 @@ because an automatically appended monolingual changelog would break the
 bilingual ordering. The publish job fails instead of falling back to an
 unrendered or partially rendered body.
 
-Primary files:
+Download badges and platform icons live in `docs/assets/release/` and use
+repository image URLs pinned to the release tag. Keep all six installer links,
+accurate system requirements, and descriptive image alt text when updating the
+table. Do not add third-party badge services or update-only MSI download buttons.
+Keep the four required bilingual section names; decorative emoji may follow them.
 
-- `usque-v0.2.6-windows-x64-v2.exe`
-- `usque-v0.2.6-windows-arm64.exe`
-- `usque-v0.2.6-windows-x64-v2.msi`
-- `usque-v0.2.6-windows-arm64.msi`
-- `usque-v0.2.6-android-arm64-v8a.apk`
-- `usque-v0.2.6-android-x86_64.apk`
-- `usque-v0.2.6-android-armeabi-v7a.apk`
-- `usque-v0.2.6-android-universal.apk`
+The v0.3.1 primary files (official only after approved publication):
+
+- `usque-v0.3.1-windows-x64-v2.exe`
+- `usque-v0.3.1-windows-arm64.exe`
+- `usque-v0.3.1-windows-x64-v2.msi`
+- `usque-v0.3.1-windows-arm64.msi`
+- `usque-v0.3.1-android-arm64-v8a.apk`
+- `usque-v0.3.1-android-x86_64.apk`
+- `usque-v0.3.1-android-armeabi-v7a.apk`
+- `usque-v0.3.1-android-universal.apk`
 
 The two EXEs and four APKs are the user-facing installers; the two MSIs are
 update payloads consumed by the signed Windows updater. In addition to these
@@ -108,7 +230,7 @@ documented in [RELIABILITY_TESTING.md](RELIABILITY_TESTING.md).
 
 ## Windows package rules
 
-These rules describe the v0.2.6 authoring and verification code. The Agent
+These rules describe the current authoring and verification code. The Agent
 file-version check and late related-product removal sequence were added after
 the original v0.2.4 tag; they must not be presented as properties already
 verified in that older package. User-facing applicability is recorded in
@@ -121,13 +243,25 @@ MSI build = SemVer patch * 100 + beta ordinal
 stable ordinal = 99
 ```
 
-Stable `v0.2.6` is therefore MSI ProductVersion `0.2.699`. The real SemVer stays in ProductName and the filenames. The Agent embeds the same mapped value as its four-part PE file version (`0.2.699.0`), and packaging rejects an unversioned or mismatched Agent. Equal-version major upgrades are enabled so a validation build can replace the same product instead of installing a second copy under `Program Files\Usque`. WiX validation suppresses only ICE61, which assumes upgrades must raise the version; every other standard ICE check stays on.
+Stable `v0.3.1` maps to MSI ProductVersion `0.3.199` and Agent PE file version
+`0.3.199.0`; `v0.3.1-beta.3` maps to `0.3.103`. The prior `v0.3.0` maps to
+`0.3.99` / `0.3.99.0`, so the new stable package advances the build component.
+The real SemVer stays in
+ProductName and the filenames, and packaging
+rejects an unversioned or mismatched Agent. Equal-version major upgrades are
+enabled so a validation build can replace the same product instead of
+installing a second copy under `Program Files\Usque`. WiX validation suppresses
+only ICE61, which assumes upgrades must raise the version; every other standard
+ICE check stays on.
 
-The user-facing Windows artifact is a WiX Internal UI Bootstrapper Application
-bundle. It contains the signed English MSI plus 20 language transforms and
-selects a transform from the current Windows UI language; unsupported UI
-languages fall back to English. Every localized MSI is compiled and fully
-ICE-validated from the same ProductCode before its transform is generated.
+The user-facing Windows artifact is a WiX Burn bundle with the repository's
+native C++ setup window. It contains the signed native setup EXE, signed English
+MSI and 20 language transforms. It initially uses the current Windows UI
+language, permits a language change before installation, and falls back to
+English for unsupported languages. The bundle suppresses the inner MSI UI;
+direct MSI deployments retain the custom MSI UI. Every localized MSI is
+compiled and fully ICE-validated from the same ProductCode before its transform
+is generated.
 `MajorUpgrade/@IgnoreLanguage` is required so a direct update MSI can replace
 an installation created with any transform. The tag workflow signs the base
 MSI first, builds the bundle, detaches and signs the Burn engine, reattaches it,
@@ -168,7 +302,31 @@ process is force-closed only after Restart Manager's bounded graceful timeout,
 and sets `MSIDISABLERMRESTART=1` so an old process is never relaunched after an
 uninstall or in the middle of a major upgrade.
 
-The build rejects unsigned project EXE/DLL files, a signer mismatch, an unversioned or version-mismatched Agent, PDBs, reparse points, a modified Wintun DLL, a missing `usque-update.exe`, a wrong service command/start type/DACL, an advertised shortcut, a missing maintenance guard, an early related-product removal sequence, a language-sensitive upgrade row, a missing or malformed bundle transform, a visible duplicate Burn uninstall entry, a direct quiet-MSI uninstall registration that would strand Burn, a wrong uninstall action/condition sequence, a 32-bit component, or an ICE failure. The signed update helper reuses the Agent's offline Authenticode verifier and additionally checks the MSI SHA-256, UpgradeCode, mapped stable ProductVersion, summary architecture, and `USQUE_UPDATE_VARIANT` property before starting Windows Installer. True uninstall runs emergency WFP cleanup, journal recovery, optional current-user data cleanup, and clean-state finalization after the service stops and before its binary is removed. A major upgrade runs the first two actions but skips user-data cleanup and clean-state finalization so the replacement service keeps user state and the machine-state directory. The installer UI exposes `INSTALLFOLDER` and stores the chosen path in the 64-bit machine registry for the next major upgrade.
+### Package rejection checks
+
+The release fails if any of these checks fail:
+
+| Area | Rejected package contents or metadata |
+| --- | --- |
+| Binaries | Unsigned project EXE/DLL files, a signer mismatch, an unversioned or version-mismatched Agent, a modified Wintun DLL, or a missing `usque-update.exe`. |
+| Payload layout | PDBs, reparse points or a 32-bit component. |
+| Service and shortcuts | A wrong service command, start type or DACL; an advertised shortcut; or a missing maintenance guard. |
+| Upgrade and removal | Early related-product removal, a language-sensitive upgrade row, or a wrong uninstall action/condition sequence. |
+| Bundle and localization | A missing or malformed language transform, a visible duplicate Burn uninstall entry, a direct quiet-MSI uninstall registration that would leave Burn registered, or an ICE failure. |
+
+The signed update helper uses the Agent's offline Authenticode verifier. Before
+starting Windows Installer it also checks the MSI SHA-256, UpgradeCode, mapped
+stable ProductVersion, summary architecture and `USQUE_UPDATE_VARIANT`.
+
+True uninstall runs emergency WFP cleanup, journal recovery, optional
+current-user data cleanup and clean-state finalization after stopping the service
+and before removing its binary. A major upgrade runs only the first two actions;
+it preserves user data and the machine-state directory for the replacement service.
+
+The installer exposes `INSTALLFOLDER` and records the selected path in the
+64-bit machine registry for the next major upgrade.
+
+### Visible uninstall entry
 
 Uninstall keeps the current user's profiles, preferences, logs, caches, and
 Credential Manager records by default. Settings does not host the MSI wizard,
@@ -177,14 +335,26 @@ registers `usque-uninstall.exe` as the visible uninstall command. The bundle
 also sets `DisableModify=yes` and `DisableRemove=yes`, which keeps its Burn
 registration out of Programs and Features instead of creating a second
 uninstall route. The helper asks for confirmation in the Windows UI language,
-then copies itself out of the install directory before removal begins.
-It resolves the hidden bundle through the architecture-specific stable Burn
+then copies itself out of the install directory before removal begins. The
+temporary Rust/Win32 window remains open while the MSI worker reports progress,
+files-in-use questions, cancellation availability and the final result.
+Uninstall, current-user data deletion and hidden-bundle cleanup have separate
+results; an incomplete cleanup or restart requirement cannot become a false
+success. Window cancellation is disabled during irreversible deletion and
+registration cleanup.
+
+### Hidden bundle cleanup
+
+The helper resolves the hidden bundle through the architecture-specific stable Burn
 provider key, requires the cached EXE to remain in its bundle-ID cache directory
 and have the same Authenticode signer, uninstalls the current MSI, then runs the
 cached bundle quietly so Burn removes its own registration and cache.
 Windows Installer and Burn own separate per-machine elevation boundaries, so
 Windows may request administrator approval for each phase; the helper itself
 is never elevated from its user-writable temporary path.
+
+### Quiet uninstall
+
 The registered `QuietUninstallString` embeds the repository's quiet launcher
 in a hidden system PowerShell host. It stages the signed helper, waits for the
 installed staging process to exit, locks the copy against changes, rechecks
@@ -194,11 +364,17 @@ and callers receive failures and reboot requirements instead of asynchronous
 success. Installation paths are passed as process filenames, never script
 source; no execution-policy override is used. Direct `--quiet` from the install
 directory fails closed rather than detaching. The registered command keeps
-data. An administrator may request deletion explicitly; deletion covers
+data.
+
+### Data retention and MSI-only deployments
+
+An administrator may request deletion explicitly; deletion covers
 only that user's Usque directories and credential namespace. A direct
 `msiexec /x` command is reserved for MSI-only deployments because it cannot
 clean an EXE bundle registration. The shared Wintun driver package is not
 removed.
+
+### WiX argument handling
 
 The quiet launcher's fixed executable prefix and quotes are authored in WXS.
 Only its Base64 script token crosses the WiX `-define` command-line boundary;
@@ -208,6 +384,21 @@ Registry value against the trusted launcher, and CI compiles real inert MSIs
 under all three PowerShell 7 argument-passing modes.
 
 User-facing install and uninstall steps are in [INSTALLATION.md](INSTALLATION.md).
+
+## In-app update verification
+
+The app offers only non-prerelease GitHub Releases. It requires the exact update
+MSI (Windows) or APK (Android) and `release-manifest.json` from the same release.
+It streams the package into a private `.part` file, checks the declared size and
+SHA-256, and atomically exposes the completed file. Cancellation and failure
+remove partial downloads; abandoned update packages expire after seven days.
+
+On Windows, **Restart and update** flushes local settings, disconnects the Engine normally, and starts the signed `usque-update.exe` helper. The helper checks the MSI digest, Authenticode signer, UpgradeCode, ProductVersion, architecture, and installed variant before waiting for the GUI to exit and running Windows Installer in passive, no-restart mode. It deletes the MSI at a terminal result and starts the installed application again unless Windows requires a reboot. Validate the real upgrade and failure-recovery paths only in a snapshot-enabled VM.
+
+On Android, **Install update** verifies that the APK stays in Usque's private cache and has the same package name and signing identity, a higher version code, the advertised version, and native code for the running ABI. Android may first open the permission page for installing unknown apps; Usque then submits the APK with `PackageInstaller` and Android shows its normal confirmation UI. Success, failure, cancellation, package replacement, and the next startup all clean the cached APK. Validate this path only on a dedicated phone or TV.
+
+These checks complement the user-facing [update steps](INSTALLATION.md#updates).
+They do not authorize a development workstation to install or exercise a package.
 
 ## Runner isolation boundary
 

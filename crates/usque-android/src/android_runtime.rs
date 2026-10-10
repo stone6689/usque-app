@@ -9,14 +9,15 @@ use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use usque_core::{AddressFamily, IpSbProbe, Transport, WarpIdentity};
+use usque_core::{AddressFamily, Transport, WarpIdentity};
 use usque_core::{ReconfigureClass, classify_reconfigure};
 use usque_geo::CountryCode;
 use usque_transport::{
-    DataPlaneRuntime, EndpointPinRefresher, GeoDirectPolicy, RuntimeHealth, RuntimePath,
-    TrafficSnapshot, TransportError, TunPacketIo,
+    DataPlaneRuntime, EndpointPinRefresher, GeoDirectPolicy, RuntimeHealth, TrafficSnapshot,
+    TransportError, TunPacketIo,
 };
 
+use crate::exit_probe_task::{ExitProbeTask, run_probe};
 use crate::session_pump::{SessionDataEvent, next_session_data, wait_pending};
 use crate::tun_read_slab::TunReadSlab;
 
@@ -30,6 +31,14 @@ use super::{
 
 static ENGINE: OnceLock<Mutex<Option<EngineHandle>>> = OnceLock::new();
 static LAST_START_ERROR: OnceLock<Mutex<Option<NativeSnapshot>>> = OnceLock::new();
+type InternalNetworks = (
+    usque_transport::InternalNetwork,
+    usque_transport::InternalNetwork,
+);
+static NETWORKS: Mutex<Option<InternalNetworks>> = Mutex::new(None);
+pub(super) fn internal_networks() -> Option<InternalNetworks> {
+    NETWORKS.lock().ok().and_then(|v| v.clone())
+}
 
 pub(super) fn is_running() -> bool {
     ENGINE
@@ -40,6 +49,7 @@ pub(super) fn is_running() -> bool {
 enum RuntimeCommand {
     Reconfigure {
         profile: Profile,
+        deadline: Instant,
         reply: std::sync::mpsc::SyncSender<i32>,
         cancelled: Arc<AtomicBool>,
     },
@@ -53,6 +63,10 @@ enum RuntimeCommand {
         reply: std::sync::mpsc::SyncSender<i32>,
         cancelled: Arc<AtomicBool>,
     },
+    RejectFinalNetwork {
+        reply: std::sync::mpsc::SyncSender<i32>,
+        cancelled: Arc<AtomicBool>,
+    },
 }
 
 struct EngineHandle {
@@ -60,6 +74,7 @@ struct EngineHandle {
     status: Arc<Mutex<NativeSnapshot>>,
     protector: Arc<AndroidSocketProtector>,
     commands: tokio::sync::mpsc::UnboundedSender<RuntimeCommand>,
+    connection_deadline: Arc<Mutex<Option<Instant>>>,
     // A retained, shared join owner keeps ENGINE occupied while stopping.
     // Starts remain fail-closed, without holding ENGINE across a blocking wait.
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -106,6 +121,9 @@ fn spawn_runtime(
     geo_cache_dir: PathBuf,
     protector: Arc<AndroidSocketProtector>,
 ) -> i32 {
+    let connection_deadline = Arc::new(Mutex::new(Some(
+        Instant::now() + usque_core::endpoint_connection_budget(&profile),
+    )));
     clear_last_start_error();
     let engine = ENGINE.get_or_init(|| Mutex::new(None));
     let mut slot = match engine.lock() {
@@ -115,7 +133,7 @@ fn spawn_runtime(
     if slot.is_some() {
         return START_ALREADY_RUNNING;
     }
-    super::connection_timeline::publish(Default::default());
+    let timeline_generation = super::connection_timeline::begin();
     let tun = match tun_file_descriptor {
         Some(fd) => match duplicate_tun(fd) {
             Ok(tun) => Some(tun),
@@ -143,6 +161,21 @@ fn spawn_runtime(
             return START_TRANSPORT_FAILURE;
         }
     };
+    let selected_gate = if profile.chain_enabled() {
+        let selected = super::chain_exit::prepare(&geo_cache_dir, &profile)
+            .ok()
+            .flatten();
+        let Some(selected) = selected else {
+            return START_INVALID_PROFILE;
+        };
+        // The provisional blocking TUN must never carry final packets.
+        if tun.is_some() {
+            return START_INVALID_PROFILE;
+        }
+        Some(selected)
+    } else {
+        None
+    };
 
     // JNI captured an earlier generation before taking ENGINE's lock. Re-read
     // the authoritative atomic Java generation before any worker can bind;
@@ -154,9 +187,14 @@ fn spawn_runtime(
     let mut initial_status = NativeSnapshot::preparing();
     initial_status.session_congestion_control = Some(profile.congestion_control);
     initial_status.data_plane = Some(profile.data_plane);
+    initial_status.ads_rule_revision = geo_policy.ads_revision().unwrap_or_default().to_owned();
+    if profile.routing.ads_enabled && initial_status.ads_rule_revision.is_empty() {
+        initial_status.warning = Some("ADS_UNAVAILABLE".into());
+    }
     let status = Arc::new(Mutex::new(initial_status));
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+    let thread_deadline = connection_deadline.clone();
     let thread_cancel = cancellation.clone();
     let thread_status = Arc::clone(&status);
     let handle_protector = Arc::clone(&protector);
@@ -185,11 +223,15 @@ fn spawn_runtime(
                 tls_identity,
                 protector,
                 geo_policy,
+                selected_gate,
+                geo_cache_dir,
                 pin_refresher,
                 thread_cancel,
                 thread_status,
                 started_tx,
                 command_rx,
+                thread_deadline,
+                timeline_generation,
             ));
         });
     let thread = match thread {
@@ -201,17 +243,25 @@ fn spawn_runtime(
         status: Arc::clone(&status),
         protector: handle_protector,
         commands: command_tx,
+        connection_deadline: connection_deadline.clone(),
         thread: Arc::new(Mutex::new(Some(thread))),
     });
     drop(slot);
 
-    let result = match started_rx.recv_timeout(Duration::from_secs(30)) {
+    let wait = connection_deadline
+        .lock()
+        .ok()
+        .and_then(|value| *value)
+        .map_or(Duration::from_secs(195), |deadline| {
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(15)
+        });
+    let result = match started_rx.recv_timeout(wait) {
         Ok(result) => result,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             set_error_with_code(
                 &status,
                 "ANDROID_START_TIMEOUT",
-                "The Android native runtime did not start within 30 seconds.".to_owned(),
+                "The Android native runtime did not start within its connection budget.".to_owned(),
             );
             START_TRANSPORT_FAILURE
         }
@@ -233,9 +283,6 @@ fn spawn_runtime(
 }
 
 fn load_geo_direct_policy(profile: &Profile, cache_dir: &Path) -> Result<GeoDirectPolicy, String> {
-    if profile.geo_direct_countries.is_empty() {
-        return Ok(GeoDirectPolicy::disabled());
-    }
     let countries = match profile
         .geo_direct_countries
         .iter()
@@ -248,7 +295,10 @@ fn load_geo_direct_policy(profile: &Profile, cache_dir: &Path) -> Result<GeoDire
         }
     };
     match GeoDirectPolicy::load(cache_dir, countries) {
-        Ok(policy) => Ok(policy),
+        Ok(policy) => policy
+            .with_custom_rules(profile)
+            .map(|policy| policy.with_ads(cache_dir))
+            .map_err(|error| error.to_string()),
         Err(error) => Err(format!("Android GEO cache could not be loaded: {error}")),
     }
 }
@@ -333,6 +383,7 @@ pub(super) fn notify_network_changed(generation: u64) {
     };
     if let Some(handle) = slot.as_ref() {
         super::publish_network_generation(&handle.protector.network_generation, generation);
+        handle.protector.refresh_recovery_network();
     }
 }
 
@@ -350,8 +401,10 @@ pub(super) fn snapshot() -> NativeSnapshot {
 }
 
 pub(super) fn reconfigure(profile: Profile) -> i32 {
+    let deadline = Instant::now() + usque_core::endpoint_connection_budget(&profile);
     send_command(|reply, cancelled| RuntimeCommand::Reconfigure {
         profile,
+        deadline,
         reply,
         cancelled,
     })
@@ -380,30 +433,45 @@ pub(super) fn detach_tun() -> i32 {
     send_command(|reply, cancelled| RuntimeCommand::DetachTun { reply, cancelled })
 }
 
+pub(super) fn reject_final_network() -> i32 {
+    send_command(|reply, cancelled| RuntimeCommand::RejectFinalNetwork { reply, cancelled })
+}
+
 fn send_command(
     build: impl FnOnce(std::sync::mpsc::SyncSender<i32>, Arc<AtomicBool>) -> RuntimeCommand,
 ) -> i32 {
     let Some(engine) = ENGINE.get() else {
         return RECONFIGURE_NOT_RUNNING;
     };
-    let commands = {
+    let (commands, connection_deadline) = {
         let Ok(slot) = engine.lock() else {
             return START_PLATFORM_FAILURE;
         };
         let Some(handle) = slot.as_ref() else {
             return RECONFIGURE_NOT_RUNNING;
         };
-        handle.commands.clone()
+        (handle.commands.clone(), handle.connection_deadline.clone())
     };
     let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
     let cancelled = Arc::new(AtomicBool::new(false));
-    if commands
-        .send(build(reply_tx, Arc::clone(&cancelled)))
-        .is_err()
-    {
+    let command = build(reply_tx, Arc::clone(&cancelled));
+    let wait = match &command {
+        RuntimeCommand::Reconfigure { deadline, .. } => {
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(15)
+        }
+        RuntimeCommand::AttachTun { .. } => connection_deadline
+            .lock()
+            .ok()
+            .and_then(|value| *value)
+            .map_or(Duration::from_secs(30), |deadline| {
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(15)
+            }),
+        _ => Duration::from_secs(30),
+    };
+    if commands.send(command).is_err() {
         return RECONFIGURE_NOT_RUNNING;
     }
-    super::wait_jni_command_reply(reply_rx, &cancelled, Duration::from_secs(30))
+    super::wait_jni_command_reply(reply_rx, &cancelled, wait)
 }
 
 fn clear_last_start_error() {
@@ -435,11 +503,18 @@ async fn run(
     identity: MasqueTlsIdentity,
     protector: Arc<dyn SocketProtector>,
     geo_policy: Arc<GeoDirectPolicy>,
+    selected_gate: Option<(
+        usque_core::vpngate::ServerSummary,
+        usque_core::vpngate::PreparedProfile,
+    )>,
+    cache_dir: PathBuf,
     pin_refresher: Arc<dyn EndpointPinRefresher>,
     cancellation: CancellationToken,
     status: Arc<Mutex<NativeSnapshot>>,
     started: std::sync::mpsc::SyncSender<i32>,
     commands: tokio::sync::mpsc::UnboundedReceiver<RuntimeCommand>,
+    connection_deadline: Arc<Mutex<Option<Instant>>>,
+    timeline_generation: u64,
 ) {
     let tun = match tun {
         Some(fd) => match AsyncFd::new(TunFd(fd)) {
@@ -456,14 +531,51 @@ async fn run(
         },
         None => None,
     };
+    let (gate_tx, mut gate_rx) =
+        tokio::sync::watch::channel(usque_core::vpngate::GateStatus::default());
+    struct ClearNetworks;
+    impl Drop for ClearNetworks {
+        fn drop(&mut self) {
+            if let Ok(mut networks) = NETWORKS.lock() {
+                *networks = None;
+            }
+        }
+    }
+    let _clear_networks = ClearNetworks;
+    let gate_status = Arc::clone(&status);
+    let gate_cancel = cancellation.clone();
+    let _gate_watch = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = gate_cancel.cancelled() => break,
+                changed = gate_rx.changed() => {
+                    if changed.is_err() { break; }
+                    if let Ok(mut snapshot) = gate_status.lock() {
+                        if gate_cancel.is_cancelled() { break; }
+                        snapshot.vpn_gate = Some(gate_rx.borrow_and_update().clone());
+                    }
+                }
+            }
+        }
+    }));
     let mut tunnel = {
-        let startup = DataPlaneRuntime::start_with_geo_policy(
+        let startup = Box::pin(DataPlaneRuntime::start_with_vpngate(
             &profile,
             identity,
             protector,
             Some(pin_refresher),
             geo_policy,
-        );
+            usque_transport::VpnGateStart {
+                selected: selected_gate,
+                status: Some(gate_tx.clone()),
+                cancellation: cancellation.clone(),
+                deadline: connection_deadline
+                    .lock()
+                    .ok()
+                    .and_then(|value| *value)
+                    .map(tokio::time::Instant::from_std),
+            },
+        ));
         tokio::pin!(startup);
         let started_tunnel = tokio::select! {
             biased;
@@ -476,22 +588,46 @@ async fn run(
         match started_tunnel {
             Ok(tunnel) => tunnel,
             Err(error) => {
+                if let Ok(mut snapshot) = status.lock() {
+                    snapshot.vpn_gate = Some(gate_tx.borrow().clone());
+                }
                 set_transport_error(&status, &error);
                 let _ = started.send(START_TRANSPORT_FAILURE);
                 return;
             }
         }
     };
-    update_health(&status, tunnel.health());
+    if !profile.frontends.tunnel
+        && let Err(error) = tunnel.activate_final().await
+    {
+        set_runtime_transport_error(&status, &error, &tunnel);
+        tunnel.shutdown().await;
+        let _ = started.send(START_TRANSPORT_FAILURE);
+        return;
+    }
+    if !profile.frontends.tunnel
+        && let Ok(mut deadline) = connection_deadline.lock()
+    {
+        *deadline = None;
+    }
+    update_health(&status, &tunnel);
     update_frontends(&status, &tunnel);
     let _ = started.send(START_OK);
-    spawn_exit_probe(&status, &tunnel, &profile, tun.is_some());
+    let gate_context = GateContext {
+        cache_dir,
+        status: gate_tx,
+        snapshot: status.clone(),
+        cancellation: cancellation.clone(),
+        exit_probe: ExitProbeTask::default(),
+        connection_deadline,
+    };
+    spawn_exit_probe(&gate_context, &tunnel, &profile);
 
     let tun_io = if tun.is_some() {
         match tunnel.attach_tun() {
             Ok(tun_io) => Some(tun_io),
             Err(error) => {
-                set_transport_error_on_path(&status, &error, tunnel.path());
+                set_runtime_transport_error(&status, &error, &tunnel);
                 tunnel.shutdown().await;
                 return;
             }
@@ -499,37 +635,47 @@ async fn run(
     } else {
         None
     };
-    run_session(tun, tun_io, tunnel, profile, cancellation, status, commands).await;
+    run_session(
+        tun,
+        tun_io,
+        tunnel,
+        profile,
+        cancellation.clone(),
+        status.clone(),
+        commands,
+        gate_context,
+        timeline_generation,
+    )
+    .await;
 }
 
-fn spawn_exit_probe(
-    status: &Arc<Mutex<NativeSnapshot>>,
-    tunnel: &DataPlaneRuntime,
-    profile: &Profile,
-    has_tun: bool,
-) {
-    let probe = if has_tun {
-        IpSbProbe::new().ok()
-    } else {
-        let listener = tunnel
-            .listeners()
-            .iter()
-            .copied()
-            .find(|address| address.ip().is_loopback());
-        let listener_auth = profile.proxy.listener_credentials().ok().flatten();
-        listener.and_then(|listener| {
-            if profile.frontends.socks5 {
-                IpSbProbe::through_socks_with_auth(listener, listener_auth.as_ref()).ok()
-            } else if profile.frontends.http {
-                IpSbProbe::through_http_with_auth(listener, listener_auth.as_ref()).ok()
-            } else {
-                None
-            }
-        })
-    };
-    if let Some(probe) = probe {
-        tokio::spawn(populate_exit(Arc::clone(status), probe));
+fn spawn_exit_probe(context: &GateContext, tunnel: &DataPlaneRuntime, profile: &Profile) {
+    let cancellation = context.exit_probe.begin(&context.cancellation);
+    if profile.chain_enabled() && !matches!(tunnel.health(), RuntimeHealth::Connected { .. }) {
+        return;
     }
+    // Keep both WARP and Gate diagnostics inside the selected final session.
+    // OS-routed sockets can observe the physical exit during a TUN handoff;
+    // local frontend listeners can also apply explicit direct-routing rules.
+    let network = tunnel.internal_network();
+    let status = Arc::clone(&context.snapshot);
+    let gate_generation = profile
+        .chain_enabled()
+        .then(|| tunnel.gate_status().generation);
+    tokio::spawn(async move {
+        if let Some(Ok(exit)) = run_probe(&cancellation, network.probe_exit()).await
+            && let Ok(mut snapshot) = status.lock()
+            && !cancellation.is_cancelled()
+            && gate_generation.is_none_or(|generation| {
+                snapshot.vpn_gate.as_ref().is_some_and(|gate| {
+                    gate.generation == generation
+                        && gate.stage == usque_core::vpngate::GateStage::Connected
+                })
+            })
+        {
+            apply_exit(&mut snapshot, exit);
+        }
+    });
 }
 
 type OwnedSessionDataEvent = SessionDataEvent<
@@ -538,6 +684,15 @@ type OwnedSessionDataEvent = SessionDataEvent<
     Result<(), TransportError>,
     io::Result<()>,
 >;
+
+struct GateContext {
+    cache_dir: PathBuf,
+    status: tokio::sync::watch::Sender<usque_core::vpngate::GateStatus>,
+    snapshot: Arc<Mutex<NativeSnapshot>>,
+    cancellation: CancellationToken,
+    exit_probe: ExitProbeTask,
+    connection_deadline: Arc<Mutex<Option<Instant>>>,
+}
 
 struct PendingPacketIo<'a, F> {
     send: std::pin::Pin<&'a mut Option<F>>,
@@ -610,6 +765,8 @@ async fn run_session(
     cancellation: CancellationToken,
     status: Arc<Mutex<NativeSnapshot>>,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<RuntimeCommand>,
+    gate_context: GateContext,
+    timeline_generation: u64,
 ) {
     let mut packet_slab = TunReadSlab::new();
     let mut ticker = interval(Duration::from_secs(1));
@@ -630,8 +787,8 @@ async fn run_session(
             _ = cancellation.cancelled() => break,
             command = commands.recv() => {
                 let Some(command) = command else { break; };
-                if matches!(&command, RuntimeCommand::AttachTun { .. } | RuntimeCommand::DetachTun { .. })
-                    || matches!(&command, RuntimeCommand::Reconfigure { profile: next, .. } if next.frontends.tunnel != profile.frontends.tunnel)
+                if matches!(&command, RuntimeCommand::AttachTun { .. } | RuntimeCommand::DetachTun { .. } | RuntimeCommand::RejectFinalNetwork { .. })
+                    || matches!(&command, RuntimeCommand::Reconfigure { profile: next, .. } if next.frontends.tunnel != profile.frontends.tunnel || (next.vpn_gate != profile.vpn_gate || next.chain_exit != profile.chain_exit))
                 {
                     pending_send.set(None);
                     pending_write = None;
@@ -643,9 +800,14 @@ async fn run_session(
                     &mut profile,
                     &mut tun,
                     &mut tun_io,
-                    &status,
+                    &gate_context,
                 )
                 .await;
+                if tunnel.gate_status().stage == usque_core::vpngate::GateStage::Error
+                    || (profile.chain_enabled() && status.lock().is_ok_and(|s| s.phase == "error"))
+                {
+                    break;
+                }
                 write_observer = tun_io.as_ref().and_then(TunPacketIo::write_observer);
             }
             event = next_owned_session_data(
@@ -659,7 +821,7 @@ async fn run_session(
                 SessionDataEvent::Sent(result) => {
                     pending_send.set(None);
                     if let Err(error) = result {
-                        set_transport_error_on_path(&status, &error, tunnel.path());
+                        set_runtime_transport_error(&status, &error, &tunnel);
                         break;
                     }
                 }
@@ -696,7 +858,7 @@ async fn run_session(
                             break;
                         }
                     };
-                    pending_send.set(Some(io.start_send_owned_packet(packet)));
+                    pending_send.set(Some(io.start_send_mut_packet(packet)));
                 }
                 SessionDataEvent::TunnelReceive(received) => {
                     let Some(received) = received else { continue; };
@@ -707,15 +869,19 @@ async fn run_session(
                             write_sample = write_observer.as_ref().map(|o| o.begin());
                         }
                         Err(error) => {
-                            set_transport_error_on_path(&status, &error, tunnel.path());
+                            set_runtime_transport_error(&status, &error, &tunnel);
                             break;
                         }
                     }
                 }
                 SessionDataEvent::Tick => {
-                    super::connection_timeline::publish(tunnel.connection_timeline());
-                    update_health(&status, tunnel.health());
+                    let quality = tunnel.subscribe_network_quality().borrow().clone();
+                    super::connection_timeline::publish_for(timeline_generation, tunnel.connection_timeline(), quality.connection_id.map(|id| id.0), false);
+                    update_health(&status, &tunnel);
                     update_frontends(&status, &tunnel);
+                    if matches!(tunnel.health(), RuntimeHealth::Failed { .. }) {
+                        break;
+                    }
                     let now = Instant::now();
                     let current = tunnel.statistics();
                     let seconds = now.duration_since(last_sample).as_secs_f64().max(0.001);
@@ -736,61 +902,70 @@ async fn run_session(
                 }
             }
         }
-        // L4 download only: drain already-ready packets without awaiting one
-        // direction. One existing pending slot owns any WouldBlock remainder.
-        if let (Some(tun), Some(io), Some(observer)) =
-            (tun.as_ref(), tun_io.as_mut(), write_observer.as_ref())
-        {
+        // Drain only ready packets; the existing pending slot retains a
+        // WouldBlock/budget remainder without combining distinct IP packets.
+        if let (Some(tun), Some(io)) = (tun.as_ref(), tun_io.as_mut()) {
+            use crate::session_pump::{
+                ReadyDrainError, ReadyDrainStop, ReadyWriteEvent, drain_ready_packets,
+            };
             let mut batch = crate::session_pump::ReadyBatch::new();
             if let Some(bytes) = completed_write {
                 batch.completed(bytes);
             }
-            loop {
-                if cancellation.is_cancelled() {
-                    break;
-                }
-                if pending_write.is_none() {
-                    match io.try_receive_packet() {
-                        Ok(Some(packet)) => {
-                            pending_write = Some(packet);
-                            write_sample = Some(observer.begin());
-                        }
-                        Ok(None) => break,
-                        Err(error) => {
-                            set_transport_error_on_path(&status, &error, tunnel.path());
-                            cancellation.cancel();
-                            break;
-                        }
-                    }
-                }
-                let packet = pending_write.as_ref().expect("pending packet");
-                if !batch.allows(packet.len()) {
-                    tokio::task::yield_now().await;
-                    break;
-                }
-                let result = tun.try_io(tokio::io::Interest::WRITABLE, |inner| {
-                    write_packet_once(inner, packet, Some(observer))
-                });
-                match result {
-                    Ok(()) => {
-                        batch.completed(packet.len());
-                        pending_write = None;
-                        if let Some(sample) = write_sample.take() {
+            let sample = &mut write_sample;
+            let observer = write_observer.as_ref().map(|observer| {
+                move |event| match event {
+                    ReadyWriteEvent::Started => *sample = Some(observer.begin()),
+                    ReadyWriteEvent::Finished => {
+                        if let Some(sample) = sample.take() {
                             observer.finish(sample);
                         }
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        set_error(&status, format!("write Android TUN: {error}"));
-                        cancellation.cancel();
-                        break;
-                    }
+                }
+            });
+            let result = drain_ready_packets(
+                &mut pending_write,
+                &mut batch,
+                || cancellation.is_cancelled(),
+                || io.try_receive_packet(),
+                |packet| {
+                    tun.try_io(tokio::io::Interest::WRITABLE, |inner| {
+                        write_packet_once(inner, packet, write_observer.as_ref())
+                    })
+                },
+                observer,
+            );
+            match result {
+                Ok(ReadyDrainStop::Budget) => tokio::task::yield_now().await,
+                Ok(_) => {}
+                Err(ReadyDrainError::Receive(error)) => {
+                    set_runtime_transport_error(&status, &error, &tunnel);
+                    cancellation.cancel();
+                }
+                Err(ReadyDrainError::Write(error)) => {
+                    set_error(&status, format!("write Android TUN: {error}"));
+                    cancellation.cancel();
                 }
             }
         }
     }
-    super::connection_timeline::publish(tunnel.connection_timeline());
+    let connection_id = tunnel
+        .subscribe_network_quality()
+        .borrow()
+        .connection_id
+        .map(|id| id.0);
+    super::connection_timeline::publish_for(
+        timeline_generation,
+        tunnel.connection_timeline(),
+        connection_id,
+        true,
+    );
+    gate_context.exit_probe.cancel();
+    cancellation.cancel();
     tunnel.cancel_immediately();
+    if let Ok(mut snapshot) = status.lock() {
+        snapshot.finish_runtime(tunnel.gate_status());
+    }
     pending_send.set(None);
     drop(pending_write.take());
     drop(tun_io.take());
@@ -798,6 +973,12 @@ async fn run_session(
     // own FD for fail-closed recovery unless the user explicitly disconnected.
     drop(tun.take());
     tunnel.shutdown().await;
+    super::connection_timeline::publish_for(
+        timeline_generation,
+        tunnel.connection_timeline(),
+        connection_id,
+        true,
+    );
 }
 
 async fn handle_runtime_command(
@@ -806,11 +987,25 @@ async fn handle_runtime_command(
     profile: &mut Profile,
     tun: &mut Option<AsyncFd<TunFd>>,
     tun_io: &mut Option<TunPacketIo>,
-    status: &Arc<Mutex<NativeSnapshot>>,
+    gate_context: &GateContext,
 ) {
+    let status = &gate_context.snapshot;
     match command {
+        RuntimeCommand::RejectFinalNetwork { reply, cancelled } => {
+            if !super::jni_command_abandoned(&cancelled) && profile.chain_enabled() {
+                gate_context.exit_probe.cancel();
+                detach_tun_locked(tunnel, tun, tun_io);
+                tunnel
+                    .fail_gate(usque_core::vpngate::GateFailure::Configuration)
+                    .await;
+                update_health(status, tunnel);
+                update_frontends(status, tunnel);
+            }
+            let _ = reply.send(RECONFIGURE_OK);
+        }
         RuntimeCommand::Reconfigure {
             profile: mut next,
+            deadline,
             reply,
             cancelled,
         } => {
@@ -820,34 +1015,129 @@ async fn handle_runtime_command(
                 let _ = reply.send(START_PLATFORM_FAILURE);
                 return;
             }
-            if next.proxy.listener_auth_username().is_some() && next.proxy.auth_password.is_none() {
-                next.proxy.auth_password = profile.proxy.auth_password.clone();
+            if next.proxy.listener_credentials().is_err() {
+                let _ = reply.send(START_INVALID_PROFILE);
+                return;
             }
             let code = match classify_reconfigure(profile, &next) {
+                ReconfigureClass::HotTrafficPolicy => {
+                    *profile = next;
+                    RECONFIGURE_OK
+                }
                 ReconfigureClass::PersistOnly => RECONFIGURE_OK,
                 ReconfigureClass::Reject => START_INVALID_PROFILE,
                 ReconfigureClass::ColdReconnect => RECONFIGURE_NEED_COLD,
+                ReconfigureClass::HotVpnGate => {
+                    if let Ok(mut saved) = gate_context.connection_deadline.lock() {
+                        *saved = Some(deadline);
+                    }
+                    gate_context.exit_probe.cancel();
+                    tunnel.quiesce_final();
+                    detach_tun_locked(tunnel, tun, tun_io);
+                    if let Ok(mut snapshot) = status.lock() {
+                        snapshot.phase = "reconnecting".into();
+                        snapshot.exit_ipv4 = None;
+                        snapshot.exit_ipv6 = None;
+                        snapshot.exit_city = None;
+                        snapshot.exit_country = None;
+                        snapshot.exit_country_code = None;
+                        snapshot.exit_flag_svg = None;
+                    }
+                    let selected = super::chain_exit::prepare(&gate_context.cache_dir, &next)
+                        .ok()
+                        .flatten();
+                    let policy = load_geo_direct_policy(&next, &gate_context.cache_dir);
+                    let ads_revision = policy
+                        .as_ref()
+                        .ok()
+                        .and_then(|policy| policy.ads_revision())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let result = match (selected, policy) {
+                        (selected, Ok(policy)) if selected.is_some() || !next.chain_enabled() => {
+                            tunnel
+                                .replace_gate_before(
+                                    &next,
+                                    selected,
+                                    Arc::new(policy),
+                                    gate_context.status.clone(),
+                                    &gate_context.cancellation,
+                                    tokio::time::Instant::from_std(deadline),
+                                )
+                                .await
+                        }
+                        _ => Err(TransportError::VpnGate(
+                            usque_core::vpngate::GateFailure::Configuration,
+                        )),
+                    };
+                    if result.is_ok()
+                        && let Ok(mut snapshot) = status.lock()
+                    {
+                        snapshot.ads_rule_revision = ads_revision;
+                    }
+                    *profile = next;
+                    if super::jni_command_abandoned(&cancelled) {
+                        tunnel.cancel_immediately();
+                        START_PLATFORM_FAILURE
+                    } else if let Err(error) = result {
+                        let reason = match &error {
+                            TransportError::VpnGate(reason) => *reason,
+                            _ => usque_core::vpngate::GateFailure::Transport,
+                        };
+                        tunnel.fail_gate(reason).await;
+                        set_runtime_transport_error(status, &error, tunnel);
+                        START_TRANSPORT_FAILURE
+                    } else {
+                        update_frontends(status, tunnel);
+                        if profile.frontends.tunnel {
+                            RECONFIGURE_NEED_ATTACH
+                        } else {
+                            match tunnel.activate_final().await {
+                                Ok(()) => {
+                                    if let Ok(mut deadline) =
+                                        gate_context.connection_deadline.lock()
+                                    {
+                                        *deadline = None;
+                                    }
+                                    update_frontends(status, tunnel);
+                                    spawn_exit_probe(gate_context, tunnel, profile);
+                                    RECONFIGURE_OK
+                                }
+                                Err(error) => {
+                                    set_runtime_transport_error(status, &error, tunnel);
+                                    START_TRANSPORT_FAILURE
+                                }
+                            }
+                        }
+                    }
+                }
                 ReconfigureClass::HotSystemProxy => {
                     *profile = next;
                     RECONFIGURE_OK
                 }
-                ReconfigureClass::HotFrontends => match tunnel.reconfigure_frontends(&next).await {
-                    Ok(()) => {
-                        *profile = next;
-                        update_frontends(status, tunnel);
-                        RECONFIGURE_OK
+                ReconfigureClass::HotFrontends => {
+                    gate_context.exit_probe.cancel();
+                    match tunnel.reconfigure_frontends(&next).await {
+                        Ok(()) => {
+                            *profile = next;
+                            update_frontends(status, tunnel);
+                            spawn_exit_probe(gate_context, tunnel, profile);
+                            RECONFIGURE_OK
+                        }
+                        Err(error) => {
+                            set_runtime_transport_error(status, &error, tunnel);
+                            START_TRANSPORT_FAILURE
+                        }
                     }
-                    Err(error) => {
-                        set_transport_error_on_path(status, &error, tunnel.path());
-                        START_TRANSPORT_FAILURE
-                    }
-                },
+                }
                 ReconfigureClass::HotTunnelAttach => {
                     if next.frontends.tunnel && tun.is_none() {
                         RECONFIGURE_NEED_ATTACH
                     } else if !next.frontends.tunnel && tun.is_some() {
+                        gate_context.exit_probe.cancel();
                         detach_tun_locked(tunnel, tun, tun_io);
                         *profile = next;
+                        spawn_exit_probe(gate_context, tunnel, profile);
                         RECONFIGURE_OK
                     } else {
                         *profile = next;
@@ -855,6 +1145,9 @@ async fn handle_runtime_command(
                     }
                 }
             };
+            if code == RECONFIGURE_OK {
+                tunnel.update_traffic_policy(profile.disable_quic);
+            }
             let _ = reply.send(code);
         }
         RuntimeCommand::AttachTun {
@@ -872,6 +1165,7 @@ async fn handle_runtime_command(
                 let _ = reply.send(START_ALREADY_RUNNING);
                 return;
             }
+            gate_context.exit_probe.cancel();
             if let Err(error) = set_nonblocking(&owned) {
                 set_error(
                     status,
@@ -891,17 +1185,18 @@ async fn handle_runtime_command(
             let io = match tunnel.attach_tun() {
                 Ok(io) => io,
                 Err(error) => {
-                    set_transport_error_on_path(status, &error, tunnel.path());
+                    set_runtime_transport_error(status, &error, tunnel);
                     let _ = reply.send(START_TRANSPORT_FAILURE);
                     return;
                 }
             };
-            if next.proxy.listener_auth_username().is_some() && next.proxy.auth_password.is_none() {
-                next.proxy.auth_password = profile.proxy.auth_password.clone();
+            if next.proxy.listener_credentials().is_err() {
+                let _ = reply.send(START_INVALID_PROFILE);
+                return;
             }
             if let Err(error) = tunnel.reconfigure_frontends(&next).await {
                 tunnel.detach_tun();
-                set_transport_error_on_path(status, &error, tunnel.path());
+                set_runtime_transport_error(status, &error, tunnel);
                 let _ = reply.send(START_TRANSPORT_FAILURE);
                 return;
             }
@@ -910,20 +1205,32 @@ async fn handle_runtime_command(
                 let _ = reply.send(START_PLATFORM_FAILURE);
                 return;
             }
+            tunnel.update_traffic_policy(next.disable_quic);
             *tun = Some(attached);
             *tun_io = Some(io);
+            if let Err(error) = tunnel.activate_final().await {
+                detach_tun_locked(tunnel, tun, tun_io);
+                set_runtime_transport_error(status, &error, tunnel);
+                let _ = reply.send(START_TRANSPORT_FAILURE);
+                return;
+            }
+            if let Ok(mut deadline) = gate_context.connection_deadline.lock() {
+                *deadline = None;
+            }
             if super::jni_command_abandoned(&cancelled) || reply.send(RECONFIGURE_OK).is_err() {
                 detach_tun_locked(tunnel, tun, tun_io);
                 return;
             }
             *profile = next;
             update_frontends(status, tunnel);
+            spawn_exit_probe(gate_context, tunnel, profile);
         }
         RuntimeCommand::DetachTun { reply, cancelled } => {
             if super::jni_command_abandoned(&cancelled) {
                 let _ = reply.send(START_PLATFORM_FAILURE);
                 return;
             }
+            gate_context.exit_probe.cancel();
             detach_tun_locked(tunnel, tun, tun_io);
             profile.frontends.tunnel = false;
             let _ = reply.send(RECONFIGURE_OK);
@@ -941,25 +1248,22 @@ fn detach_tun_locked(
     *tun = None;
 }
 
-async fn populate_exit(status: Arc<Mutex<NativeSnapshot>>, probe: IpSbProbe) {
-    let Ok(exit) = probe.probe().await else {
-        return;
-    };
+fn apply_exit(snapshot: &mut NativeSnapshot, exit: usque_core::ExitInfo) {
     let location = exit.primary_location().cloned();
     let flag_svg = location.as_ref().and_then(|value| value.flag_svg.clone());
-    if let Ok(mut snapshot) = status.lock() {
-        snapshot.exit_ipv4 = exit.ipv4.map(|address| address.to_string());
-        snapshot.exit_ipv6 = exit.ipv6.map(|address| address.to_string());
-        snapshot.exit_city = location.as_ref().and_then(|value| value.city.clone());
-        snapshot.exit_country = location.as_ref().and_then(|value| value.country.clone());
-        snapshot.exit_country_code = location
-            .as_ref()
-            .and_then(|value| value.country_code.clone());
-        snapshot.exit_flag_svg = flag_svg;
-    }
+    snapshot.exit_ipv4 = exit.ipv4.map(|address| address.to_string());
+    snapshot.exit_ipv6 = exit.ipv6.map(|address| address.to_string());
+    snapshot.exit_city = location.as_ref().and_then(|value| value.city.clone());
+    snapshot.exit_country = location.as_ref().and_then(|value| value.country.clone());
+    snapshot.exit_country_code = location
+        .as_ref()
+        .and_then(|value| value.country_code.clone());
+    snapshot.exit_flag_svg = flag_svg;
 }
 
-fn update_health(status: &Arc<Mutex<NativeSnapshot>>, health: RuntimeHealth) {
+fn update_health(status: &Arc<Mutex<NativeSnapshot>>, tunnel: &DataPlaneRuntime) {
+    let health = tunnel.health();
+    let gate = tunnel.gate_status();
     let Ok(mut snapshot) = status.lock() else {
         return;
     };
@@ -983,9 +1287,13 @@ fn update_health(status: &Arc<Mutex<NativeSnapshot>>, health: RuntimeHealth) {
         RuntimeHealth::Connected { path, .. } => {
             snapshot.tunnel_ipv4_available = path.ipv4_available;
             snapshot.tunnel_ipv6_available = path.ipv6_available;
-            let dual_stack = path.ipv4_available && path.ipv6_available;
-            snapshot.phase = if dual_stack { "connected" } else { "degraded" }.to_owned();
-            snapshot.warning = (!dual_stack).then(|| {
+            let connected = usque_core::ConnectionPhase::connected_tunnel(
+                path.ipv4_available,
+                path.ipv6_available,
+                Some(&gate),
+            ) == usque_core::ConnectionPhase::Connected;
+            snapshot.phase = if connected { "connected" } else { "degraded" }.to_owned();
+            snapshot.warning = (!connected).then(|| {
                 if path.ipv4_available {
                     "The CONNECT-IP peer is not currently routing IPv6; IPv4 remains protected."
                 } else {
@@ -1020,12 +1328,18 @@ fn update_health(status: &Arc<Mutex<NativeSnapshot>>, health: RuntimeHealth) {
 }
 
 fn update_frontends(status: &Arc<Mutex<NativeSnapshot>>, tunnel: &DataPlaneRuntime) {
+    if let Ok(mut networks) = NETWORKS.lock() {
+        *networks = Some((tunnel.internal_network(), tunnel.warp_internal_network()));
+    }
     let Ok(mut snapshot) = status.lock() else {
         return;
     };
     snapshot.active_listeners = tunnel.listeners().iter().map(ToString::to_string).collect();
     snapshot.data_plane = Some(tunnel.mode());
     snapshot.l4 = tunnel.l4_snapshot();
+    let gate = tunnel.gate_status();
+    snapshot.final_network = gate.network.clone();
+    snapshot.vpn_gate = Some(gate);
     snapshot.active_frontends.clear();
     if !tunnel.socks5_listeners().is_empty() {
         snapshot.active_frontends.push("socks5".to_owned());
@@ -1043,12 +1357,12 @@ fn set_transport_error(status: &Arc<Mutex<NativeSnapshot>>, error: &TransportErr
     set_transport_failure(status, error, android_transport_failure(error, None));
 }
 
-fn set_transport_error_on_path(
+fn set_runtime_transport_error(
     status: &Arc<Mutex<NativeSnapshot>>,
     error: &TransportError,
-    path: RuntimePath,
+    tunnel: &DataPlaneRuntime,
 ) {
-    set_transport_failure(status, error, android_transport_failure(error, Some(path)));
+    set_transport_failure(status, error, tunnel.transport_failure(error));
 }
 
 fn set_transport_failure(

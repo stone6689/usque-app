@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::error::Error as StdError;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use ts_netstack_smoltcp::CreateSocket;
 use usque_core::{OperatingMode, Profile, ProxyAuthCredentials};
 
-use crate::dns::Resolver;
+use crate::dns::{CandidateResolution, Resolver};
 use crate::geo_direct::{GeoDirectPolicy, GeoTarget, RoutedTcpStream, connect_routed};
 use crate::h2::{MasqueTlsIdentity, TransportError};
 use crate::netstack::{
@@ -40,6 +40,10 @@ use crate::netstack::{
 use crate::pin_refresh::EndpointPinRefresher;
 use crate::socket::{SocketProtector, noop_socket_protector};
 
+#[cfg(test)]
+#[path = "http_proxy/ipv6_tests.rs"]
+mod ipv6_tests;
+
 /// Hyper HTTP/1 `max_buf_size` is both the connection I/O window and the
 /// unparsed-header cap. Independent of the CONNECT/SOCKS5 relay buffer so
 /// relay sizing cannot silently raise the header budget.
@@ -47,7 +51,6 @@ const HTTP_IO_BUFFER_SIZE: usize = 128 * 1024;
 const MAX_HEADERS: usize = 128;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_TARGET_ADDRESSES: usize = 16;
 const MAX_SESSION_CONNECTIONS: usize = 32;
 const MAX_IDLE_PER_AUTHORITY: usize = 2;
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -208,7 +211,7 @@ impl HttpProxyFrontend {
                 crate::relay::RELAY_BUFFER_SIZE
             },
             admission: services.admission,
-            resolver: services.resolver,
+            resolver: services.resolver.with_routing(services.geo_policy.clone()),
             dialer: services.dialer,
             edge_resolved: profile.proxy.dns_mode == usque_core::ProxyDnsMode::EdgeResolved,
             protector: services.protector,
@@ -389,7 +392,8 @@ async fn handle_request(
         return Ok(response);
     }
 
-    if matches!(&*context.health.borrow(), RuntimeHealth::Failed { .. })
+    if !context.dialer.is_ready()
+        || matches!(&*context.health.borrow(), RuntimeHealth::Failed { .. })
         || (!context.l4 && !matches!(&*context.health.borrow(), RuntimeHealth::Connected { .. }))
     {
         return Ok(error_response(
@@ -451,6 +455,9 @@ async fn handle_connect(
     };
     let remote = match connect_remote(&context, &destination.host, destination.port).await {
         Ok(remote) => remote,
+        Err(RemoteConnectError::Rejected) => {
+            return error_response(StatusCode::FORBIDDEN, "routing_rejected", false);
+        }
         Err(RemoteConnectError::BudgetExhausted) => {
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -508,6 +515,11 @@ async fn handle_forward(
         Ok(destination) => destination,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message, false),
     };
+    if GeoTarget::from_host(&destination.host).route(&pool.context.geo_policy)
+        == crate::geo_direct::GeoRoute::Reject
+    {
+        return error_response(StatusCode::FORBIDDEN, "routing_rejected", false);
+    }
     if let Err(message) = prepare_forward_request(&mut request, &destination) {
         return error_response(StatusCode::BAD_REQUEST, &message, false);
     }
@@ -648,6 +660,12 @@ impl SessionPool {
         authority: &str,
         force_new: bool,
     ) -> Result<(PoolEntry, bool), PoolError> {
+        let destination = parse_destination(authority, 80).map_err(PoolError::Upstream)?;
+        if GeoTarget::from_host(&destination.host).route(&self.context.geo_policy)
+            == crate::geo_direct::GeoRoute::Reject
+        {
+            return Err(PoolError::Rejected);
+        }
         if !force_new {
             let mut idle = self.idle.lock().await;
             prune_idle(&mut idle);
@@ -678,6 +696,7 @@ impl SessionPool {
         let remote = connect_remote(&self.context, &destination.host, destination.port)
             .await
             .map_err(|error| match error {
+                RemoteConnectError::Rejected => PoolError::Rejected,
                 RemoteConnectError::BudgetExhausted => PoolError::Busy,
                 RemoteConnectError::Failed(message) => PoolError::Upstream(message),
             })?;
@@ -733,6 +752,7 @@ fn prune_idle(idle: &mut Vec<PoolEntry>) {
 
 #[derive(Debug)]
 enum PoolError {
+    Rejected,
     Busy,
     StaleReused,
     Upstream(String),
@@ -740,6 +760,7 @@ enum PoolError {
 
 fn pool_error_response(error: PoolError) -> Response<ProxyBody> {
     match error {
+        PoolError::Rejected => error_response(StatusCode::FORBIDDEN, "routing_rejected", false),
         PoolError::Busy => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "the proxy connection memory budget is temporarily exhausted",
@@ -809,8 +830,23 @@ fn parse_destination(value: &str, default_port: u16) -> Result<Destination, Stri
     if port == 0 {
         return Err("proxy target port is zero".to_owned());
     }
+    // URI authorities retain IPv6 brackets, but IP parsing and both local and
+    // edge-resolved dialers require the literal without them. Keep the original
+    // authority for the upstream Host header and connection-pool key.
+    let host = authority.host();
+    let host = if let Some(literal) = host.strip_prefix('[') {
+        let literal = literal
+            .strip_suffix(']')
+            .ok_or_else(|| "invalid IPv6 proxy authority".to_owned())?;
+        literal
+            .parse::<Ipv6Addr>()
+            .map_err(|_| "invalid IPv6 proxy authority".to_owned())?;
+        literal
+    } else {
+        host
+    };
     Ok(Destination {
-        host: authority.host().to_owned(),
+        host: host.to_owned(),
         port,
         authority: authority.to_string(),
         origin_form: None,
@@ -861,6 +897,7 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 }
 
 enum RemoteConnectError {
+    Rejected,
     BudgetExhausted,
     Failed(String),
 }
@@ -889,9 +926,13 @@ async fn connect_remote_inner(
         &context.geo_policy,
         context.protector.as_ref(),
         Arc::clone(&context.counters),
-        (GeoTarget::from_host(host), port),
-        || RemoteConnectError::Failed("encrypted_direct_dns_failed".to_owned()),
+        (GeoTarget::from_host(host), port, Some(&context.resolver)),
+        (
+            || RemoteConnectError::Failed("encrypted_direct_dns_failed".to_owned()),
+            || RemoteConnectError::Rejected,
+        ),
         |resolved| async {
+            let deadline = tokio::time::Instant::now() + REMOTE_CONNECT_TIMEOUT;
             if resolved.is_none() && context.edge_resolved {
                 let target =
                     crate::tcp::TcpTarget::new(host, port).map_err(remote_connect_error)?;
@@ -899,26 +940,22 @@ async fn connect_remote_inner(
                     .dialer
                     .connect(
                         target,
-                        tokio::time::Instant::now() + REMOTE_CONNECT_TIMEOUT,
+                        deadline,
                         &context.cancellation,
                         crate::tcp::FlowClass::Business,
                     )
                     .await
                     .map_err(remote_connect_error);
             }
-            let addresses = if let Some(addresses) = resolved {
-                addresses
+            let resolution = if let Some(addresses) = resolved {
+                CandidateResolution::from_addresses(addresses)
             } else {
-                match host.parse::<IpAddr>() {
-                    Ok(address) => vec![address],
-                    Err(_) => context
-                        .resolver
-                        .resolve(host)
-                        .await
-                        .map_err(|error| RemoteConnectError::Failed(error.to_string()))?,
-                }
+                context
+                    .resolver
+                    .resolve_candidates(host, deadline)
+                    .map_err(|error| resolution_failure(error.to_string()))?
             };
-            connect_tunnel_remote(context, &addresses, port).await
+            connect_tunnel_remote(context, resolution, port, deadline).await
         },
     )
     .await
@@ -926,39 +963,38 @@ async fn connect_remote_inner(
 
 async fn connect_tunnel_remote(
     context: &HttpContext,
-    addresses: &[IpAddr],
+    resolution: CandidateResolution,
     port: u16,
+    deadline: tokio::time::Instant,
 ) -> Result<crate::tcp::TcpStream, RemoteConnectError> {
-    let deadline = tokio::time::Instant::now() + REMOTE_CONNECT_TIMEOUT;
-    let mut last = crate::tcp::DialError::Network;
-    for address in addresses.iter().take(MAX_TARGET_ADDRESSES) {
-        let target = crate::tcp::TcpTarget::address(SocketAddr::new(*address, port));
-        match context
-            .dialer
-            .connect(
-                target,
-                deadline,
-                &context.cancellation,
-                crate::tcp::FlowClass::Business,
-            )
-            .await
-        {
-            Ok(stream) => return Ok(stream),
-            Err(
-                error @ (crate::tcp::DialError::Budget
-                | crate::tcp::DialError::Cancelled
-                | crate::tcp::DialError::Rejected(401 | 403)),
-            ) => return Err(remote_connect_error(error)),
-            Err(error) => last = error,
+    crate::tcp_candidates::connect_candidates(
+        context.dialer.clone(),
+        resolution,
+        port,
+        deadline,
+        &context.cancellation,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::tcp_candidates::CandidateDialError::Resolve(error) => {
+            resolution_failure(error.to_string())
         }
+        crate::tcp_candidates::CandidateDialError::Dial(error) => remote_connect_error(error),
+    })
+}
+
+fn resolution_failure(message: String) -> RemoteConnectError {
+    if message.contains("routing_rejected") {
+        RemoteConnectError::Rejected
+    } else {
+        RemoteConnectError::Failed(message)
     }
-    Err(remote_connect_error(last))
 }
 
 fn remote_connect_error(error: crate::tcp::DialError) -> RemoteConnectError {
     match error {
         crate::tcp::DialError::Budget => RemoteConnectError::BudgetExhausted,
-        _ => RemoteConnectError::Failed(error.to_string()),
+        _ => resolution_failure(error.to_string()),
     }
 }
 
@@ -997,6 +1033,7 @@ fn full_body(bytes: Bytes) -> ProxyBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use ts_netstack_smoltcp::netcore::{Config, HasChannel, NetstackControl};
@@ -1162,6 +1199,96 @@ mod tests {
                 _tasks: tasks,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn allow_lan_http_forward_and_connect_attempt_protected_direct_egress() {
+        use crate::geo_direct::{LanProbeProtector, lan_test_policy};
+        for allow_lan in [false, true] {
+            let mut fixture = StackedProxy::new().await;
+            let protector = Arc::new(LanProbeProtector::default());
+            let context = Arc::get_mut(&mut fixture.context).unwrap();
+            context.geo_policy = Arc::new(lan_test_policy(allow_lan));
+            context.protector = protector.clone();
+            let origin = fixture.origin;
+            let upstream = tokio::spawn(async move {
+                let stream = origin.accept().await.unwrap();
+                hyper::server::conn::http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(|_request| async {
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let _stream = origin.accept().await.unwrap();
+            });
+            let frontend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = frontend.local_addr().unwrap();
+            let task = tokio::spawn(run_listener(frontend, fixture.context.clone()));
+            for request in [
+                b"GET http://10.0.0.2:8080/ HTTP/1.1\r\nHost: 10.0.0.2:8080\r\nConnection: close\r\n\r\n".as_slice(),
+                b"CONNECT 10.0.0.2:8080 HTTP/1.1\r\nHost: 10.0.0.2:8080\r\nConnection: close\r\n\r\n".as_slice(),
+            ] {
+                let mut client = TcpStream::connect(address).await.unwrap();
+                client.write_all(request).await.unwrap();
+                let mut response = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+                    .await.unwrap().unwrap();
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+            }
+            upstream.await.unwrap();
+            let expected = if allow_lan {
+                vec![
+                    (
+                        "10.0.0.2:8080".parse().unwrap(),
+                        crate::socket::DirectProtocol::Tcp
+                    );
+                    2
+                ]
+            } else {
+                vec![]
+            };
+            assert_eq!(*protector.attempts.lock().unwrap(), expected);
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_reject_returns_403_without_opening_or_admitting_an_upstream() {
+        let mut fixture = StackedProxy::new().await;
+        Arc::get_mut(&mut fixture.context).unwrap().geo_policy =
+            Arc::new(crate::geo_direct::routing_test_policy(&[(
+                "10.0.0.2",
+                usque_core::RoutingAction::Reject,
+            )]));
+        let frontend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = frontend.local_addr().unwrap();
+        let task = tokio::spawn(run_listener(frontend, fixture.context.clone()));
+        for request in [b"CONNECT 10.0.0.2:8080 HTTP/1.1\r\nHost: 10.0.0.2:8080\r\nConnection: close\r\n\r\n".as_slice(), b"GET http://10.0.0.2:8080/ HTTP/1.1\r\nHost: 10.0.0.2:8080\r\nConnection: close\r\n\r\n".as_slice()] {
+            let mut client = TcpStream::connect(address).await.unwrap();
+            client.write_all(request).await.unwrap();
+            let mut buffer = vec![0; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buffer)).await.unwrap().unwrap();
+            assert!(buffer[..n].starts_with(b"HTTP/1.1 403"));
+        }
+        let pool = SessionPool::new(fixture.context.clone());
+        assert!(matches!(
+            pool.acquire("10.0.0.2:8080", false).await,
+            Err(PoolError::Rejected)
+        ));
+        assert_eq!(
+            fixture.context.performance.misses.load(Ordering::Relaxed),
+            0
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), fixture.origin.accept())
+                .await
+                .is_err()
+        );
+        task.abort();
     }
 
     #[tokio::test]

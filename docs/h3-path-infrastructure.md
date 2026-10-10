@@ -36,8 +36,9 @@ remain connection-scoped; their origin is not guessed from the receive socket.
 Initial and candidate sockets use the target-aware
 `protect_for_target_generation` contract. The factory checks generation before
 creation, after platform protection, and immediately before returning. A stale
-result closes the unexposed socket and releases its lease; initial setup retries
-at most twice before returning `UnderlyingNetworkChanged` to the scheduler.
+result closes the unexposed socket and releases its lease; initial setup makes
+at most two attempts (one retry) before returning `UnderlyingNetworkChanged` to
+the scheduler.
 
 Android retains only the current and adjacent previous generation entries,
 including an explicit absent-network entry. Out-of-order records cannot bring
@@ -172,5 +173,5 @@ these tests calls native route/WFP mutation APIs on the workstation.
 
 Actual Android bind/protect instrumentation, device/service lifecycle,
 external leak observation, and controlled performance measurements require
-the protected environments from `AGENTS.md`. Without those environments they
+the protected environments from [Contributing](../CONTRIBUTING.md#development-machines). Without those environments they
 are `not_run`, not passes, and the infrastructure tests do not replace them.

@@ -6,6 +6,7 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../core/app_strings.dart';
+import '../core/user_facing_errors.dart';
 import '../models/app_models.dart';
 import '../services/engine_client.dart';
 import '../services/zero_trust_callback.dart';
@@ -124,6 +125,8 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
   bool _callbackReceived = false;
   bool? _reportedValidity;
   late int _seenZeroTrustTicket;
+  late Object _loginOwner;
+  int _inputGeneration = 0;
 
   AppStrings get _strings => widget.controller.strings;
 
@@ -136,6 +139,7 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
     _teamFocusNode = FocusNode()..addListener(_validateTeamAfterEditing);
     _callbackFocusNode = FocusNode();
     _seenZeroTrustTicket = widget.controller.zeroTrustCallbackTicket;
+    _loginOwner = widget.controller.createZeroTrustLoginOwner();
     widget.controller.addListener(_onControllerChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -149,8 +153,16 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
   @override
   void didUpdateWidget(covariant ZeroTrustEnrollmentEditor oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller ||
+        oldWidget.enabled != widget.enabled ||
+        oldWidget.initialTeam != widget.initialTeam) {
+      _inputGeneration++;
+    }
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller.removeListener(_onControllerChanged);
+      oldWidget.controller.releaseZeroTrustLoginOwner(_loginOwner);
+      _loginOwner = widget.controller.createZeroTrustLoginOwner();
+      _startingLogin = false;
       widget.controller.addListener(_onControllerChanged);
       _seenZeroTrustTicket = widget.controller.zeroTrustCallbackTicket;
     }
@@ -163,9 +175,10 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
 
   @override
   void dispose() {
+    _inputGeneration++;
     widget.controller.removeListener(_onControllerChanged);
     WidgetsBinding.instance.removeObserver(this);
-    unawaited(widget.controller.cancelZeroTrustLogin());
+    widget.controller.releaseZeroTrustLoginOwner(_loginOwner);
     _callbackController.clear();
     _teamFocusNode.dispose();
     _callbackFocusNode.dispose();
@@ -197,6 +210,9 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
     final valid = _isValid;
     if (_reportedValidity == valid) return;
     _reportedValidity = valid;
+    if (valid) {
+      unawaited(widget.controller.cancelZeroTrustLogin(owner: _loginOwner));
+    }
     widget.onValidityChanged?.call(valid);
   }
 
@@ -236,7 +252,21 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
 
   Future<void> _fillCallbackFromClipboard() async {
     if (_startingLogin || !widget.enabled) return;
-    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final generation = ++_inputGeneration;
+    ClipboardData? data;
+    try {
+      data = await Clipboard.getData(Clipboard.kTextPlain);
+    } on Object catch (error) {
+      if (!mounted || !widget.enabled || generation != _inputGeneration) return;
+      setState(() => _operationError = userFacingError(_strings, error));
+      return;
+    }
+    if (!mounted ||
+        !widget.enabled ||
+        _startingLogin ||
+        generation != _inputGeneration) {
+      return;
+    }
     var text = data?.text?.trim() ?? '';
     if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
       text = text.substring(1, text.length - 1).trim();
@@ -259,6 +289,9 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
 
   Future<void> _beginZeroTrustLogin() async {
     if (_startingLogin || !widget.enabled) return;
+    final generation = ++_inputGeneration;
+    final controller = widget.controller;
+    final owner = _loginOwner;
     final team = _normalizedTeam();
     if (team == null) {
       setState(() => _teamError = _strings.get('zero_trust_team_invalid'));
@@ -277,41 +310,77 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
     });
     _emitValidity();
     try {
-      final loginUrl = await widget.controller.beginZeroTrustLogin(team);
+      final loginUrl = await controller.beginZeroTrustLogin(team, owner: owner);
+      if (!_operationIsCurrent(generation, controller, owner) ||
+          _normalizedTeam() != team) {
+        await controller.cancelZeroTrustLogin(owner: owner);
+        return;
+      }
       final opened = await launchUrl(
         Uri.parse(loginUrl),
         mode: LaunchMode.externalApplication,
       );
+      if (!_operationIsCurrent(generation, controller, owner)) {
+        await controller.cancelZeroTrustLogin(owner: owner);
+        return;
+      }
       if (!opened) {
         throw StateError('The system browser could not be opened.');
       }
     } on Object catch (error) {
-      await widget.controller.cancelZeroTrustLogin();
-      if (!mounted) return;
+      await controller.cancelZeroTrustLogin(owner: owner);
+      if (!_operationIsCurrent(generation, controller, owner)) return;
       setState(() {
         _operationError = error is EngineException
-            ? error.message
+            ? userFacingError(_strings, error)
             : _strings.get('zero_trust_browser_failed');
       });
     } finally {
-      if (mounted) setState(() => _startingLogin = false);
+      if (mounted && controller == widget.controller && owner == _loginOwner) {
+        setState(() => _startingLogin = false);
+      }
     }
   }
 
   Future<void> _consumeAutomaticCallback() async {
+    if (!widget.enabled) return;
+    final generation = _inputGeneration;
+    final controller = widget.controller;
+    final owner = _loginOwner;
     final team = _normalizedTeam();
     if (team == null) return;
-    final callback = await widget.controller.consumeZeroTrustCallback();
-    if (!mounted || callback == null || callback.isEmpty) return;
-    if (!ZeroTrustCallbackSession.isValidCallback(team, callback)) return;
-    _callbackController.text = callback;
-    setState(() {
-      _callbackReceived = true;
-      _callbackError = null;
-      _operationError = null;
-    });
-    _emitValidity();
+    try {
+      final callback = await controller.consumeZeroTrustCallback(owner: owner);
+      if (!_operationIsCurrent(generation, controller, owner) ||
+          team != _normalizedTeam() ||
+          callback == null ||
+          callback.isEmpty) {
+        return;
+      }
+      if (!ZeroTrustCallbackSession.isValidCallback(team, callback)) return;
+      _callbackController.text = callback;
+      setState(() {
+        _callbackReceived = true;
+        _callbackError = null;
+        _operationError = null;
+      });
+      _emitValidity();
+    } on Object catch (error) {
+      if (!_operationIsCurrent(generation, controller, owner)) return;
+      setState(() => _operationError = userFacingError(_strings, error));
+    }
   }
+
+  bool _operationIsCurrent(
+    int generation,
+    AppController controller,
+    Object owner,
+  ) =>
+      mounted &&
+      widget.enabled &&
+      generation == _inputGeneration &&
+      controller == widget.controller &&
+      owner == _loginOwner;
 
   ZeroTrustEnrollmentDraft? validateAndRead() {
     final team = _normalizedTeam();
@@ -336,6 +405,7 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
   }
 
   Future<void> clearSensitive() async {
+    _inputGeneration++;
     _callbackController.clear();
     if (mounted) {
       setState(() {
@@ -345,7 +415,7 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
       });
       _emitValidity();
     }
-    await widget.controller.cancelZeroTrustLogin();
+    await widget.controller.cancelZeroTrustLogin(owner: _loginOwner);
   }
 
   @override
@@ -369,9 +439,11 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
                   labelText: _strings.get('zero_trust_team'),
                   hintText: 'example-team',
                   errorText: _teamError,
+                  errorMaxLines: 6,
                   prefixIcon: const Icon(LucideIcons.building2),
                 ),
                 onChanged: (_) {
+                  _inputGeneration++;
                   setState(() {
                     _teamError = null;
                     _callbackError = _callbackValidationError(
@@ -416,9 +488,11 @@ class ZeroTrustEnrollmentEditorState extends State<ZeroTrustEnrollmentEditor>
                 decoration: InputDecoration(
                   labelText: _strings.get('zero_trust_callback'),
                   errorText: _callbackError,
+                  errorMaxLines: 6,
                   prefixIcon: const Icon(LucideIcons.link),
                 ),
                 onChanged: (_) {
+                  _inputGeneration++;
                   setState(() {
                     _callbackReceived = false;
                     _callbackError = _callbackValidationError(

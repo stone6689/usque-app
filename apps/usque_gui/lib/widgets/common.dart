@@ -1,4 +1,7 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../core/usque_motion.dart';
@@ -9,33 +12,56 @@ import '../core/usque_theme.dart';
 class PageFrame extends StatelessWidget {
   const PageFrame({
     required this.title,
-    required this.child,
+    this.child,
+    this.slivers,
     this.subtitle,
     this.header,
     this.titleWidget,
     this.showHeading = true,
+    this.fillViewport = false,
     this.contentWidth = maxContentWidth,
     this.actions = const <Widget>[],
     super.key,
-  });
+  }) : assert((child == null) != (slivers == null)),
+       assert(!fillViewport || child != null);
 
   final String title;
-  final Widget child;
+  final Widget? child;
+
+  /// Use slivers for long content that must be built and laid out on demand.
+  final List<Widget>? slivers;
   final String? subtitle;
   final Widget? header;
   final Widget? titleWidget;
 
   /// Hide the visual header while retaining the page's scroll-storage identity.
   final bool showHeading;
+
+  /// Give [child] at least the viewport height left below the heading and
+  /// above the bottom margin. Taller content still scrolls.
+  final bool fillViewport;
   final double contentWidth;
   final List<Widget> actions;
 
   static const double maxContentWidth = 1120;
+  static const double _bottomMargin = 34;
 
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
     final double gutter = MediaQuery.sizeOf(context).width < 600 ? 16 : 32;
+    Widget content(double minHeight) => SliverToBoxAdapter(
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: contentWidth,
+            minHeight: minHeight,
+          ),
+          child: child,
+        ),
+      ),
+    );
     return Material(
       color: UsqueTokens.of(context).canvas,
       child: CustomScrollView(
@@ -120,17 +146,34 @@ class PageFrame extends StatelessWidget {
               gutter,
               showHeading ? 0 : gutter,
               gutter,
-              34,
+              _bottomMargin,
             ),
-            sliver: SliverToBoxAdapter(
-              child: Align(
-                alignment: Alignment.topCenter,
-                child: ConstrainedBox(
-                  constraints: BoxConstraints(maxWidth: contentWidth),
-                  child: child,
-                ),
-              ),
-            ),
+            sliver: slivers != null
+                ? SliverLayoutBuilder(
+                    builder: (context, constraints) => SliverPadding(
+                      padding: EdgeInsets.symmetric(
+                        horizontal:
+                            (constraints.crossAxisExtent - contentWidth).clamp(
+                              0,
+                              double.infinity,
+                            ) /
+                            2,
+                      ),
+                      sliver: SliverMainAxisGroup(slivers: slivers!),
+                    ),
+                  )
+                : fillViewport
+                ? SliverLayoutBuilder(
+                    builder: (context, constraints) => content(
+                      math.max(
+                        0,
+                        constraints.viewportMainAxisExtent -
+                            constraints.precedingScrollExtent -
+                            _bottomMargin,
+                      ),
+                    ),
+                  )
+                : content(0),
           ),
         ],
       ),
@@ -147,17 +190,19 @@ class SubPage extends StatelessWidget {
   const SubPage({
     required this.title,
     required this.backLabel,
-    required this.child,
+    this.child,
+    this.slivers,
     this.subtitle,
     this.actions = const <Widget>[],
     this.bottomBar,
     this.contentWidth = PageFrame.maxContentWidth,
     super.key,
-  });
+  }) : assert((child == null) != (slivers == null));
 
   final String title;
   final String backLabel;
-  final Widget child;
+  final Widget? child;
+  final List<Widget>? slivers;
   final String? subtitle;
   final List<Widget> actions;
   final Widget? bottomBar;
@@ -186,6 +231,7 @@ class SubPage extends StatelessWidget {
               ),
             ),
           ),
+          slivers: slivers,
           child: child,
         ),
       ),
@@ -215,6 +261,87 @@ class PanelStack extends StatelessWidget {
       ],
     );
   }
+}
+
+/// A stretched column whose last child is offered the height its siblings
+/// leave under the column's minimum, up to [maxLastExtent].
+///
+/// The offer is a minimum, so the last child keeps its natural height when
+/// space is short and the column grows instead. A [Column] cannot do this:
+/// flexible children need a bounded height, which a scroll view never gives.
+class FillColumn extends MultiChildRenderObjectWidget {
+  const FillColumn({
+    required super.children,
+    this.maxLastExtent = double.infinity,
+    super.key,
+  });
+
+  final double maxLastExtent;
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderFillColumn(maxLastExtent);
+
+  @override
+  void updateRenderObject(BuildContext context, RenderObject renderObject) {
+    (renderObject as _RenderFillColumn).maxLastExtent = maxLastExtent;
+  }
+}
+
+class _FillColumnParentData extends ContainerBoxParentData<RenderBox> {}
+
+class _RenderFillColumn extends RenderBox
+    with
+        ContainerRenderObjectMixin<RenderBox, _FillColumnParentData>,
+        RenderBoxContainerDefaultsMixin<RenderBox, _FillColumnParentData> {
+  _RenderFillColumn(this._maxLastExtent);
+
+  double _maxLastExtent;
+  set maxLastExtent(double value) {
+    if (value == _maxLastExtent) return;
+    _maxLastExtent = value;
+    markNeedsLayout();
+  }
+
+  @override
+  void setupParentData(RenderBox child) {
+    if (child.parentData is! _FillColumnParentData) {
+      child.parentData = _FillColumnParentData();
+    }
+  }
+
+  @override
+  void performLayout() {
+    final width = constraints.maxWidth;
+    var offset = 0.0;
+    var child = firstChild;
+    while (child != null) {
+      final data = child.parentData! as _FillColumnParentData;
+      final minHeight = child == lastChild
+          ? (constraints.minHeight - offset).clamp(0.0, _maxLastExtent)
+          : 0.0;
+      child.layout(
+        BoxConstraints(minWidth: width, maxWidth: width, minHeight: minHeight),
+        parentUsesSize: true,
+      );
+      data.offset = Offset(0, offset);
+      offset += child.size.height;
+      child = data.nextSibling;
+    }
+    size = constraints.constrain(Size(width, offset));
+  }
+
+  @override
+  double? computeDistanceToActualBaseline(TextBaseline baseline) =>
+      defaultComputeDistanceToFirstActualBaseline(baseline);
+
+  @override
+  void paint(PaintingContext context, Offset offset) =>
+      defaultPaint(context, offset);
+
+  @override
+  bool hitTestChildren(BoxHitTestResult result, {required Offset position}) =>
+      defaultHitTestChildren(result, position: position);
 }
 
 /// An open content region. Grouping comes from its heading and spacing, never
@@ -330,6 +457,8 @@ class ContentHeading extends StatelessWidget {
             children: [heading, const SizedBox(height: 8), trailing!],
           );
         }
+        // The trailing piece keeps its natural width so the heading takes the
+        // rest of the row; a flexible trailing slot would split it in half.
         return Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -338,11 +467,11 @@ class ContentHeading extends StatelessWidget {
             if (trailing is Icon)
               trailing!
             else
-              Flexible(
-                child: Align(
-                  alignment: AlignmentDirectional.centerEnd,
-                  child: trailing!,
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: constraints.maxWidth * 0.45,
                 ),
+                child: trailing!,
               ),
           ],
         );
@@ -414,6 +543,170 @@ class _ActionRowState extends State<ActionRow> {
         ),
       ),
     ),
+  );
+}
+
+/// A settings row that opens another page or system screen. The chevron always
+/// stays at the trailing edge; on narrow layouts or at large text the value
+/// moves under the summary instead of squeezing the title.
+class LinkRow extends StatelessWidget {
+  const LinkRow({
+    required this.icon,
+    required this.title,
+    required this.onTap,
+    this.subtitle,
+    this.value,
+    this.valueKey,
+    this.padding = const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+    super.key,
+  });
+
+  final IconData icon;
+  final String title;
+  final String? subtitle;
+  final String? value;
+  final Key? valueKey;
+  final VoidCallback? onTap;
+  final EdgeInsetsGeometry padding;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final muted = theme.colorScheme.onSurfaceVariant;
+    Widget valueText() => Text(
+      value!,
+      key: valueKey,
+      style: theme.textTheme.labelLarge?.copyWith(color: muted),
+    );
+    return ActionRow(
+      padding: padding,
+      onTap: onTap,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final stacked =
+              value != null &&
+              (constraints.maxWidth < 480 ||
+                  MediaQuery.textScalerOf(context).scale(14) > 21);
+          return Row(
+            children: [
+              ExcludeSemantics(child: Icon(icon, size: 20, color: muted)),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title, style: theme.textTheme.titleMedium),
+                    if (subtitle != null) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        subtitle!,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: muted,
+                        ),
+                      ),
+                    ],
+                    if (stacked) ...[const SizedBox(height: 6), valueText()],
+                  ],
+                ),
+              ),
+              if (value != null && !stacked) ...[
+                const SizedBox(width: 16),
+                ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: constraints.maxWidth * 0.4,
+                  ),
+                  child: valueText(),
+                ),
+              ],
+              const SizedBox(width: 8),
+              ExcludeSemantics(
+                child: Icon(
+                  LucideIcons.chevronRightDir,
+                  size: 20,
+                  color: muted,
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// Explanatory copy under a control, styled like a field's helper text so it
+/// never reads as a value.
+class HintText extends StatelessWidget {
+  const HintText(this.text, {super.key});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Text(
+      text,
+      style: theme.textTheme.bodySmall?.copyWith(
+        color: theme.colorScheme.onSurfaceVariant,
+      ),
+    );
+  }
+}
+
+/// Dropdown fields that sit among text fields show their value in the typed
+/// input's face and line height, with an arrow no taller than that line, so
+/// a picker and a text field side by side keep one height at any text scale.
+abstract final class FieldDropdown {
+  static const double iconSize = 20;
+
+  /// Flutter keeps at least this much content height in a dense dropdown.
+  static const double _denseMinimum = 24;
+
+  static TextStyle? valueStyle(BuildContext context) {
+    final theme = Theme.of(context);
+    return theme.textTheme.bodyLarge?.copyWith(
+      color: theme.colorScheme.onSurface,
+    );
+  }
+
+  /// The dense minimum exceeds one line of input text at small scales, so
+  /// that difference comes back out of the vertical padding.
+  static InputDecoration decoration(BuildContext context, {String? labelText}) {
+    final style = valueStyle(context);
+    final line =
+        MediaQuery.textScalerOf(context).scale(style?.fontSize ?? 14) *
+        (style?.height ?? 1);
+    final excess = math.max(0.0, _denseMinimum - line) / 2;
+    final padding =
+        Theme.of(context).inputDecorationTheme.contentPadding?.resolve(
+          Directionality.of(context),
+        ) ??
+        const EdgeInsets.all(14);
+    return InputDecoration(
+      labelText: labelText,
+      contentPadding: padding.copyWith(
+        top: padding.top - excess,
+        bottom: padding.bottom - excess,
+      ),
+    );
+  }
+}
+
+/// Material list tiles drawn with the [LinkRow] and [ContentHeading] metrics:
+/// 20 px icons, a 12 px title gap and the row title style, so switch rows and
+/// navigation rows share one text column.
+class RowTileTheme extends StatelessWidget {
+  const RowTileTheme({required this.child, super.key});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => ListTileTheme.merge(
+    titleTextStyle: Theme.of(context).textTheme.titleMedium,
+    minLeadingWidth: 20,
+    horizontalTitleGap: 12,
+    child: IconTheme.merge(data: const IconThemeData(size: 20), child: child),
   );
 }
 
@@ -691,13 +984,7 @@ Color statusToneColor(BuildContext context, StatusTone tone) {
     StatusTone.success => tokens.success,
     StatusTone.warning => tokens.caution,
     StatusTone.danger => tokens.danger,
-    // The logo orange is deliberately vivid and misses the 3:1 graphical
-    // contrast threshold on its own light tint. Use the accessible ember for
-    // status indicators in light mode; dark surfaces can keep the brand hue.
-    StatusTone.brand =>
-      theme.brightness == Brightness.light
-          ? theme.colorScheme.primary
-          : tokens.brand,
+    StatusTone.brand => tokens.brand,
     StatusTone.neutral => theme.colorScheme.onSurfaceVariant,
   };
 }
@@ -799,7 +1086,8 @@ class WarningBanner extends StatelessWidget {
     super.key,
   });
 
-  final String title;
+  /// Omitted when an adjacent heading already names the failure.
+  final String? title;
   final String message;
   final VoidCallback? onDismiss;
   final bool danger;
@@ -835,14 +1123,16 @@ class WarningBanner extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: <Widget>[
-                    Text(
-                      title,
-                      style: theme.textTheme.titleSmall?.copyWith(
-                        color: foreground,
-                        fontWeight: FontWeight.w700,
+                    if (title case final title?) ...<Widget>[
+                      Text(
+                        title,
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          color: foreground,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 3),
+                      const SizedBox(height: 3),
+                    ],
                     Text(message, style: theme.textTheme.bodyMedium),
                   ],
                 ),
@@ -1027,7 +1317,7 @@ class _MonoValueState extends State<MonoValue> {
       child: SelectableText(
         widget.value,
         textAlign: TextAlign.end,
-        style: UsqueTheme.mono(
+        style: UsqueTheme.address(
           context,
           size: widget.size,
           weight: FontWeight.w500,

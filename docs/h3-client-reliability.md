@@ -1,9 +1,11 @@
 # H3 client receive and recovery behavior
 
-This change retains one data-bearing CONNECT-IP session, CUBIC with pacing,
-the existing endpoint identity/pin policy, and the existing packet/socket
-budgets. It does not enable BBR, UDP offload, larger socket buffers, a new TUN
-MTU, or any host-wide network setting.
+This reference describes CONNECT-IP HTTP/3 receive and recovery behavior.
+One selected CONNECT-IP session carries application traffic; endpoint public-key
+checks and packet/socket budgets still apply. Current algorithm choices are in
+[Congestion control](congestion-control.md), and the shared socket receive-buffer
+default is in [QUIC UDP receive buffer](UDP_RECEIVE_BUFFER.md). The configured
+TUN MTU remains independent of outer-path PMTU discovery.
 
 ## Receive path
 
@@ -53,9 +55,30 @@ only restart quiche's existing discovery; probe acknowledgements determine
 the usable size. There is no forced unverified MTU reduction and no bypass of
 congestion control. Probe-only loss, sparse random loss, idle samples, an
 unfinished search, disabled automatic PMTU, and a completed 1200-byte floor do
-not trigger this mechanism. Promotion resets loss history. EMSGSIZE retains
-its separate suppression and exhaustion budget. Confirmed insufficient IPv6
-minimum MTU still follows the existing fail-closed termination policy.
+not trigger this mechanism. Promotion resets loss history.
+
+An EMSGSIZE rejection during unfinished discovery is treated as a failed size
+probe only when its UDP payload exceeds the active path's current ordinary-send
+bound. The actor releases that rejected datagram and retains the unsent tail,
+including smaller DNS, TLS and ACK packets. It does not pause ordinary traffic
+for one second on each rejected probe. It reports the exact local/peer socket
+addresses and rejected UDP length to quiche. Only an outstanding probe of that
+size on the active, validated path can narrow the search immediately, without
+repeating that size or waiting for its loss timer. Ordinary network loss still
+uses the configured retry budget. The error does not publish or force an
+unverified PMTU: smaller sizes still require peer acknowledgements.
+The local rejection bounds only this path's search; delayed ACK/loss callbacks
+for rejected sizes cannot clear the new probe or restore a rejected ceiling.
+Normal recovery still retires their packet accounting. A new path starts with
+the configured ceiling independently of this limit.
+Both UDP backends report a successfully sent prefix before a later error, so
+the rejected datagram is the first remaining queue entry.
+
+Errors at or below the ordinary-send bound, errors after discovery completes,
+and migration-drain errors retain the conservative queue reset, suppression and
+revalidation policy. The finite discovery-error and revalidation budgets remain
+in force. Confirmed insufficient IPv6 minimum MTU still follows the existing
+fail-closed termination policy.
 
 ## GOAWAY and automatic recovery
 
@@ -86,7 +109,97 @@ for a typed PMTU, authentication, identity, or protection failure. Shutdown
 resolution remains cancellable and uses the existing ten-second packet-operation
 budget. If cleanup stalls past that budget, it reports the non-fallback-eligible
 `PacketReceiveStalled` failure and aborts the owned driver; it never invents a
-network failure to enable H2. H2 channel handling is unchanged.
+network failure to enable H2.
+
+## Established CONNECT-IP recovery
+
+The established-session supervisor classifies driver exits and failed replacement
+attempts using the same failure contract. Authentication, identity, configuration,
+address-assignment and socket-protection failures stop automatic attempts. Address
+family races cancel remaining candidates after an observed terminal error;
+H3/H2 aggregate errors cannot erase a terminal child cause. An endpoint pin mismatch
+retains the existing single protected enrollment refresh, with unchanged address
+assignment and pin verification. Initial connection failures still return to the
+caller rather than starting an unlimited background retry loop.
+
+Ordinary network failures retain the 1/2/4/8/15/30-second retry delays with 20%
+jitter. A connection lasting at least 60 seconds resets this backoff. An optional
+latest-value physical-network subscription distinguishes Unknown, Offline and
+Online address families. Offline waits do not start handshakes or advance the
+backoff/count. Unknown or a closed observation channel retains timed retry. A usable
+new network resets the old backoff after 250 milliseconds of settling; event-driven
+attempts start no more than once per second. A newer observation cancels an obsolete
+handshake, and cancellation takes precedence over both ready success and recovery.
+Waiting and connecting continue draining bounded outgoing packet queues; they do
+not retain an unbounded backlog or recreate local proxy listeners.
+
+Android publishes an immutable generation/availability/family snapshot through
+JNI. Windows VPN reuses the existing 500-millisecond Agent observations. The new
+`AGENT_PHYSICAL_NETWORK_OFFLINE` code means the Agent confirmed there was no usable
+physical interface. Older Agents' generic errors, invalid observations and failed
+queries mean Unknown. Windows pure proxy mode has no physical subscription and
+keeps timed retries. These are scheduling hints, never authorization to bypass
+exact-generation socket protection. L4 demand-driven replacement, downstream chain
+recovery and platform-service recovery retain their separate policies.
+
+If an established Android CONNECT-IP worker exits with an allowlisted retryable
+network failure, the service retains its connection intent and blocking TUN,
+confirms native cleanup, and starts one replacement on a usable physical network.
+The first attempt waits 250 milliseconds; failed replacements use 1/2/4/8/15/30
+second delays. A newer usable physical generation resets that backoff, while
+duplicate callbacks do not. Offline recovery waits without handshakes. Manual
+connection, disconnect, service destruction, other terminal failures, and
+unconfirmed cleanup revoke pending work. Initial connection failures do not start
+this loop.
+For an established Android CONNECT-IP session without a chain, a typed
+socket-protection failure retains the TUN and connection intent after confirmed
+cleanup, but waits for a newer usable physical-network generation before one
+replacement attempt. If protection fails again, it waits for another generation;
+there is no timed retry on the same network. Initial startup and chain failures
+keep their existing policy. Every replacement creates and protects new sockets.
+Live ordinary sessions continue using native migration and reconnect scheduling.
+Android chain exits share this service recovery owner and rebuild the whole chain
+on a physical-generation change or an explicitly retryable final transport error.
+The order of the native failure snapshot and physical callback does not determine
+whether recovery survives. Chain startup failures retain typed native evidence;
+authentication, certificate, configuration, address and cleanup failures cannot
+be reclassified as generic transport failures. A terminal failure stops attempts
+and native ingress while Java retains the blocking TUN and armed Kill Switch until
+the user retries or disconnects. Clearing stale runtime observations during
+recovery does not clear that protection intent.
+
+Android socket binding always rejects a socket whose protection fails. A binding
+failure caused by a changed generation or netd's `ENONET` (the selected network no longer
+exists) rejects that socket as a stale path so native recovery can retry exact
+protection and binding. Other binding failures remain rejected; no unprotected
+socket or fallback route is authorized. Physical-network callbacks also preserve
+terminal error evidence until an explicit retry or disconnect, except for the
+established CONNECT-IP network-change recovery described above.
+
+## HTTP/2 liveness
+
+H2 retains its five-second PING cadence and permits only one outstanding PING.
+The soft deadline is five seconds before any RTT sample, otherwise
+`max(3 * smoothed RTT, smoothed RTT + 4 * RTT variation)`, clamped to 2–10 seconds.
+It records one timeout and continues polling the same PONG. The final deadline,
+measured from this PING's start, is three times the soft timeout, clamped to
+15–30 seconds. A PONG before that deadline preserves the connection. A permanent
+blackhole therefore ends the old driver within this deadline plus at most one
+PING interval under normal scheduling.
+
+A scheduling gap exceeding 15 seconds permits one five-second resume grace for
+the current PING; it cannot repeatedly extend the deadline, and its RTT sample is
+discarded. Driver completion, explicit cancellation and network replacement remain
+independently interruptible. Final timeout reports `PACKET_RECEIVE_STALLED` on the
+H2 path. The cause is published before connection teardown, so send/receive EOF
+cannot hide it. Ordinary stream resets still fail immediately. The driver owns
+the heartbeat future and closes its socket/egress lease when it exits.
+
+These policies add no saved settings or GUI phases. Waiting remains Reconnecting;
+terminal failures use existing failure codes. No extra identifiers or packet
+content are recorded. Actual device suspension, physical recovery latency, leak
+behavior and energy use require their respective isolated environments; virtual
+clock and in-memory H2 regressions are not evidence of those platform outcomes.
 
 ## Safety and validation
 

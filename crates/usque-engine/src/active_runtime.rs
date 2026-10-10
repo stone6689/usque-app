@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::Arc;
 use std::{net::SocketAddr, time::Instant};
 
 use usque_core::{FrontendKind, FrontendPhase, FrontendSettings, FrontendStatus, Profile};
@@ -37,11 +39,15 @@ pub(crate) enum ActiveRuntime {
     #[cfg(windows)]
     Vpn(Box<crate::windows_agent::WindowsVpnRuntime>),
     #[cfg(test)]
-    Harness(HarnessRuntime),
+    Harness(Box<HarnessRuntime>),
 }
 
 #[cfg(test)]
 pub(crate) struct HarnessRuntime {
+    pub(crate) timeline: usque_transport::ConnectionTelemetry,
+    pub(crate) disable_quic: bool,
+    pub(crate) traffic_policy_updates: u32,
+    pub(crate) path: RuntimePath,
     pub(crate) reconnect_count: u32,
     pub(crate) vpn: bool,
     pub(crate) listeners: Vec<SocketAddr>,
@@ -52,7 +58,20 @@ pub(crate) struct HarnessRuntime {
     pub(crate) detach_count: u32,
     system_proxy: bool,
     pub(crate) system_proxy_apply_count: u32,
+    pub(crate) system_proxy_failures: u32,
+    pub(crate) fail_attach: bool,
     pub(crate) fail_after_detach: bool,
+    pub(crate) gate_status: usque_core::vpngate::GateStatus,
+    pub(crate) gate_replace_count: u32,
+    pub(crate) warp_ready: bool,
+    pub(crate) stop_requested: tokio_util::sync::CancellationToken,
+    pub(crate) stopped: tokio_util::sync::CancellationToken,
+    pub(crate) failure_retained: bool,
+    #[cfg(windows)]
+    pub(crate) fail_protected_reconnect: bool,
+    pub(crate) shutdown_failures: u32,
+    pub(crate) shutdown_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) shutdown_release: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[cfg(test)]
@@ -71,7 +90,16 @@ impl HarnessRuntime {
         let mut listeners = socks5_listeners.clone();
         listeners.extend(http_listeners.iter().copied());
         Self {
+            timeline: usque_transport::ConnectionTelemetry::default(),
+            path: RuntimePath {
+                transport: usque_core::Transport::Http3,
+                endpoint_family: usque_core::AddressFamily::Ipv4,
+                ipv4_available: true,
+                ipv6_available: true,
+            },
             reconnect_count,
+            disable_quic: profile.disable_quic,
+            traffic_policy_updates: 0,
             vpn,
             listeners,
             socks5_listeners,
@@ -81,20 +109,56 @@ impl HarnessRuntime {
             detach_count: 0,
             system_proxy: profile.frontends.http && profile.proxy.system_proxy,
             system_proxy_apply_count: 0,
+            system_proxy_failures: 0,
+            fail_attach: false,
             fail_after_detach: false,
+            gate_status: Default::default(),
+            gate_replace_count: 0,
+            warp_ready: true,
+            stop_requested: tokio_util::sync::CancellationToken::new(),
+            stopped: tokio_util::sync::CancellationToken::new(),
+            failure_retained: false,
+            #[cfg(windows)]
+            fail_protected_reconnect: false,
+            shutdown_failures: 0,
+            shutdown_attempts: Arc::default(),
+            shutdown_release: None,
         }
     }
 
     fn health(&self) -> RuntimeHealth {
+        if let Some(reason) = self.gate_status.failure {
+            let error = usque_transport::TransportError::VpnGate(reason);
+            return RuntimeHealth::Failed {
+                last_path: self.path(),
+                reconnect_count: self.reconnect_count,
+                failure: error.failure(None, None),
+                message: error.to_string(),
+            };
+        }
         RuntimeHealth::Connected {
-            path: RuntimePath {
-                transport: usque_core::Transport::Http3,
-                endpoint_family: usque_core::AddressFamily::Ipv4,
-                ipv4_available: true,
-                ipv6_available: true,
-            },
+            path: self.path(),
             reconnect_count: self.reconnect_count,
         }
+    }
+
+    fn path(&self) -> RuntimePath {
+        self.path
+    }
+
+    pub(crate) fn replace_gate(&mut self, profile: &Profile) {
+        self.failure_retained = false;
+        self.warp_ready = true;
+        self.gate_replace_count += 1;
+        self.gate_status = usque_core::vpngate::GateStatus {
+            stage: if profile.chain_enabled() {
+                usque_core::vpngate::GateStage::Connected
+            } else {
+                usque_core::vpngate::GateStage::Disabled
+            },
+            ..Default::default()
+        };
+        self.reconfigure_frontends(profile);
     }
 
     fn reconfigure_frontends(&mut self, profile: &Profile) {
@@ -126,6 +190,143 @@ impl HarnessRuntime {
 }
 
 impl ActiveRuntime {
+    pub(crate) fn take_startup_error(&mut self) -> Option<ControlServiceError> {
+        #[cfg(windows)]
+        if let Self::Vpn(runtime) = self {
+            return runtime.take_startup_error().map(map_windows_vpn_error);
+        }
+        None
+    }
+
+    pub(crate) fn target_committed(&self) -> bool {
+        #[cfg(windows)]
+        if let Self::Vpn(runtime) = self {
+            return runtime.target_committed();
+        }
+        false
+    }
+
+    pub(crate) fn replacement_pending(&self) -> bool {
+        #[cfg(windows)]
+        if let Self::Vpn(runtime) = self {
+            return runtime.replacement_pending();
+        }
+        false
+    }
+
+    pub(crate) fn failure_retained(&self) -> bool {
+        match self {
+            #[cfg(windows)]
+            Self::Vpn(runtime) => runtime.failure_retained(),
+            #[cfg(test)]
+            Self::Harness(runtime) => runtime.failure_retained,
+            _ => false,
+        }
+    }
+
+    pub(crate) async fn retain_failed_gate(
+        &mut self,
+        _reason: usque_core::vpngate::GateFailure,
+    ) -> Result<(), ControlServiceError> {
+        match self {
+            #[cfg(windows)]
+            Self::Vpn(runtime) => runtime
+                .retain_failed_gate(_reason)
+                .await
+                .map_err(map_windows_vpn_error),
+            #[cfg(test)]
+            Self::Harness(runtime) => {
+                runtime.failure_retained = true;
+                runtime.gate_status.stage = usque_core::vpngate::GateStage::Error;
+                runtime.gate_status.failure = Some(_reason);
+                runtime.warp_ready = false;
+                runtime.listeners.clear();
+                runtime.socks5_listeners.clear();
+                runtime.http_listeners.clear();
+                Ok(())
+            }
+            _ => Err(ControlServiceError::InvalidRequest(
+                "only a VPN session can retain platform protection".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn quiesce_final(&mut self) {
+        match self {
+            Self::Proxy(r) => r.runtime.quiesce_final(),
+            #[cfg(windows)]
+            Self::Vpn(r) => r.quiesce_final(),
+            #[cfg(test)]
+            Self::Harness(r) => {
+                r.listeners.clear();
+                r.socks5_listeners.clear();
+                r.http_listeners.clear();
+            }
+        }
+    }
+    pub(crate) async fn fail_gate(&mut self, reason: usque_core::vpngate::GateFailure) {
+        match self {
+            Self::Proxy(r) => r.runtime.fail_gate(reason).await,
+            #[cfg(windows)]
+            Self::Vpn(r) => r.fail_gate(reason).await,
+            #[cfg(test)]
+            Self::Harness(r) => {
+                r.gate_status.stage = usque_core::vpngate::GateStage::Error;
+                r.gate_status.failure = Some(reason);
+                r.stop_requested.cancel();
+                r.warp_ready = false;
+            }
+        }
+    }
+    pub(crate) fn internal_networks(
+        &self,
+    ) -> Option<(
+        usque_transport::InternalNetwork,
+        usque_transport::InternalNetwork,
+    )> {
+        match self {
+            Self::Proxy(r) => Some((
+                r.runtime.internal_network(),
+                r.runtime.warp_internal_network(),
+            )),
+            #[cfg(windows)]
+            Self::Vpn(r) => r.internal_networks(),
+            #[cfg(test)]
+            Self::Harness(_) => None,
+        }
+    }
+    pub(crate) fn gate_status(&self) -> usque_core::vpngate::GateStatus {
+        match self {
+            Self::Proxy(r) => r.runtime.gate_status(),
+            #[cfg(windows)]
+            Self::Vpn(r) => r.gate_status(),
+            #[cfg(test)]
+            Self::Harness(r) => r.gate_status.clone(),
+        }
+    }
+    pub(crate) fn needs_warp_bootstrap(&self) -> bool {
+        #[cfg(windows)]
+        if let Self::Vpn(runtime) = self {
+            return runtime.needs_warp_bootstrap();
+        }
+        false
+    }
+
+    pub(crate) fn can_retry_gate_in_place(&self) -> bool {
+        if self.requires_agent_reattach()
+            || self.gate_status().stage == usque_core::vpngate::GateStage::Error
+        {
+            return false;
+        }
+        #[cfg(test)]
+        if let Self::Harness(runtime) = self {
+            return runtime.warp_ready;
+        }
+        self.needs_warp_bootstrap()
+            || self.internal_networks().is_some_and(|(_, warp)| {
+                matches!(warp.health_snapshot(), RuntimeHealth::Connected { .. })
+            })
+    }
     pub(crate) fn l4_snapshot(&self) -> Option<usque_core::L4Snapshot> {
         match self {
             Self::Proxy(runtime) => runtime.runtime.l4_snapshot(),
@@ -142,7 +343,10 @@ impl ActiveRuntime {
             #[cfg(windows)]
             Self::Vpn(runtime) => runtime.cancel_immediately(),
             #[cfg(test)]
-            Self::Harness(_) => {}
+            Self::Harness(runtime) => {
+                runtime.stop_requested.cancel();
+                runtime.warp_ready = false;
+            }
         }
     }
 
@@ -168,7 +372,14 @@ impl ActiveRuntime {
 
     pub(crate) fn health(&self) -> RuntimeHealth {
         match self {
-            Self::Proxy(runtime) => runtime.runtime.health(),
+            Self::Proxy(runtime) => {
+                let health = runtime.runtime.health();
+                #[cfg(windows)]
+                if let Some(proxy) = &runtime.system_proxy {
+                    return proxy.health(health);
+                }
+                health
+            }
             #[cfg(windows)]
             Self::Vpn(runtime) => runtime.health(),
             #[cfg(test)]
@@ -192,7 +403,7 @@ impl ActiveRuntime {
             #[cfg(windows)]
             Self::Vpn(runtime) => runtime.connection_timeline(),
             #[cfg(test)]
-            Self::Harness(_) => ConnectionTimelineSnapshot::default(),
+            Self::Harness(runtime) => runtime.timeline.snapshot(),
         }
     }
 
@@ -315,9 +526,12 @@ impl ActiveRuntime {
         statuses
     }
 
-    #[cfg(windows)]
     pub(crate) fn requires_agent_reattach(&self) -> bool {
-        matches!(self, Self::Vpn(runtime) if runtime.requires_agent_reattach())
+        #[cfg(windows)]
+        if let Self::Vpn(runtime) = self {
+            return runtime.requires_agent_reattach();
+        }
+        false
     }
 
     #[cfg(windows)]
@@ -351,8 +565,49 @@ impl ActiveRuntime {
             #[cfg(windows)]
             Self::Vpn(runtime) => runtime.shutdown().await.map_err(map_windows_vpn_error),
             #[cfg(test)]
-            Self::Harness(_) => Ok(()),
+            Self::Harness(runtime) => {
+                runtime
+                    .shutdown_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(release) = &runtime.shutdown_release {
+                    release.cancelled().await;
+                }
+                if runtime.shutdown_failures > 0 {
+                    runtime.shutdown_failures -= 1;
+                    return Err(ControlServiceError::DisconnectCleanup(
+                        "injected shutdown failure".into(),
+                    ));
+                }
+                runtime.timeline.record(
+                    usque_transport::ConnectionEventType::Disconnected,
+                    None,
+                    Default::default(),
+                    None,
+                    None,
+                );
+                runtime.stopped.cancel();
+                Ok(())
+            }
         }
+    }
+
+    pub(crate) fn update_traffic_policy(
+        &mut self,
+        disable_quic: bool,
+    ) -> Result<(), ControlServiceError> {
+        match self {
+            Self::Proxy(runtime) => runtime.runtime.update_traffic_policy(disable_quic),
+            #[cfg(windows)]
+            Self::Vpn(runtime) => runtime
+                .update_traffic_policy(disable_quic)
+                .map_err(map_windows_vpn_error)?,
+            #[cfg(test)]
+            Self::Harness(runtime) => {
+                runtime.disable_quic = disable_quic;
+                runtime.traffic_policy_updates += 1;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn reconfigure_frontends(
@@ -426,9 +681,16 @@ impl ActiveRuntime {
                 .map_err(map_windows_vpn_error),
             #[cfg(test)]
             Self::Harness(runtime) => {
-                runtime.system_proxy = profile.frontends.http && profile.proxy.system_proxy;
+                runtime.system_proxy = false;
                 runtime.system_proxy_apply_count =
                     runtime.system_proxy_apply_count.saturating_add(1);
+                if runtime.system_proxy_failures > 0 {
+                    runtime.system_proxy_failures -= 1;
+                    return Err(ControlServiceError::PlatformVpn(
+                        "injected system proxy apply failure".to_owned(),
+                    ));
+                }
+                runtime.system_proxy = profile.frontends.http && profile.proxy.system_proxy;
                 Ok(())
             }
         }
@@ -437,9 +699,17 @@ impl ActiveRuntime {
     pub(crate) async fn with_tunnel(
         self,
         profile: &Profile,
+        #[cfg(windows)] device: &crate::windows_agent::WindowsDeviceOwner,
     ) -> Result<Self, (Self, ControlServiceError)> {
         #[cfg(test)]
         if let Self::Harness(mut harness) = self {
+            if profile.frontends.tunnel && harness.fail_attach {
+                harness.system_proxy = false;
+                return Err((
+                    Self::Harness(harness),
+                    ControlServiceError::PlatformVpn("injected VPN attach failure".to_owned()),
+                ));
+            }
             harness.set_tunnel(profile.frontends.tunnel);
             if harness.fail_after_detach && !harness.vpn {
                 return Err((
@@ -459,7 +729,7 @@ impl ActiveRuntime {
         #[cfg(windows)]
         {
             return if profile.frontends.tunnel {
-                attach_vpn(self, profile).await
+                attach_vpn(self, profile, device).await
             } else {
                 detach_vpn(self, profile).await
             };
@@ -507,6 +777,7 @@ fn output_status(
 async fn attach_vpn(
     runtime: ActiveRuntime,
     profile: &Profile,
+    device: &crate::windows_agent::WindowsDeviceOwner,
 ) -> Result<ActiveRuntime, (ActiveRuntime, ControlServiceError)> {
     let ActiveRuntime::Proxy(proxy) = runtime else {
         return Ok(runtime);
@@ -526,7 +797,7 @@ async fn attach_vpn(
         ));
     }
     let masque = proxy.runtime.into_data_plane();
-    match crate::windows_agent::WindowsVpnRuntime::attach_existing(profile, masque).await {
+    match crate::windows_agent::WindowsVpnRuntime::attach_existing(profile, masque, device).await {
         Ok(vpn) => Ok(ActiveRuntime::Vpn(Box::new(vpn))),
         Err((masque, error)) => Err((
             ActiveRuntime::Proxy(Box::new(ActiveProxyRuntime {
@@ -603,7 +874,8 @@ mod tests {
             ..Profile::default()
         };
         profile.proxy.system_proxy = true;
-        let mut runtime = ActiveRuntime::Harness(HarnessRuntime::from_profile(&profile, false, 0));
+        let mut runtime =
+            ActiveRuntime::Harness(Box::new(HarnessRuntime::from_profile(&profile, false, 0)));
         profile.proxy.http_listeners[0].set_port(18081);
         runtime
             .reconfigure_frontends(&profile)

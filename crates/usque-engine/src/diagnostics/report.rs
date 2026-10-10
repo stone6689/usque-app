@@ -44,6 +44,8 @@ pub(crate) fn session_to_proto(session: &DiagnosticSession) -> v1::DiagnosticSes
             skipped: session.summary.skipped,
             cancelled: session.summary.cancelled,
         }),
+        active_checks: session.active_checks(),
+        revision: session.revision,
     }
 }
 
@@ -77,6 +79,30 @@ pub(crate) fn finding_to_proto(finding: &DiagnosticFinding) -> v1::DiagnosticFin
             .map_or(0, |started| started.timestamp_millis()),
         duration_milliseconds: finding.duration_milliseconds.unwrap_or_default(),
         dependency_reason: finding.dependency_reason.clone().unwrap_or_default(),
+        observation: finding
+            .observation
+            .as_ref()
+            .map(|observation| v1::DiagnosticObservation {
+                source: observation.source.as_str().to_owned(),
+                availability: observation.availability.as_str().to_owned(),
+                age_milliseconds: observation.age_milliseconds,
+                connection_instance_id: observation
+                    .connection_instance_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                network_generation: observation.network_generation.unwrap_or_default(),
+            }),
+        evidence: finding
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.is_export_safe())
+            .take(16)
+            .map(|evidence| v1::DiagnosticEvidence {
+                key: evidence.key().to_owned(),
+                number: evidence.number(),
+                token: evidence.token().unwrap_or_default().to_owned(),
+            })
+            .collect(),
     }
 }
 
@@ -85,6 +111,10 @@ pub(crate) fn timeline_to_proto(timeline: &ConnectionTimelineSnapshot) -> v1::Co
         events: timeline.events.iter().map(event_to_proto).collect(),
         metrics: Some(metrics_to_proto(&timeline.metrics)),
         dropped_event_count: timeline.dropped_event_count,
+        connection_instance_id: String::new(),
+        retained: false,
+        session_generation: 0,
+        observation: None,
     }
 }
 
@@ -139,6 +169,9 @@ fn event_to_proto(event: &ConnectionEvent) -> v1::ConnectionEvent {
             }
             ConnectionEventType::MigrationFailed => v1::ConnectionEventType::MigrationFailed as i32,
             ConnectionEventType::QueueSaturated => v1::ConnectionEventType::QueueSaturated as i32,
+            ConnectionEventType::QueueBackpressured => {
+                v1::ConnectionEventType::QueueBackpressured as i32
+            }
             ConnectionEventType::PmtuChanged => v1::ConnectionEventType::PmtuChanged as i32,
             ConnectionEventType::PmtuRevalidationStarted => {
                 v1::ConnectionEventType::PmtuRevalidationStarted as i32
@@ -166,6 +199,9 @@ fn event_to_proto(event: &ConnectionEvent) -> v1::ConnectionEvent {
             .to_owned(),
         duration_milliseconds: event.duration.map_or(0, duration_milliseconds),
         failure: event.failure.as_ref().map(transport_failure_to_proto),
+        queue_kind: event
+            .queue_kind
+            .map_or(0, |kind| crate::network_quality::queue_kind(kind) as i32),
     }
 }
 

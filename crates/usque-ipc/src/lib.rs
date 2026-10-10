@@ -75,6 +75,93 @@ pub enum FrameError {
 mod tests {
     use super::*;
     #[test]
+    fn initial_identity_wire_numbers_are_append_only() {
+        let initial = v1::ControlRequest {
+            request_id: String::new(),
+            payload: Some(v1::control_request::Payload::InitialIdentity(
+                Default::default(),
+            )),
+        };
+        assert_eq!(initial.encode_to_vec(), [0x8a, 0x03, 0]);
+        let get = v1::ControlRequest {
+            request_id: String::new(),
+            payload: Some(v1::control_request::Payload::GetInitialIdentityState(
+                Default::default(),
+            )),
+        };
+        assert_eq!(get.encode_to_vec(), [0x92, 0x03, 0]);
+        let response = v1::ControlResponse {
+            payload: Some(v1::control_response::Payload::InitialIdentityState(
+                Default::default(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(response.encode_to_vec(), [0xd2, 0x01, 0]);
+        assert_eq!(v1::InitialIdentityState::decode(&[][..]).unwrap().phase, 0);
+        assert!(
+            !v1::InitialIdentityRequest::decode(&[][..])
+                .unwrap()
+                .resume_only
+        );
+        assert_eq!(
+            v1::InitialIdentityRequest {
+                resume_only: true,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            [0x20, 1]
+        );
+    }
+    #[test]
+    fn automatic_endpoint_wire_fields_are_append_only() {
+        let endpoint = v1::EndpointSettings {
+            selection: v1::EndpointSelection::Automatic as i32,
+            ..Default::default()
+        };
+        assert_eq!(endpoint.encode_to_vec(), [0x28, 1]);
+        assert_eq!(v1::EndpointSettings::decode(&[][..]).unwrap().selection, 0);
+        assert!(v1::EndpointSettings::decode(&[0x28, 0x80][..]).is_err());
+        assert_eq!(
+            v1::Capabilities {
+                automatic_endpoints: true,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            [0xd0, 0x02, 1]
+        );
+        assert_eq!(
+            agent_v1::AgentCapabilities {
+                automatic_endpoint_leases: true,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            [0x88, 0x01, 1]
+        );
+        assert_eq!(
+            agent_v1::AcquireDirectEgressRequest {
+                purpose: agent_v1::DirectEgressPurpose::AutomaticMasque as i32,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            [0x28, 1]
+        );
+        let plan = agent_v1::TunnelPlan {
+            automatic_endpoint_policy: Some(agent_v1::AutomaticEndpointPolicy {
+                pool: agent_v1::AutomaticEndpointPool::Free as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(plan.encode_to_vec(), [0x7a, 2, 8, 1]);
+        assert!(
+            agent_v1::TunnelPlan::decode(&[][..])
+                .unwrap()
+                .automatic_endpoint_policy
+                .is_none()
+        );
+    }
+
+    #[test]
     fn network_settings_wire_numbers_are_append_only() {
         let save = v1::ControlRequest {
             request_id: String::new(),
@@ -230,6 +317,48 @@ mod tests {
     }
 
     #[test]
+    fn protected_tunnel_replacement_contract_is_append_only() {
+        use agent_v1::{AgentCapabilities, AgentRequest, AgentState, agent_request};
+        let capabilities = AgentCapabilities {
+            protected_tunnel_replacement: true,
+            ..Default::default()
+        };
+        assert_eq!(capabilities.encode_to_vec(), [0x90, 0x01, 1]);
+        assert!(
+            !AgentCapabilities::decode(&[][..])
+                .unwrap()
+                .protected_tunnel_replacement
+        );
+        assert_eq!(
+            LegacyAgentCapabilities::decode(capabilities.encode_to_vec().as_slice())
+                .unwrap()
+                .protocol_version,
+            0
+        );
+        let request = AgentRequest {
+            payload: Some(agent_request::Payload::ReplaceTunnel(Default::default())),
+            ..Default::default()
+        };
+        assert_eq!(request.encode_to_vec(), [0x82, 0x02, 0]);
+        let abort = AgentRequest {
+            payload: Some(agent_request::Payload::AbortReplacement(Default::default())),
+            ..Default::default()
+        };
+        assert_eq!(abort.encode_to_vec(), [0x8a, 0x02, 0]);
+        let state = AgentState {
+            replacement: Some(Box::default()),
+            ..Default::default()
+        };
+        assert_eq!(state.encode_to_vec(), [0x62, 0]);
+        assert_eq!(
+            LegacyAgentState::decode(state.encode_to_vec().as_slice())
+                .unwrap()
+                .journal_generation,
+            0
+        );
+    }
+
+    #[test]
     fn control_request_round_trips_through_a_bounded_frame() {
         let request = ControlRequest {
             request_id: "request-1".to_owned(),
@@ -238,6 +367,116 @@ mod tests {
         let encoded = encode_frame(&request).unwrap();
         let decoded: ControlRequest = decode_frame(encoded).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn chain_exit_fields_are_append_only_wire_snapshots() {
+        let request = ControlRequest {
+            request_id: String::new(),
+            payload: Some(control_request::Payload::ChainProfile(Box::default())),
+        };
+        assert_eq!(request.encode_to_vec(), [0xfa, 0x02, 0]); // request field 47
+        let response = v1::ControlResponse {
+            payload: Some(v1::control_response::Payload::ChainProfiles(
+                Default::default(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(response.encode_to_vec(), [0xc2, 0x01, 0]); // response field 24
+        let profile = v1::Profile {
+            chain_exit: Some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(profile.encode_to_vec(), [0xb2, 0x01, 0]); // profile field 22
+        let capability = v1::Capabilities {
+            chain_profile_import: true,
+            chain_openvpn_udp: true,
+            chain_wireguard: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            capability.encode_to_vec(),
+            [0x90, 0x02, 1, 0x98, 0x02, 1, 0xa0, 0x02, 1]
+        );
+    }
+
+    #[test]
+    fn multi_endpoint_capability_is_append_only() {
+        let value = v1::Capabilities {
+            chain_openvpn_multi_endpoint: true,
+            ..Default::default()
+        };
+        assert_eq!(value.encode_to_vec(), [0xa8, 0x02, 1]);
+    }
+
+    #[test]
+    fn proxy_exit_fields_are_append_only() {
+        let capabilities = v1::Capabilities {
+            chain_http_proxy: true,
+            chain_socks5_proxy: true,
+            ..Default::default()
+        };
+        assert_eq!(capabilities.encode_to_vec(), [0xb8, 0x02, 1, 0xc0, 0x02, 1]);
+        let request = v1::ChainProfileRequest {
+            proxy: Some(v1::ProxyExitConfiguration {
+                host: "p".into(),
+                port: 80,
+                auth_mode: "none".into(),
+                dns_servers: vec![],
+                dns_transport: String::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            request.encode_to_vec(),
+            [82, 11, 10, 1, b'p', 16, 80, 26, 4, b'n', b'o', b'n', b'e']
+        );
+        let mut encrypted = request.clone();
+        encrypted.proxy.as_mut().unwrap().dns_transport = "doh".into();
+        let mut expected = request.encode_to_vec();
+        expected[1] += 5;
+        expected.extend_from_slice(&[42, 3, b'd', b'o', b'h']);
+        assert_eq!(encrypted.encode_to_vec(), expected);
+        let capability = v1::Capabilities {
+            chain_proxy_encrypted_dns: true,
+            ..Default::default()
+        };
+        assert_eq!(capability.encode_to_vec(), [0xd8, 0x02, 1]);
+        assert_eq!(v1::QueueKind::FinalDns as i32, 9);
+    }
+
+    #[test]
+    fn warp_wireguard_control_and_capability_append_without_changing_existing_fields() {
+        let request = ControlRequest {
+            payload: Some(control_request::Payload::WarpWireguard(
+                v1::WarpWireguardRequest {
+                    command_json: "{}".into(),
+                },
+            )),
+            ..Default::default()
+        };
+        assert_eq!(request.encode_to_vec(), [0x82, 0x03, 4, 10, 2, b'{', b'}']);
+        let response = v1::ControlResponse {
+            payload: Some(v1::control_response::Payload::WarpWireguard(
+                Default::default(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(response.encode_to_vec(), [0xca, 0x01, 0]);
+        let capability = v1::Capabilities {
+            chain_warp_wireguard: true,
+            ..Default::default()
+        };
+        assert_eq!(capability.encode_to_vec(), [0xb0, 0x02, 1]);
+        let settings = v1::ChainExitSettings {
+            endpoint_override_ip: Some("::1".into()),
+            endpoint_override_port: Some(500),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.encode_to_vec(),
+            [42, 3, b':', b':', b'1', 48, 0xf4, 3]
+        );
     }
 
     #[test]
@@ -304,6 +543,7 @@ mod tests {
                     control_api_candidates,
                     ..
                 }),
+                ..
             })) if operation_id == "o"
                 && control_api_candidates == &["198.51.100.10:443"]
         ));
@@ -324,6 +564,7 @@ mod tests {
                     remote_endpoint: "203.0.113.9:53".to_owned(),
                     protocol: 17,
                     expected_generation: 0,
+                    purpose: 0,
                 },
             )),
         };
@@ -519,6 +760,192 @@ mod tests {
             .encode_to_vec(),
             [0x8a, 0x01, 6, 0x08, 4, 0x10, 3, 0x18, 3]
         );
+    }
+
+    #[test]
+    fn recovery_diagnostics_are_optional_field_eighteen_and_old_readers_skip_them() {
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct LegacyPlatformState {
+            #[prost(uint64, tag = "16")]
+            journal_generation: u64,
+        }
+        let extension = agent_v1::PlatformState {
+            recovery_diagnostics: Some(Box::default()),
+            ..Default::default()
+        };
+        assert_eq!(extension.encode_to_vec(), [0x92, 0x01, 0x00]);
+        let state = agent_v1::PlatformState {
+            journal_generation: 19,
+            ..extension
+        };
+        assert_eq!(
+            LegacyPlatformState::decode(state.encode_to_vec().as_slice())
+                .unwrap()
+                .journal_generation,
+            19
+        );
+        let old = LegacyPlatformState {
+            journal_generation: 7,
+        };
+        let decoded = agent_v1::PlatformState::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.journal_generation, 7);
+        assert!(decoded.recovery_diagnostics.is_none());
+        let sample = agent_v1::RecoveryDiagnostics {
+            current: Some(agent_v1::RecoveryObservation {
+                sampled_at_unix_ms: 200,
+                journal_generation: 19,
+                status: agent_v1::RecoverySampleStatus::GenerationChanged as i32,
+                ..Default::default()
+            }),
+            history_status: agent_v1::RecoveryHistoryStatus::Missing as i32,
+            history: vec![],
+            ..Default::default()
+        };
+        assert_eq!(
+            agent_v1::RecoveryDiagnostics::decode(sample.encode_to_vec().as_slice()).unwrap(),
+            sample
+        );
+    }
+
+    #[test]
+    fn reusable_device_contract_is_append_only_and_absent_on_legacy_peers() {
+        let capabilities = AgentCapabilities {
+            reusable_tun_device: true,
+            ..Default::default()
+        };
+        assert_eq!(capabilities.encode_to_vec(), [0x80, 0x01, 0x01]);
+        assert!(
+            !AgentCapabilities::decode(&[][..])
+                .unwrap()
+                .reusable_tun_device
+        );
+        assert_eq!(
+            AgentState {
+                device: Some(Default::default()),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            [0x5a, 0]
+        );
+        assert_eq!(
+            agent_v1::PlatformState {
+                device: Some(Default::default()),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            [0x9a, 1, 0]
+        );
+        let prepare = PrepareTunnelRequest {
+            device_lease_id: "x".into(),
+            device_lease_generation: 2,
+            expected_journal_generation: 3,
+            ..Default::default()
+        };
+        assert_eq!(prepare.encode_to_vec(), [0x1a, 1, b'x', 0x20, 2, 0x28, 3]);
+        let acquire = AgentRequest {
+            payload: Some(agent_request::Payload::AcquireDeviceLease(
+                agent_v1::AcquireDeviceLeaseRequest {},
+            )),
+            ..Default::default()
+        };
+        assert_eq!(acquire.encode_to_vec(), [0xf2, 1, 0]);
+        let release = AgentRequest {
+            payload: Some(agent_request::Payload::ReleaseDeviceLease(
+                Default::default(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(release.encode_to_vec(), [0xfa, 1, 0]);
+        let granted = agent_v1::AgentResponse {
+            payload: Some(agent_v1::agent_response::Payload::DeviceLease(
+                Default::default(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(granted.encode_to_vec(), [0x8a, 1, 0]);
+        assert_eq!(
+            decode_frame::<AgentRequest>(encode_frame(&acquire).unwrap()).unwrap(),
+            acquire
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)] // Frozen legacy wire contract; production no longer emits trace data.
+    fn legacy_trace_and_resource_metrics_keep_their_wire_numbers() {
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct LegacyDiagnostics {
+            #[prost(enumeration = "agent_v1::RecoveryHistoryStatus", tag = "2")]
+            history_status: i32,
+        }
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct LegacyResource {
+            #[prost(enumeration = "agent_v1::RecoveryPresence", tag = "1")]
+            presence: i32,
+        }
+        let trace = agent_v1::RecoveryDiagnostics {
+            history_status: 1,
+            trace: Some(agent_v1::RecoveryTrace {
+                status: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(trace.encode_to_vec(), [0x10, 1, 0x22, 2, 0x08, 1]);
+        assert_eq!(
+            LegacyDiagnostics::decode(trace.encode_to_vec().as_slice())
+                .unwrap()
+                .history_status,
+            1
+        );
+        assert!(
+            agent_v1::RecoveryDiagnostics::decode([0x10, 1].as_slice())
+                .unwrap()
+                .trace
+                .is_none()
+        );
+        let resource = agent_v1::RecoveryResourceObservation {
+            presence: 1,
+            interface_oper_status: Some(7),
+            interface_admin_status: Some(2),
+            media_connect_state: Some(0),
+            devnode_status: Some(1),
+            problem_code: Some(0),
+            configret_code: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(
+            resource.encode_to_vec(),
+            [
+                0x08, 1, 0x28, 7, 0x30, 2, 0x38, 0, 0x40, 1, 0x48, 0, 0x50, 5
+            ]
+        );
+        assert_eq!(
+            LegacyResource::decode(resource.encode_to_vec().as_slice())
+                .unwrap()
+                .presence,
+            1
+        );
+        let old = agent_v1::RecoveryResourceObservation::decode([0x08, 1].as_slice()).unwrap();
+        assert!(old.configret_code.is_none());
+        assert!(old.interface_oper_status.is_none());
+        assert_eq!(
+            agent_v1::RecoveryDiagnosticApi::CmGetDevNodeStatus as i32,
+            8
+        );
+        for (stage, number) in [
+            (agent_v1::RecoveryTraceStage::RemovalAttemptStarted, 18),
+            (agent_v1::RecoveryTraceStage::RemovalAttemptReturned, 19),
+        ] {
+            let event = agent_v1::RecoveryTraceEvent {
+                stage: stage as i32,
+                ..Default::default()
+            };
+            assert_eq!(event.encode_to_vec(), [0x40, number]);
+            assert_eq!(
+                agent_v1::RecoveryTraceEvent::decode([0x40, number].as_slice()).unwrap(),
+                event
+            );
+        }
     }
 
     #[test]
@@ -761,6 +1188,58 @@ mod tests {
     }
 
     #[test]
+    fn zero_trust_endpoint_editing_wire_fields_are_append_only() {
+        let capabilities = crate::v1::Capabilities {
+            zero_trust_endpoint_editing: true,
+            ..Default::default()
+        };
+        assert_eq!(capabilities.encode_to_vec(), [0xe8, 0x02, 0x01]);
+        let status = crate::v1::ProfileIdentityStatus {
+            registered_endpoint_ipv4: "v4".into(),
+            registered_endpoint_ipv6: "v6".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            status.encode_to_vec(),
+            [0x42, 2, b'v', b'4', 0x4a, 2, b'v', b'6']
+        );
+        assert_eq!(
+            crate::v1::ProfileIdentityStatus::decode(status.encode_to_vec().as_slice()).unwrap(),
+            status
+        );
+    }
+
+    #[test]
+    fn quic_policy_and_capability_use_appended_wire_numbers() {
+        let profile = Profile {
+            disable_quic: true,
+            ..Profile::default()
+        };
+        assert_eq!(profile.encode_to_vec(), [0xa8, 0x01, 0x01]);
+        assert!(
+            Profile::decode(&*profile.encode_to_vec())
+                .unwrap()
+                .disable_quic
+        );
+        assert!(!Profile::decode(&[][..]).unwrap().disable_quic);
+        let capabilities = crate::v1::Capabilities {
+            application_quic_blocking: true,
+            ..Default::default()
+        };
+        assert_eq!(capabilities.encode_to_vec(), [0xf8, 0x01, 0x01]);
+        assert!(
+            crate::v1::Capabilities::decode(&*capabilities.encode_to_vec())
+                .unwrap()
+                .application_quic_blocking
+        );
+        assert!(
+            !crate::v1::Capabilities::decode(&[][..])
+                .unwrap()
+                .application_quic_blocking
+        );
+    }
+
+    #[test]
     fn composable_frontends_and_runtime_status_use_append_only_field_fifteen() {
         let profile = Profile {
             id: "p".to_owned(),
@@ -941,5 +1420,43 @@ mod tests {
             Err(FrameError::TooLarge(_))
         ));
         assert_eq!(stream, original);
+    }
+}
+
+#[cfg(test)]
+mod custom_bypass_tests {
+    use prost::Message;
+    #[test]
+    fn bypass_profile_and_capability_append_wire_fields() {
+        let profile = super::v1::Profile {
+            bypass_domains: vec!["a.test".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            profile.encode_to_vec(),
+            [0xba, 0x01, 6, b'a', b'.', b't', b'e', b's', b't']
+        );
+        assert_eq!(
+            super::v1::Profile::decode(profile.encode_to_vec().as_slice())
+                .unwrap()
+                .bypass_domains,
+            ["a.test"]
+        );
+        assert!(
+            super::v1::Profile::decode(&[][..])
+                .unwrap()
+                .bypass_domains
+                .is_empty()
+        );
+        let caps = super::v1::Capabilities {
+            custom_bypass: true,
+            ..Default::default()
+        };
+        assert_eq!(caps.encode_to_vec(), [0xc8, 0x02, 1]);
+        assert!(
+            !super::v1::Capabilities::decode(&[][..])
+                .unwrap()
+                .custom_bypass
+        );
     }
 }

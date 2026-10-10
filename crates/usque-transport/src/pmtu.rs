@@ -58,7 +58,10 @@ pub(crate) struct PmtuLossSample {
     pub(crate) sent: usize,
     pub(crate) lost: usize,
     pub(crate) lost_datagrams: usize,
+    /// Cumulative actual PTO expirations, independent of ACK resets.
     pub(crate) pto_count: usize,
+    /// Cumulative recovery timeout callbacks (loss-time and PTO).
+    pub(crate) loss_detection_timeout_count: usize,
     pub(crate) rtt: Duration,
 }
 
@@ -240,6 +243,26 @@ impl PmtuController {
         completed_outer_payload: Option<usize>,
         now: Instant,
     ) -> PmtuRevalidationAction {
+        self.on_send_error(key, completed_outer_payload, now, false)
+    }
+
+    /// Only for a rejected discovery packet larger than quiche's current
+    /// ordinary-send bound. Losing a probe does not invalidate smaller traffic.
+    pub(crate) fn on_probe_send_too_large(
+        &mut self,
+        key: PmtuPathKey,
+        now: Instant,
+    ) -> PmtuRevalidationAction {
+        self.on_send_error(key, None, now, true)
+    }
+
+    fn on_send_error(
+        &mut self,
+        key: PmtuPathKey,
+        completed_outer_payload: Option<usize>,
+        now: Instant,
+        probe_only: bool,
+    ) -> PmtuRevalidationAction {
         self.activate_path(key);
         let automatic = self.automatic;
         let state = self.active_state_mut();
@@ -255,7 +278,9 @@ impl PmtuController {
         }
         state.published_outer_payload = None;
         state.effective_connect_ip_payload = None;
-        state.send_suppressed_until = Some(now + SEND_ERROR_SUPPRESSION);
+        if !probe_only {
+            state.send_suppressed_until = Some(now + SEND_ERROR_SUPPRESSION);
+        }
         if completed_outer_payload.is_none() {
             state.discovery_send_errors = state.discovery_send_errors.saturating_add(1);
             if state.discovery_send_errors >= MAX_DISCOVERY_SEND_ERRORS {
@@ -296,6 +321,7 @@ impl PmtuController {
     /// Sparse/random loss, probe-only loss, idle/suspended sampling, counter
     /// reset, and an in-progress search never restart discovery. A cooldown
     /// bounds false-positive probes without overriding congestion control.
+    /// Reliable streams retain their existing timeout-callback trigger.
     pub(crate) fn on_loss_sample(
         &mut self,
         key: PmtuPathKey,
@@ -330,6 +356,7 @@ impl PmtuController {
             || sample.lost < window.baseline.lost
             || sample.lost_datagrams < window.baseline.lost_datagrams
             || sample.pto_count < window.baseline.pto_count
+            || sample.loss_detection_timeout_count < window.baseline.loss_detection_timeout_count
         {
             *window = LossWindow::new(now, sample);
             return None;
@@ -344,14 +371,17 @@ impl PmtuController {
         let lost = sample.lost - window.baseline.lost;
         let datagrams_lost = sample.lost_datagrams - window.baseline.lost_datagrams;
         let pto = sample.pto_count - window.baseline.pto_count;
+        let loss_detection_timeouts =
+            sample.loss_detection_timeout_count - window.baseline.loss_detection_timeout_count;
         *window = LossWindow::new(now, sample);
         if lost < MINIMUM_SUSPECT_LOSSES
             || if reliable_streams {
-                pto < 2
+                // Preserve L4's existing timeout-callback trigger. DATAGRAM
+                // revalidation uses actual PTOs below, excluding loss timers.
+                loss_detection_timeouts < 2
             } else {
-                datagrams_lost == 0
+                datagrams_lost == 0 || (lost.saturating_mul(4) < sent && pto < 2)
             }
-            || (lost.saturating_mul(4) < sent && pto < 2)
         {
             return None;
         }
@@ -458,6 +488,7 @@ mod tests {
             lost,
             lost_datagrams,
             pto_count,
+            loss_detection_timeout_count: pto_count,
             rtt: Duration::from_millis(50),
         }
     }
@@ -524,6 +555,99 @@ mod tests {
                 )
                 .is_some()
         );
+    }
+
+    #[test]
+    fn l4_low_loss_timeout_callbacks_preserve_legacy_revalidation() {
+        let key = path("192.0.2.10:1000", "192.0.2.20:443");
+        let now = Instant::now();
+        for (sent, lost, callbacks, expected) in [
+            (100, 3, 2, true),
+            (100, 3, 1, false),
+            (100, 2, 2, false),
+            (12, 3, 0, false),
+        ] {
+            let mut controller = PmtuController::new(key);
+            controller.set_reliable_stream_mode();
+            let baseline = PmtuLossSample {
+                loss_detection_timeout_count: 10,
+                ..loss_sample(100, 7, 0, 5)
+            };
+            controller.on_loss_sample(key, Some(1472), baseline, now);
+            let sample = PmtuLossSample {
+                loss_detection_timeout_count: 10 + callbacks,
+                ..loss_sample(100 + sent, 7 + lost, 0, 5)
+            };
+
+            // The legacy L4 trigger used timeout callbacks, even when no PTO
+            // fired and fewer than one quarter of sent packets were lost.
+            let observation =
+                controller.on_loss_sample(key, Some(1472), sample, now + Duration::from_secs(2));
+            assert_eq!(observation.is_some(), expected);
+            if let Some(observation) = observation {
+                assert_eq!(observation.phase, PmtuPhase::Revalidating);
+                assert_eq!(observation.outer_payload_bytes, None);
+            }
+        }
+    }
+
+    #[test]
+    fn datagram_low_loss_timeout_callbacks_do_not_replace_true_pto() {
+        let key = path("192.0.2.10:1000", "192.0.2.20:443");
+        let now = Instant::now();
+        for (pto, expected) in [(0, false), (1, false), (2, true)] {
+            let mut controller = PmtuController::new(key);
+            let baseline = PmtuLossSample {
+                loss_detection_timeout_count: 10,
+                ..loss_sample(100, 7, 7, 5)
+            };
+            controller.on_loss_sample(key, Some(1472), baseline, now);
+            let sample = PmtuLossSample {
+                loss_detection_timeout_count: 12,
+                ..loss_sample(200, 10, 10, 5 + pto)
+            };
+            assert_eq!(
+                controller
+                    .on_loss_sample(key, Some(1472), sample, now + Duration::from_secs(2))
+                    .is_some(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_callback_counter_reset_starts_a_new_loss_window() {
+        let key = path("192.0.2.10:1000", "192.0.2.20:443");
+        let now = Instant::now();
+        for reliable in [false, true] {
+            let mut controller = PmtuController::new(key);
+            if reliable {
+                controller.set_reliable_stream_mode();
+            }
+            let baseline = PmtuLossSample {
+                loss_detection_timeout_count: 10,
+                ..loss_sample(10, 0, 0, 2)
+            };
+            controller.on_loss_sample(key, Some(1472), baseline, now);
+            let reset = PmtuLossSample {
+                loss_detection_timeout_count: 5,
+                ..loss_sample(20, 5, 5, 4)
+            };
+            assert!(
+                controller
+                    .on_loss_sample(key, Some(1472), reset, now + Duration::from_secs(2))
+                    .is_none()
+            );
+            let sample = PmtuLossSample {
+                loss_detection_timeout_count: 7,
+                ..loss_sample(30, 10, 10, 6)
+            };
+            assert!(
+                controller
+                    .on_loss_sample(key, Some(1472), sample, now + Duration::from_secs(4))
+                    .is_some()
+            );
+        }
     }
 
     #[test]
@@ -852,6 +976,41 @@ mod tests {
         assert_eq!(completed.outer_payload_bytes, Some(1_336));
         assert_eq!(completed.phase, PmtuPhase::Stable);
         assert_eq!(controller.path_state(key).unwrap().discovery_send_errors, 0);
+    }
+
+    #[test]
+    fn probe_send_errors_do_not_pause_data_but_still_exhaust_the_discovery_budget() {
+        let key = path("192.0.2.10:1000", "192.0.2.20:443");
+        let mut controller = PmtuController::new(key);
+        let now = Instant::now();
+        for _ in 1..MAX_DISCOVERY_SEND_ERRORS {
+            assert!(matches!(
+                controller.on_probe_send_too_large(key, now),
+                PmtuRevalidationAction::ContinueDiscovery(_)
+            ));
+            assert!(controller.send_suppressed_until(now).is_none());
+        }
+        assert!(matches!(
+            controller.on_probe_send_too_large(key, now),
+            PmtuRevalidationAction::Exhausted(_)
+        ));
+    }
+
+    #[test]
+    fn probe_send_error_cannot_clear_an_ordinary_send_error_pause() {
+        let key = path("192.0.2.10:1000", "192.0.2.20:443");
+        let mut controller = PmtuController::new(key);
+        let now = Instant::now();
+        controller.on_send_too_large(key, None, now);
+        controller.on_probe_send_too_large(key, now + Duration::from_millis(10));
+        assert_eq!(
+            controller.send_suppressed_until(now),
+            Some(now + SEND_ERROR_SUPPRESSION)
+        );
+        assert!(matches!(
+            PmtuController::with_automatic(key, false).on_probe_send_too_large(key, now),
+            PmtuRevalidationAction::Exhausted(_)
+        ));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Code signing policy
 
-This policy says which Usque packages are signed, who may sign them, and how to tell an official signature from a local or third-party one. How the release workflow loads keys and checks artifacts is in [RELEASE.md](RELEASE.md). How to verify a download is in [INSTALLATION.md](INSTALLATION.md).
+This policy says which Usque packages are signed, who may sign them, and how to tell an official signature from a local or third-party one. How the release workflow loads keys and checks artifacts is in [RELEASE.md](RELEASE.md). For file-hash, signer and build-provenance commands, follow [Verify before installing](INSTALLATION.md#verify-before-installing).
 
 ## Official signatures
 
@@ -8,7 +8,7 @@ Only packages attached to a GitHub Release for this repository, with matching ch
 
 Pre-1.0 official packages use two fixed, project-controlled self-signed identities:
 
-- Windows Authenticode for the installer bundle, its detached Burn engine, the update MSI, and the project EXE/DLL files inside that MSI
+- Windows Authenticode for the installer bundle, its detached Burn engine, its native setup EXE, the update MSI, and every EXE/DLL in the Windows application payload inside that MSI except the official Wintun DLL
 - an Android release certificate for every official APK
 
 Those identities are not a public CA and are not in the Windows Root or Trusted Publisher stores. Windows will show an unknown-publisher warning. That is expected. The installer does not install the certificate into the machine trust stores.
@@ -17,10 +17,14 @@ A v1.0.0 change of signing identity is a separate release. Until then, the pre-1
 
 ## Android developer verification
 
-The Android package name `io.github.georgexie2333.usque` and current official
-release certificate are registered to a verified developer identity through
-Android developer verification. Registration records package-name and signing-key
-ownership; it is not an app-content review or Google Play distribution.
+Official Android releases require the package name
+`io.github.georgexie2333.usque` and current official release certificate to be
+registered to a verified developer identity through
+[Android developer verification](https://developer.android.com/developer-verification).
+This is Usque's release policy; platform enforcement scope follows Android's
+current documentation. Registration records package-name and signing-key ownership; it
+is not an app-content review or Google Play distribution. This document does
+not verify the live console registration state.
 
 Every official Android release must use that application ID and the certificate
 identified by `ANDROID_SIGNER_SHA256`, and that pair must remain **Registered**
@@ -32,15 +36,15 @@ before distribution. Developer verification does not authorize key rotation.
 
 | Artifact | Signer |
 | --- | --- |
-| Official Windows installer bundle and its detached Burn engine | project Authenticode identity |
+| Official Windows installer bundle, its detached Burn engine and embedded native setup EXE | project Authenticode identity |
 | Official Windows MSI | project Authenticode identity |
-| Project EXE/DLL files inside that MSI | same identity |
+| Every EXE/DLL in the Windows application payload inside that MSI, including Usque binaries and the Flutter engine and plugin DLLs from the Flutter release build, except the official Wintun DLL | same identity |
 | Official per-ABI and universal APKs | project Android release certificate |
 | Official Wintun DLL (`amd64` / `arm64`) | original vendor signature; Usque redistributes those files and does not re-sign them |
 | Local validation MSI/APK | a throwaway identity created on the build machine; never official |
 
 Unsigned project binaries must not ship in an official Windows package. The
-release signs the MSI before embedding it, then follows WiX's detach/sign/
+release signs the MSI and native setup EXE before embedding them, then follows WiX's detach/sign/
 reattach/sign sequence so both the Burn engine and final bundle carry the same
 project identity. A signer mismatch, a modified Wintun DLL, a malformed
 language transform, or a missing official fingerprint fails the release.
@@ -59,18 +63,34 @@ Public fingerprints are repository or environment variables (`WINDOWS_SIGNER_SHA
 
 Only the release maintainer may approve `release-signing` and `release-publish`. A local bundle, MSI, or APK cannot replace a failed or missing GitHub Actions build.
 
+For the planned `v0.3.1`, retain both pre-1.0 identities. Before approving signing, confirm
+the live environment protection settings, the two public certificate
+fingerprints, and Android's **Registered** application-ID/certificate pair.
+Before approving publication, review the exact tagged commit and staged
+`release-manifest.json`; its eight package names, sizes, SHA-256 values and
+signer fingerprints must describe the candidate produced by that release run.
+A documentation review, a previous release's signatures or a local compile is
+not that evidence. The workflow accepts only `v0.3.1`; complete the exact-candidate
+checks in [Preparing v0.3.1](RELEASE.md#preparing-v031)
+before creating the new tag. Documentation preparation does not authorize key
+access, signing or publication.
+
 ## What users should check
 
-Before installing:
-
-1. Download the package from the [GitHub Releases page](https://github.com/GeorgeXie2333/usque-app/releases).
-2. Compare the full package SHA-256 with the digest GitHub shows for that asset.
-3. Compare the signer fingerprint with the value in that release's notes.
-4. Check the GitHub artifact attestation when it is available.
+Follow [Verify before installing](INSTALLATION.md#verify-before-installing) for
+platform-specific commands and the output fields to compare. Check the exact
+filename's package SHA-256 against both `SHA256SUMS` and GitHub's asset digest,
+then compare the certificate's SHA-256 with that release's notes. Package hashes,
+certificate hashes and public-key hashes are different values. The guide also
+shows how to verify GitHub's build attestation.
 
 Do not import a signing certificate from an unofficial package, and do not turn off antivirus or the firewall to make an installer run.
 
-On Windows, after install, the Agent accepts the official self-signed identity only when Windows has checked the Authenticode digest and the certificate fingerprint matches the packaged value. Any other chain result is rejected.
+On Windows, after install, the Agent accepts the official self-signed identity
+only when Windows has checked the Authenticode digest and signature, the chain
+result is success (`0`) or the expected `CERT_E_UNTRUSTEDROOT`, and the
+certificate's DER SHA-256 matches the packaged value. Every other trust result
+is rejected; success never bypasses the fixed fingerprint check.
 
 ## Rotation and compromise
 
@@ -87,14 +107,14 @@ A lost backup of an official key is treated the same as a compromise: do not inv
 
 ## Local and development signing
 
-`tool/build_windows_local_validation.ps1` and similar helpers may create a temporary self-signed identity, sign a validation package, then delete the key. Those packages are for table checks and isolated VM work only. They must not be published, renamed to look like a GitHub Release, or installed on a daily-driver machine. The multilingual bundle is produced only by the approved tag workflow; local MSI validation does not create an official bundle.
+`tool/build_windows_local_validation.ps1` and similar helpers may create a temporary self-signed identity, sign a validation package, then delete the key. The local validation helper creates its throwaway certificate in `CurrentUser\My` and temporarily trusts it for the current user by importing it into `CurrentUser\TrustedPeople` and `CurrentUser\TrustedPublisher`; cleanup removes it from all three stores, deletes its private key, and fails if any removal fails. Those packages are for table checks and isolated VM work only. They must not be published, renamed to look like a GitHub Release, or installed on a daily-driver machine. The multilingual bundle is produced only by the approved tag workflow; local MSI validation does not create an official bundle.
 
 Debug and unsigned Android builds used on a developer device are not release certificates. Do not reuse the official Android keystore on a development host.
 
 ## Maintainer rules
 
 - Do not commit PFX, keystore, or password files.
-- Do not re-sign Wintun or any other third-party binary that already has a vendor signature.
+- Do not re-sign the official Wintun DLL. The release workflow excludes it by path and signs every other EXE/DLL in the payload with the project identity; it does not check whether another binary already carries a vendor signature.
 - Do not add the project certificate to Root or Trusted Publisher on user machines.
 - Do not sign a package whose contents were not produced by the approved release workflow for that tag.
 - Signing-key or release-chain issues are vulnerabilities; handle them privately as in [SECURITY.md](../SECURITY.md).

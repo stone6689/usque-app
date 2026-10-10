@@ -196,6 +196,7 @@ void main() {
           ? LocalePreference.simplifiedChinese
           : LocalePreference.english
       ..engineCapabilities = EngineCapabilities(
+        automaticEndpoints: true,
         h3CongestionControlAlgorithms: supported
             ? CongestionControlAlgorithm.values
             : const [],
@@ -237,6 +238,11 @@ void main() {
       await tester.tap(find.text('Open advanced'));
       await tester.pumpAndSettle();
     }
+    // Congestion control sits in the last section, below the fold.
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('congestion-control')),
+    );
+    await tester.pumpAndSettle();
     return app;
   }
 

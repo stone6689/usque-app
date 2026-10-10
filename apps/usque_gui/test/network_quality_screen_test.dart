@@ -5,6 +5,7 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:usque/core/usque_theme.dart';
 import 'package:usque/models/app_models.dart';
 import 'package:usque/models/diagnostics_models.dart';
+import 'package:usque/screens/diagnostics_screen.dart';
 import 'package:usque/screens/network_quality_screen.dart';
 import 'package:usque/screens/settings_screen.dart';
 import 'package:usque/screens/shell_screen.dart';
@@ -85,6 +86,46 @@ void main() {
     }
   });
 
+  testWidgets('quality scope follows the connected exit, not Gate status', (
+    tester,
+  ) async {
+    final app = qualityApp(
+      QualityEngineStub(),
+      locale: LocalePreference.simplifiedChinese,
+    );
+    addTearDown(app.dispose);
+    const profile = ChainProfileSummary(
+      id: 'wireguard',
+      revision: 'r1',
+      editRevision: 'e1',
+      name: 'WireGuard exit',
+      protocol: 'wireguard',
+      host: 'vpn.example',
+      port: 51820,
+    );
+    app.snapshot = const EngineSnapshot(
+      phase: ConnectionPhase.connected,
+      chainExit: ChainExitStatus(stage: 'connected', currentProfile: profile),
+      vpnGate: VpnGateStatus(stage: 'connected'),
+    );
+    await tester.pumpWidget(host(app));
+    expect(find.text(app.strings.get('nq_subtitle')), findsOneWidget);
+    expect(find.text(app.strings.get('gate_quality_scope')), findsNothing);
+
+    app.snapshot = const EngineSnapshot(
+      phase: ConnectionPhase.connected,
+      vpnGate: VpnGateStatus(stage: 'connected'),
+    );
+    await tester.pumpWidget(host(app));
+    expect(find.text(app.strings.get('gate_quality_scope')), findsOneWidget);
+
+    app.snapshot = const EngineSnapshot(
+      vpnGate: VpnGateStatus(stage: 'connected'),
+    );
+    await tester.pumpWidget(host(app));
+    expect(find.text(app.strings.get('nq_subtitle')), findsOneWidget);
+  });
+
   testWidgets('Quality lives in Settings with its own icon and back path', (
     tester,
   ) async {
@@ -133,17 +174,11 @@ void main() {
           );
           expect(qualityCard, findsOneWidget);
           expect(diagnosticsCard, findsOneWidget);
-          final qualityTitle = tester.widget<ContentHeading>(
-            find.descendant(
-              of: qualityCard,
-              matching: find.byType(ContentHeading),
-            ),
+          final qualityTitle = tester.widget<LinkRow>(
+            find.widgetWithText(LinkRow, app.strings.get('network_quality')),
           );
-          final diagnosticsTitle = tester.widget<ContentHeading>(
-            find.descendant(
-              of: diagnosticsCard,
-              matching: find.byType(ContentHeading),
-            ),
+          final diagnosticsTitle = tester.widget<LinkRow>(
+            find.widgetWithText(LinkRow, app.strings.get('diagnostics')),
           );
           expect(qualityTitle.icon, LucideIcons.gauge);
           expect(qualityTitle.icon, isNot(diagnosticsTitle.icon));
@@ -166,7 +201,7 @@ void main() {
           await tester.tap(qualityCard);
           await tester.pumpAndSettle();
           expect(find.byType(NetworkQualityScreen), findsOneWidget);
-          expect(navigation, findsNothing);
+          expect(navigation, size.width < 760 ? findsNothing : findsOneWidget);
           expect(app.section, AppSection.settings);
           expect(engine.modes, isEmpty);
           expect(tester.takeException(), isNull);
@@ -545,6 +580,38 @@ void main() {
       app.dispose();
     },
   );
+
+  testWidgets('rail departure closes Quality and the Doctor it opened', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1280, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final app = qualityApp(QualityEngineStub())
+      ..selectSection(AppSection.settings);
+    addTearDown(app.dispose);
+    await tester.pumpWidget(host(app, shell: true));
+    await tester.pumpAndSettle();
+    await _openQualityFromSettings(tester, app);
+    await tester.tap(
+      find.byKey(const ValueKey<String>('network-doctor-standard')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(DiagnosticsScreen), findsOneWidget);
+    await tester.tap(
+      find.descendant(
+        of: find.byType(NavigationRail),
+        matching: find.text(app.strings.get('nav_home')),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(app.section, AppSection.home);
+    expect(find.byType(DiagnosticsScreen, skipOffstage: false), findsNothing);
+    expect(
+      find.byType(NetworkQualityScreen, skipOffstage: false),
+      findsNothing,
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 
   testWidgets('one tap runs Standard; Deep requires explicit dialog consent', (
     tester,

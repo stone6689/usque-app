@@ -6,9 +6,9 @@ Thanks for helping. This project changes DNS, routes, credentials, and leak prev
 
 ## Before writing code
 
-- Search existing Issues and Pull Requests first.
-- Use a Bug Issue for a reproducible defect and a Feature Issue for a product proposal.
-- Talk through large protocol, privilege, storage, installer, release, or UX changes before building them.
+- Before opening a new Issue or Pull Request, search for an existing one covering the same work.
+- When opening an Issue, use Bug for a reproducible defect and Feature for a product proposal.
+- Resolve open design decisions for large protocol, privilege, storage, installer, release, or UX changes before implementing those decisions. An agreed scope and explicit task authorization do not need repeated confirmation; all safety and release approval rules still apply.
 - Do not use a public Issue for traffic leaks, pin bypasses, credential exposure, privilege bugs, or release-chain problems.
 - Leave the Go oracle snapshot in `oracle/go` and its attribution alone. It is a frozen local reference for interoperability, not a shipping client.
 
@@ -16,18 +16,42 @@ Thanks for helping. This project changes DNS, routes, credentials, and leak prev
 
 On a normal development machine, do not:
 
-- install a generated MSI;
+- install a generated MSI or use `usque-update.exe` to start an upgrade;
+- run `usque-uninstall.exe` against a live ProductCode;
 - start Windows VPN mode or create a TUN/Wintun session;
 - apply WFP filters, routes, interface DNS, or system-proxy changes;
-- run `usque-agent --recover-state`, `--emergency-remove-kill-switch`, or the engine `--purge-user-data` just to test a build.
+- run `usque-agent --recover-state`, `--emergency-remove-kill-switch`, or the engine `--purge-user-data` just to test a build;
+- install or exercise a release APK on a personal or shared Android device;
+- invoke `usque-reliability-runner`, provision its protected labels, or set `USQUE_ISOLATED_SNAPSHOT_VM=1` as a workstation workaround.
 
 Windows VPN, recovery, upgrade, and uninstall tests need a snapshot VM with another way in. Android VPN lifecycle tests need a dedicated device or isolated emulator.
 
+Keep the protected environments distinct:
+
+- `usque-snapshot-vm`: Windows install, upgrade, connected uninstall, crash
+  recovery, platform-state restoration, and Wintun lifecycle.
+- `usque-android-device`: Android device, Doze, process, Always-on, Lockdown,
+  reboot, upgrade, and TV lifecycle.
+- `usque-network-observer`: externally observed IPv4, IPv6, DNS, Kill Switch,
+  route, endpoint, and direct-rule leak behavior.
+- `usque-performance-lab`: controlled repeated resource and performance
+  sampling.
+
+A label or environment variable alone is not proof of isolation. Windows
+destructive tests additionally require a snapshot and independent management
+channel; Android tests require a dedicated device or isolated emulator. Detailed
+runner and evidence contracts are in
+[docs/RELIABILITY_TESTING.md](docs/RELIABILITY_TESTING.md).
+
 These are safe on a development machine: SOCKS5 and HTTP loopback tests, compile-only builds, MSI table/ICE checks, `usque-agent --validate-only`, and `usque-uninstall --dry-run` without a live ProductCode.
 
-How the Windows package uninstalls and when it deletes user data is in [docs/INSTALLATION.md](docs/INSTALLATION.md). Local Windows build traps (MSVC, CMake, Ninja, libclang) are in [AGENTS.md](AGENTS.md).
+How the Windows package uninstalls and when it deletes user data is in [docs/INSTALLATION.md](docs/INSTALLATION.md). Local Windows build traps (MSVC, CMake, Ninja, libclang) are covered under [Windows Rust and MSI authoring](#windows-rust-and-msi-authoring).
 
-If you change privileged networking or the installer and cannot run the isolated tests, say so in the pull request. Do not pretend they passed.
+If you change privileged networking or the installer and cannot run the isolated tests, say so in the pull request. Do not pretend they passed. Protected-runner execution and reports are supplemental and do not gate publication; this does not waive applicable deterministic checks, compile-only gates, or release approvals.
+
+The root `AGENTS.md` is an ignored local configuration file. Keep shared
+development procedures in tracked documentation and avoid linking to local
+instruction files from published documents.
 
 ## Toolchains
 
@@ -51,6 +75,11 @@ for versions and executable behavior. Do not commit `local.properties`, signing
 material, generated JNI libraries, build directories, logs, diagnostics, or
 release artifacts. Official signing rules are in
 [docs/CODE_SIGNING.md](docs/CODE_SIGNING.md).
+
+Linux/WSL setup, native editing, debug UI preview and the Linux check wrapper
+are described in [Linux development](docs/LINUX_DEVELOPMENT.md). The wrapper
+uses Linux tools without a Windows checkout. It does not replace the Windows
+or isolated checks in the matrix below.
 
 ## Branches, commits, and pull requests
 
@@ -87,6 +116,20 @@ tests as well:
 python -m unittest discover -s tool -p "test_release_contract.py" -v
 ```
 
+### Writing documentation
+
+Write user guides around tasks: where to open a feature, what to enter, how to
+apply it, and what success or failure looks like. Use the current interface
+labels and keep the English, Simplified Chinese, Japanese, Korean, Russian, and
+Persian root READMEs in parallel. Link to technical references for protocol, resource and
+lifecycle details.
+
+Current references describe current behavior. Historical records keep their
+original date, candidate, test counts and unavailable checks; if a record does
+not identify the complete tested source, state that limit. Update the
+[documentation index](docs/README.md) when adding a guide or reference. Shared
+safety and release rules remain authoritative when shortening repeated prose.
+
 ### Aggregate source checks
 
 For multi-language changes, the aggregate script collects format and static
@@ -115,6 +158,17 @@ cargo test --workspace --all-targets --locked
 
 Every `unsafe` block needs a `// SAFETY:` comment that states the invariants. A public unsafe API needs a rustdoc `# Safety` section.
 
+Embedded OpenVPN changes additionally require the source/notice lock check and
+the memory-only TLS/CBC peer. Initialize the Windows native environment using
+the helper above before these Cargo commands. The peer opens no OS socket or
+TUN and is excluded from production builds.
+
+```shell
+python tool/check_openvpn_sources.py
+cargo clippy -p usque-openvpn --all-targets --features interop-test --locked -- -D warnings
+cargo test -p usque-openvpn --features interop-test --locked
+```
+
 ### Flutter and Dart
 
 Analyzer settings live in `apps/usque_gui/analysis_options.yaml`.
@@ -136,6 +190,16 @@ on Windows with `flutter test --no-pub --tags golden`. CI requires both the
 Ubuntu widget suite and the Windows golden suite in `CI / gate`; neither is
 optional. Keep exact pixel comparison. Regenerate baselines only on Windows
 with the pinned SDK, review every visual diff, and never update them in CI.
+
+Linux preview changes additionally require a debug compile with the pinned SDK:
+
+```shell
+flutter build linux --debug --no-pub -t lib/main_preview.dart
+```
+
+Run this from `apps/usque_gui` after the Flutter checks above. The preview uses
+an in-memory engine and does not establish native Linux VPN support or replace
+Windows validation.
 
 ### Android Rust and Kotlin
 
@@ -167,6 +231,12 @@ build-only signing procedure in [Build](.github/workflows/build.yml), never
 official signing material on a development host. Do not install a release APK
 on a personal or shared device to validate it.
 
+Release APKs compress native libraries for direct downloads. Android extracts
+those libraries during installation, so APK bytes are not installed disk usage.
+Verify compression, native-library hashes, extraction settings, ELF/ZIP alignment
+and the build-only signer when comparing local packaging changes. Debug packaging
+retains its existing behavior.
+
 Kotlin compiler warnings and Android lint warnings are errors. ktlint is pinned through `org.jlleitschuh.gradle.ktlint` `14.2.0` and ktlint `1.8.0`.
 
 ### Python tooling
@@ -183,6 +253,16 @@ Security-rule suppressions such as `S603` or `S607` must be per-line and include
 ### PowerShell tooling
 
 Every script in `tool/` must declare `[CmdletBinding()]`, call `Set-StrictMode -Version Latest`, and set `$ErrorActionPreference = 'Stop'`.
+
+For release signing cleanup changes, also run:
+
+```shell
+pwsh -NoProfile -File tool/test_windows_release_signing.ps1
+```
+
+This executes the workflow's import and cleanup steps with inert certificate
+doubles, including failed fingerprint, missing SignTool, and cleanup-error
+paths. It never accesses a certificate store or real signing material.
 
 ```shell
 Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
@@ -212,7 +292,23 @@ Pin external Actions to a full commit SHA and put the human release in a trailin
 
 ### Windows Rust and MSI authoring
 
-Do not run a plain `cargo build --release` in a fresh Windows shell. Use the helper so MSVC, Ninja, CMake, and libclang are set up:
+Do not run a plain `cargo build --release` in a fresh Windows shell. Use the helper so MSVC, Ninja, CMake, and libclang are set up.
+
+With Visual Studio 18 Build Tools, CMake 3.22 cannot name the Visual Studio 18
+generator, so BoringSSL needs the helper's Ninja environment. When editing
+`tool/build_windows_rust_release.ps1`, preserve these invariants:
+
+- call the selected `vcvars*.bat` without `-arch` or `-host_arch`;
+- retain PATH normalization, Ninja selection, and loadable `libclang.dll`
+  discovery;
+- retain imported MSVC/Windows SDK include forwarding for vendored
+  `boring-sys` bindgen.
+
+A cached binding is not clean-shell evidence. After a failed configure, clean
+only `boring-sys` for the affected profile/target; never delete the whole
+`target` tree.
+
+Run the applicable checks and release build through the helper:
 
 ```powershell
 & .\tool\build_windows_rust_release.ps1 -Variant x64-v2 -CargoAction clippy
@@ -220,7 +316,43 @@ Do not run a plain `cargo build --release` in a fresh Windows shell. Use the hel
 & .\tool\build_windows_rust_release.ps1 -Variant x64-v2
 ```
 
-Why the helper exists is in [AGENTS.md](AGENTS.md). For MSI or installer-bundle work, restore the pinned .NET tool and follow the multilingual CI fixture build. Table, transform, bundle extraction, detach/reattach, and ICE validation are safe; running the bundle or installing the MSI is not.
+For MSI or installer-bundle work, restore the pinned .NET tool and follow the multilingual CI fixture build. Table, transform, bundle extraction, detach/reattach, and ICE validation are safe; running the bundle or installing the MSI is not.
+
+The native setup window has its own compile-only gate. Run this for `x64-v2`
+and `arm64` with the corresponding Visual Studio C++ tools. The helper downloads
+only the exact hash-locked WiX 5.0.2 SDK libraries and generates the shared
+localization header. `-Test` runs only inert state/child-process tests on a
+matching host architecture; a cross-architecture test is recorded as `not_run`.
+
+```powershell
+& ./tool/build_windows_bootstrapper.ps1 -Variant x64-v2 -OutputDirectory target/bootstrapper-x64-v2 -Test
+& ./tool/build_windows_bootstrapper.ps1 -Variant arm64 -OutputDirectory target/bootstrapper-arm64 -Test
+```
+
+Pass `-PythonPath` when Python 3.10+ is not on PATH. To inspect only simulated
+pages, add `-Preview` and open the separate `usque-setup-preview.exe`; it cannot
+enter Burn or execute installation actions, even without command-line flags.
+For the Rust uninstall preview, initialize the native environment through the
+Windows Rust helper, then use `cargo build --locked --release --target
+x86_64-pc-windows-msvc -p usque-uninstall --features preview --bin
+usque-uninstall-preview`. The preview binary is not enabled by default or
+included in the application payload. Never substitute the real installed
+uninstaller for a preview.
+
+The complete inert MSI matrix can be run using the same helper as CI. Use a new
+empty output directory per run; none of its MSI/EXE artifacts are executed.
+
+```powershell
+& ./tool/test_windows_installer_authoring.ps1 -Variant x64-v2 -BootstrapperPath target/bootstrapper-x64-v2/usque-setup.exe -OutputDirectory target/installer-authoring-x64-v2
+& ./tool/test_windows_installer_authoring.ps1 -Variant arm64 -BootstrapperPath target/bootstrapper-arm64/usque-setup.exe -OutputDirectory target/installer-authoring-arm64
+```
+
+An explicitly inert matching-architecture PE can test the authoring when a
+native compiler is unavailable, but it does not establish that the actual
+bootstrapper compiled or ran. Report that distinction. The helper includes all
+language/ICE, transform, bundle, quiet-launcher, argument, replacement and
+temporary Burn-signing tests below; it does not install a product or access
+official signing material.
 
 Run ICE validation inside the culture loop for every MSI in both architecture
 sets. `tool/test_windows_msi_localization.ps1 -MsiPath <Japanese fixture MSI>`
@@ -263,8 +395,12 @@ dart format --output=none --set-exit-if-changed lib test
 flutter analyze --no-pub
 flutter test --no-pub
 & ../../tool/prepare_windows_plugin_junctions.ps1 -FlutterProject .
-flutter build windows --release --no-pub
+flutter build windows --release --no-pub --split-debug-info=build/symbols/windows
 ```
+
+Keep Dart symbols outside the installable payload and archive them with the exact
+source and binary identity as described in [Flutter release symbols](docs/FLUTTER_SYMBOLS.md).
+Run `--analyze-size` separately from `--split-debug-info`.
 
 The plugin-junction helper is part of the checked-in Windows build sequence.
 Application assembly and binary inspection are defined in
@@ -272,7 +408,35 @@ Application assembly and binary inspection are defined in
 not install an MSI, launch VPN mode, or demonstrate cleanup or leak behavior.
 Create a local validation MSI only when explicitly requested and only after
 fresh Rust and Flutter artifacts pass their applicable checks. Follow the
-packaging safety boundary in [AGENTS.md](AGENTS.md).
+requirements in [Local validation packages](#local-validation-packages).
+
+### Local validation packages
+
+Create a local validation MSI only when explicitly requested, after fresh Rust
+and Flutter release artifacts from the same working tree pass all applicable
+checks. Pass the current SemVer shared by `Cargo.toml` and
+`apps/usque_gui/pubspec.yaml`; `tool/build_windows_local_validation.ps1`
+otherwise copies whatever artifacts already exist.
+
+The local packaging script temporarily creates and trusts a self-signed
+identity. It may require approved certificate-store access and removes its key
+and trust entries afterward. Never install, publish, or rename its output to
+look official. Keep the custom installer UI; do not replace it with stock
+`WixUI_InstallDir`.
+
+Release APK builds also require an explicit request. Use
+`tool/build_android_rust.ps1` for JNI builds and the ephemeral build-only
+signing procedure in [Build](.github/workflows/build.yml), never official
+signing material locally. Do not commit generated `jniLibs`. Before delivery,
+verify ABI contents, absence of `kernel_blob.bin` and Vulkan validation layers,
+and the signing-certificate identity.
+
+Official packages come only from the approved tag workflow and exact staged
+candidate. Local artifacts cannot replace a failed job. Accessing signing
+secrets, moving release tags, publishing releases, or uploading artifacts
+requires an explicit request and satisfied approval gates. See
+[docs/CODE_SIGNING.md](docs/CODE_SIGNING.md) and
+[docs/RELEASE.md](docs/RELEASE.md).
 
 ### Go oracle snapshot
 

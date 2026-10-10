@@ -18,6 +18,357 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class AndroidEngineMethodHandlerTest {
+    @Test
+    fun onboardingPermissionPreparationDoesNotRequireNativeEngineOrConnect() {
+        engineBridge.ready = false
+        engineBridge.linked = false
+        val result = RecordingResult()
+        handler.handle(MethodCall("prepareOnboardingPermissions", null), result)
+        assertEquals(1, activityCommands.permissionPrepareCount)
+        assertEquals(0, activityCommands.connectCount)
+        assertTrue(endpoint.whats.isEmpty())
+        assertTrue(engineBridge.commands.isEmpty())
+        assertEquals(1, result.completionCount)
+    }
+
+    @Test
+    fun initialIdentityStateQueryDoesNotQueueBehindRegistration() {
+        val directory =
+            java.nio.file.Files
+                .createTempDirectory("usque-initial-identity-test")
+        try {
+            var pending: Runnable? = null
+            val independent =
+                AndroidEngineMethodHandler(
+                    profileConfigPath = directory.resolve("profiles-v2.json").toString(),
+                    identityStore = identityStore,
+                    identityExecutor = Executor { pending = it },
+                    initialIdentityStateExecutor = Executor { it.run() },
+                    mainScheduler = scheduler,
+                    controlClient = controlClient,
+                    activityCommands = activityCommands,
+                    engineBridge = engineBridge,
+                    maintenanceBridge = maintenance,
+                    warpSecretOkCode = 0,
+                )
+            val profileId = "00000000-0000-4000-8000-000000000002"
+            engineBridge.profileCatalogJson = """{"active_profile_id":"$profileId","profiles":[{"id":"$profileId"}]}"""
+            independent.handle(
+                MethodCall(
+                    "initializeIdentity",
+                    mapOf(
+                        "operation_id" to "00000000-0000-4000-8000-000000000001",
+                        "profile_id" to profileId,
+                        "method" to "register",
+                        "terms_accepted" to true,
+                    ),
+                ),
+                RecordingResult(),
+            )
+            assertTrue(pending != null)
+            val result = RecordingResult()
+            independent.handle(MethodCall("getInitialIdentityState", mapOf("profile_id" to profileId)), result)
+            assertEquals(1, result.completionCount)
+            assertEquals("idle", (result.successValue as Map<*, *>)["phase"])
+            assertEquals(1, engineBridge.commands.size)
+            assertTrue(engineBridge.commands.single().contains("get_initial_identity_state"))
+            assertTrue(endpoint.whats.isEmpty())
+        } finally {
+            java.nio.file.Files
+                .deleteIfExists(directory.resolve("profiles-v2.initial-identity.lock"))
+            java.nio.file.Files
+                .deleteIfExists(directory)
+        }
+    }
+
+    @Test
+    fun accountDeletionCannotRaceAFirstIdentityLease() {
+        val guarded =
+            AndroidEngineMethodHandler(
+                profileConfigPath = "/tmp/profiles-v2.json",
+                initialIdentityLease = { null },
+                identityStore = identityStore,
+                identityExecutor = Executor { it.run() },
+                mainScheduler = scheduler,
+                controlClient = controlClient,
+                activityCommands = activityCommands,
+                engineBridge = engineBridge,
+                maintenanceBridge = maintenance,
+            )
+        val result = RecordingResult()
+        guarded.handle(MethodCall("deleteProfile", mapOf("profile_id" to "p1")), result)
+        assertEquals("PROFILE_STORE_FAILED", result.errorCode)
+        assertTrue(engineBridge.commands.isEmpty())
+    }
+
+    @Test
+    fun firstInitializationReusesAValidStoredAccount() {
+        val profileId = "00000000-0000-4000-8000-000000000002"
+        engineBridge.profileCatalogJson = """{"active_profile_id":"$profileId","profiles":[{"id":"$profileId"}]}"""
+        identityStore.put(profileId, SecureIdentityStore.Record.WARP_SECRET, byteArrayOf(1, 2, 3))
+        val result = RecordingResult()
+        handler.handle(
+            MethodCall(
+                "initializeIdentity",
+                mapOf(
+                    "operation_id" to "00000000-0000-4000-8000-000000000001",
+                    "profile_id" to profileId,
+                    "method" to "register",
+                    "terms_accepted" to true,
+                ),
+            ),
+            result,
+        )
+        assertEquals("completed", (result.successValue as Map<*, *>)["phase"])
+        assertEquals(true, (result.successValue as Map<*, *>)["reused"])
+        assertEquals(0, engineBridge.consumerRegistrationCount)
+        assertEquals(1, identityStore.putCount)
+        assertTrue(engineBridge.commands.none { it.contains("replacement") || it.contains("begin_initial_identity") })
+    }
+
+    @Test
+    fun dataResetDuringLicensedRegistrationUnbindsNewIdentityWithoutSavingIt() {
+        val profileId = "00000000-0000-4000-8000-000000000002"
+        engineBridge.profileCatalogJson = """{"active_profile_id":"$profileId","profiles":[{"id":"$profileId"}]}"""
+        engineBridge.afterLicensedRegistration = {
+            handler.handle(MethodCall("clearAllData", mapOf("confirmed" to true)), RecordingResult())
+        }
+        val result = RecordingResult()
+        handler.handle(
+            MethodCall(
+                "initializeIdentity",
+                mapOf(
+                    "operation_id" to "00000000-0000-4000-8000-000000000001",
+                    "profile_id" to profileId,
+                    "method" to "registerWithLicense",
+                    "license_key" to "test-key",
+                    "terms_accepted" to true,
+                ),
+            ),
+            result,
+        )
+        assertEquals("failed", (result.successValue as Map<*, *>)["phase"])
+        assertEquals(1, engineBridge.unbindCount)
+        assertNull(identityStore.get(profileId, SecureIdentityStore.Record.WARP_SECRET))
+        assertNull(identityStore.get(profileId, SecureIdentityStore.Record.LICENSE))
+        assertEquals(1, result.completionCount)
+    }
+
+    @Test
+    fun resumeOnlyWithoutJournalCannotStartRemoteRegistration() {
+        val profileId = "00000000-0000-4000-8000-000000000002"
+        engineBridge.profileCatalogJson = """{"active_profile_id":"$profileId","profiles":[{"id":"$profileId"}]}"""
+        val result = RecordingResult()
+        handler.handle(
+            MethodCall(
+                "initializeIdentity",
+                mapOf(
+                    "operation_id" to "00000000-0000-4000-8000-000000000001",
+                    "profile_id" to profileId,
+                    "method" to "register",
+                    "terms_accepted" to true,
+                    "resume_only" to true,
+                ),
+            ),
+            result,
+        )
+        assertEquals("idle", (result.successValue as Map<*, *>)["phase"])
+        assertEquals(0, engineBridge.consumerRegistrationCount)
+        assertEquals(0, identityStore.putCount)
+        assertTrue(engineBridge.commands.none { it.contains("begin_initial_identity") })
+    }
+
+    @Test
+    fun interruptedZeroTrustCandidateCompletesWithoutRemoteRegistration() {
+        val profileId = "00000000-0000-4000-8000-000000000002"
+        val request =
+            InitialIdentityCoordinator.Request(
+                "00000000-0000-4000-8000-000000000001",
+                profileId,
+                "zeroTrust",
+                "example-team",
+            )
+        engineBridge.profileCatalogJson = """{"active_profile_id":"$profileId","profiles":[{"id":"$profileId"}]}"""
+        engineBridge.applyProfileCommand("unused", request.json("begin_initial_identity").toString())
+        val candidate =
+            InitialIdentityCandidate(
+                request,
+                byteArrayOf(1, 2, 3),
+                """{"version":1,"provider":"zero_trust","organization":"example-team"}""".toByteArray(),
+                null,
+                JSONObject().put("endpoint_ipv4", "162.159.197.2").put("endpoint_ipv6", "2606:4700:102::2"),
+            )
+        val encoded = candidate.encode()
+        identityStore.put(profileId, SecureIdentityStore.Record.INITIAL_IDENTITY_CANDIDATE, encoded)
+        encoded.fill(0)
+        candidate.close()
+        val result = RecordingResult()
+        handler.handle(
+            MethodCall(
+                "initializeIdentity",
+                mapOf(
+                    "operation_id" to request.operationId,
+                    "profile_id" to profileId,
+                    "method" to "zeroTrust",
+                    "team_name" to "example-team",
+                    "terms_accepted" to true,
+                    "resume_only" to true,
+                ),
+            ),
+            result,
+        )
+        assertEquals("completed", (result.successValue as Map<*, *>)["phase"])
+        assertEquals(0, engineBridge.zeroTrustRegistrationCount)
+        assertNull(identityStore.get(profileId, SecureIdentityStore.Record.INITIAL_IDENTITY_CANDIDATE))
+        assertTrue(
+            JSONObject(
+                engineBridge.profileCatalogJson,
+            ).getJSONArray("profiles").getJSONObject(0).optString("identity_provider") ==
+                "zero_trust",
+        )
+    }
+
+    @Test
+    fun changedProfileFencePreventsCandidateVaultWritesAndReleasesLicense() {
+        val profileId = "00000000-0000-4000-8000-000000000002"
+        engineBridge.profileCatalogJson = """{"active_profile_id":"$profileId","profiles":[{"id":"$profileId"}]}"""
+        engineBridge.afterLicensedRegistration =
+            { engineBridge.profileCatalogJson = """{"active_profile_id":"other","profiles":[{"id":"$profileId"}]}""" }
+        val result = RecordingResult()
+        handler.handle(
+            MethodCall(
+                "initializeIdentity",
+                mapOf(
+                    "operation_id" to "00000000-0000-4000-8000-000000000001",
+                    "profile_id" to profileId,
+                    "method" to "registerWithLicense",
+                    "license_key" to "test-key",
+                    "terms_accepted" to true,
+                ),
+            ),
+            result,
+        )
+        assertEquals("failed", (result.successValue as Map<*, *>)["phase"])
+        assertEquals(0, identityStore.putCount)
+        assertEquals(1, engineBridge.unbindCount)
+    }
+
+    @Test
+    fun uncertainCommitKeepsCandidateAndReconcilesWithoutRegisteringAgain() {
+        val profileId = "00000000-0000-4000-8000-000000000002"
+        engineBridge.profileCatalogJson = """{"active_profile_id":"$profileId","profiles":[{"id":"$profileId"}]}"""
+        engineBridge.failCommitReply = true
+        val arguments =
+            mapOf(
+                "operation_id" to "00000000-0000-4000-8000-000000000001",
+                "profile_id" to profileId,
+                "method" to "registerWithLicense",
+                "license_key" to "test-key",
+                "terms_accepted" to true,
+            )
+        val result = RecordingResult()
+        handler.handle(MethodCall("initializeIdentity", arguments), result)
+        assertEquals("pending", (result.successValue as Map<*, *>)["phase"])
+        assertEquals(0, engineBridge.unbindCount)
+        assertTrue(identityStore.get(profileId, SecureIdentityStore.Record.INITIAL_IDENTITY_CANDIDATE) != null)
+        engineBridge.failInitialStateReads = false
+        val resumed = RecordingResult()
+        handler.handle(MethodCall("initializeIdentity", arguments - "license_key"), resumed)
+        assertEquals("completed", (resumed.successValue as Map<*, *>)["phase"])
+        assertEquals(1, engineBridge.licensedRegistrationCount)
+        assertNull(identityStore.get(profileId, SecureIdentityStore.Record.INITIAL_IDENTITY_CANDIDATE))
+        assertTrue(engineBridge.commands.none { it.contains("test-key") })
+    }
+
+    @Test
+    fun cleanupFailureRetainsEncryptedCredentialAndNeverReportsClearSuccess() {
+        identityStore.put("p1", SecureIdentityStore.Record.PENDING_CLEANUP_SECRET, byteArrayOf(4, 5, 6))
+        engineBridge.unbindResult = false
+        val result = RecordingResult()
+        handler.handle(MethodCall("clearAllData", mapOf("confirmed" to true)), result)
+        controlClient.deliverSnapshotReply(
+            endpoint.messages.last().second,
+            null,
+            null,
+            mapOf("phase" to "disconnected"),
+        )
+        assertEquals("INITIAL_IDENTITY_CLEANUP_REQUIRED", result.errorCode)
+        assertEquals(0, identityStore.clearAllCount)
+        assertTrue(identityStore.get("p1", SecureIdentityStore.Record.PENDING_CLEANUP_SECRET) != null)
+        assertTrue(engineBridge.commands.none { it.contains("clear_all_data") })
+        assertEquals(1, result.completionCount)
+    }
+
+    @Test
+    fun candidateForAnotherIntentCannotBeAdoptedOrOverwritten() {
+        val profileId = "00000000-0000-4000-8000-000000000002"
+        val request =
+            InitialIdentityCoordinator.Request(
+                "00000000-0000-4000-8000-000000000001",
+                profileId,
+                "register",
+                null,
+            )
+        engineBridge.profileCatalogJson = """{"active_profile_id":"$profileId","profiles":[{"id":"$profileId"}]}"""
+        engineBridge.applyProfileCommand("unused", request.json("begin_initial_identity").toString())
+        val candidate =
+            InitialIdentityCandidate(
+                request,
+                byteArrayOf(1, 2),
+                """{"version":1,"provider":"consumer"}""".toByteArray(),
+                null,
+                JSONObject(),
+            )
+        val encoded = candidate.encode()
+        identityStore.put(profileId, SecureIdentityStore.Record.INITIAL_IDENTITY_CANDIDATE, encoded)
+        encoded.fill(0)
+        candidate.close()
+        val result = RecordingResult()
+        handler.handle(
+            MethodCall(
+                "initializeIdentity",
+                mapOf(
+                    "operation_id" to "00000000-0000-4000-8000-000000000003",
+                    "profile_id" to profileId,
+                    "method" to "register",
+                    "terms_accepted" to true,
+                ),
+            ),
+            result,
+        )
+        assertEquals("INITIAL_IDENTITY_REPAIR_REQUIRED", result.errorCode)
+        assertEquals(0, engineBridge.consumerRegistrationCount)
+        assertEquals(1, identityStore.putCount)
+        assertNull(identityStore.get(profileId, SecureIdentityStore.Record.WARP_SECRET))
+    }
+
+    @Test
+    fun disconnectInvalidatesPendingProfileValidation() {
+        var pending: Runnable? = null
+        engineBridge.profileCatalogJson =
+            """{"profiles":[{"id":"p1","mode":"socks5","frontends":{"tunnel":false,"socks5":true,"http":false}}]}"""
+        val delayed =
+            AndroidEngineMethodHandler(
+                profileConfigPath = "/tmp/profiles-v2.json",
+                initialIdentityLease = { AutoCloseable { } },
+                identityStore = identityStore,
+                identityExecutor = Executor { pending = it },
+                mainScheduler = scheduler,
+                controlClient = controlClient,
+                activityCommands = activityCommands,
+                engineBridge = engineBridge,
+                maintenanceBridge = maintenance,
+                warpSecretOkCode = 0,
+            )
+        val result = RecordingResult()
+        delayed.handle(MethodCall("connect", mapOf("id" to "p1", "mode" to "vpn")), result)
+        delayed.handle(MethodCall("disconnect", null), RecordingResult())
+        pending!!.run()
+        assertEquals("ENGINE_REQUEST_CANCELLED", result.errorCode)
+        assertEquals(0, activityCommands.connectCount)
+        assertEquals(1, result.completionCount)
+    }
+
     private lateinit var scheduler: ImmediateScheduler
     private lateinit var controlClient: VpnControlClient
     private lateinit var endpoint: RecordingEndpoint
@@ -46,6 +397,7 @@ class AndroidEngineMethodHandlerTest {
         handler =
             AndroidEngineMethodHandler(
                 profileConfigPath = "/tmp/profiles-v2.json",
+                initialIdentityLease = { AutoCloseable { } },
                 identityStore = identityStore,
                 identityExecutor = Executor { it.run() },
                 mainScheduler = scheduler,
@@ -121,6 +473,80 @@ class AndroidEngineMethodHandlerTest {
         )
         assertEquals("INVALID_ARGUMENT", result.errorCode)
         assertTrue(endpoint.whats.isEmpty())
+    }
+
+    @Test
+    fun selectedAccountIsPersistedBeforeTheServiceDecidesProtectedReplacement() {
+        engineBridge.profileCatalogJson = """{"active_profile_id":"p2","profiles":[{"id":"p2"}]}"""
+        val result = RecordingResult()
+        handler.handle(MethodCall("setActiveProfile", mapOf("profile_id" to "p2")), result)
+        assertTrue(engineBridge.commands.single().contains("set_active_profile"))
+        assertEquals(listOf(UsqueVpnService.MSG_RECONFIGURE), endpoint.whats)
+        assertEquals(true, endpoint.lastExtras?.get("account_selection"))
+        assertEquals(
+            "p2",
+            JSONObject(endpoint.lastExtras?.get(UsqueVpnService.EXTRA_PROFILE_JSON) as String).getString("id"),
+        )
+        assertEquals(0, activityCommands.connectCount)
+        assertEquals(0, result.completionCount)
+    }
+
+    @Test
+    fun rapidAccountChangesDoNotDispatchTheSupersededSelection() {
+        val pending = mutableListOf<Runnable>()
+        val delayed =
+            AndroidEngineMethodHandler(
+                profileConfigPath = "/tmp/profiles-v2.json",
+                initialIdentityLease = { AutoCloseable { } },
+                identityStore = identityStore,
+                identityExecutor = Executor { pending.add(it) },
+                mainScheduler = scheduler,
+                controlClient = controlClient,
+                activityCommands = activityCommands,
+                engineBridge = engineBridge,
+                maintenanceBridge = maintenance,
+                warpSecretOkCode = 0,
+            )
+        val b = RecordingResult()
+        delayed.handle(MethodCall("setActiveProfile", mapOf("profile_id" to "b")), b)
+        delayed.handle(MethodCall("setActiveProfile", mapOf("profile_id" to "c")), RecordingResult())
+        engineBridge.profileCatalogJson = """{"active_profile_id":"b","profiles":[{"id":"b"}]}"""
+        pending.removeAt(0).run()
+        assertEquals(1, b.completionCount)
+        assertTrue(endpoint.whats.isEmpty())
+        engineBridge.profileCatalogJson = """{"active_profile_id":"c","profiles":[{"id":"c"}]}"""
+        pending.removeAt(0).run()
+        assertEquals(listOf(UsqueVpnService.MSG_RECONFIGURE), endpoint.whats)
+        assertEquals(
+            "c",
+            JSONObject(endpoint.lastExtras?.get(UsqueVpnService.EXTRA_PROFILE_JSON) as String).getString("id"),
+        )
+    }
+
+    @Test
+    fun accountSelectionCancelsAnOlderPendingConnectContinuation() {
+        val pending = mutableListOf<Runnable>()
+        val delayed =
+            AndroidEngineMethodHandler(
+                profileConfigPath = "/tmp/profiles-v2.json",
+                initialIdentityLease = { AutoCloseable { } },
+                identityStore = identityStore,
+                identityExecutor = Executor { pending.add(it) },
+                mainScheduler = scheduler,
+                controlClient = controlClient,
+                activityCommands = activityCommands,
+                engineBridge = engineBridge,
+                maintenanceBridge = maintenance,
+                warpSecretOkCode = 0,
+            )
+        engineBridge.profileCatalogJson =
+            """{"active_profile_id":"a","profiles":[{"id":"a","mode":"socks5","frontends":{"tunnel":false}}]}"""
+        val oldConnect = RecordingResult()
+        delayed.handle(MethodCall("connect", mapOf("id" to "a", "mode" to "socks5")), oldConnect)
+        delayed.handle(MethodCall("setActiveProfile", mapOf("profile_id" to "b")), RecordingResult())
+        pending.removeAt(0).run()
+        assertEquals("ENGINE_REQUEST_CANCELLED", oldConnect.errorCode)
+        assertEquals(0, activityCommands.connectCount)
     }
 
     @Test
@@ -291,6 +717,10 @@ class AndroidEngineMethodHandlerTest {
                 }.second,
             null,
         )
+        controlClient.deliverLogsReply(
+            endpoint.messages.last { it.first == UsqueVpnService.MSG_LOG_SNAPSHOT }.second,
+            null,
+        )
         assertEquals(1, activityCommands.diagnosticsCount)
     }
 
@@ -345,12 +775,19 @@ class AndroidEngineMethodHandlerTest {
         )
 
         controlClient.deliverTimelineReply(timelineRequestId, null)
+        controlClient.deliverLogsReply(
+            endpoint.messages.last { it.first == UsqueVpnService.MSG_LOG_SNAPSHOT }.second,
+            null,
+        )
         val frozenPayload = requireNotNull(activityCommands.diagnosticsPayload)
         assertEquals(1L, frozenPayload.snapshot["network_generation"])
         assertEquals(firstSessionId, frozenPayload.diagnosticSession?.get("session_id"))
         assertEquals(1, activityCommands.diagnosticsCount)
         assertNull(exportResult.errorCode)
         assertNull(secondResult.errorCode)
+        assertTrue(handler.matchesExportCapture(frozenPayload))
+        handler.handle(MethodCall("clearAllData", mapOf("confirmed" to true)), RecordingResult())
+        assertFalse(handler.matchesExportCapture(frozenPayload))
     }
 
     @Test
@@ -553,11 +990,20 @@ class AndroidEngineMethodHandlerTest {
             ),
             saved,
         )
+        assertEquals(0, saved.completionCount)
+        assertEquals(true, endpoint.lastExtras?.get("auth_only"))
+        controlClient.deliverSnapshotReply(
+            endpoint.messages.last().second,
+            null,
+            null,
+            mapOf("phase" to "disconnected"),
+        )
+        assertEquals(1, saved.completionCount)
         assertNull(saved.errorCode)
         assertEquals(
             "s3cret",
             identityStore
-                .get("p1", SecureIdentityStore.Record.PROXY_PASSWORD)!!
+                .get(SharedProxyCredentials.SHARED_ID, SecureIdentityStore.Record.PROXY_PASSWORD)!!
                 .toString(Charsets.UTF_8),
         )
 
@@ -574,6 +1020,13 @@ class AndroidEngineMethodHandlerTest {
             ),
             cleared,
         )
+        controlClient.deliverSnapshotReply(
+            endpoint.messages.last().second,
+            null,
+            null,
+            mapOf("phase" to "disconnected"),
+        )
+        assertNull(identityStore.get(SharedProxyCredentials.SHARED_ID, SecureIdentityStore.Record.PROXY_PASSWORD))
         assertNull(cleared.errorCode)
         assertNull(identityStore.get("p1", SecureIdentityStore.Record.PROXY_PASSWORD))
     }
@@ -1181,6 +1634,7 @@ class AndroidEngineMethodHandlerTest {
         val localHandler =
             AndroidEngineMethodHandler(
                 profileConfigPath = "/tmp/profiles-v2.json",
+                initialIdentityLease = { AutoCloseable { } },
                 identityStore = identityStore,
                 identityExecutor = Executor { it.run() },
                 mainScheduler = localScheduler,
@@ -1230,6 +1684,7 @@ class AndroidEngineMethodHandlerTest {
         val localHandler =
             AndroidEngineMethodHandler(
                 profileConfigPath = "/tmp/profiles-v2.json",
+                initialIdentityLease = { AutoCloseable { } },
                 identityStore = localIdentity,
                 identityExecutor = Executor { deferred.add(it) },
                 mainScheduler = localScheduler,
@@ -1293,6 +1748,7 @@ class AndroidEngineMethodHandlerTest {
         val localHandler =
             AndroidEngineMethodHandler(
                 profileConfigPath = "/tmp/profiles-v2.json",
+                initialIdentityLease = { AutoCloseable { } },
                 identityStore = localIdentity,
                 identityExecutor = wipeExecutor,
                 mainScheduler = localScheduler,
@@ -1359,6 +1815,17 @@ class AndroidEngineMethodHandlerTest {
         )
 
     private class RecordingActivityCommands : AndroidEngineMethodHandler.ActivityCommands {
+        var permissionPrepareCount = 0
+
+        override fun getOnboardingPermissions(result: MethodChannel.Result) {
+            result.success(mapOf("vpnGranted" to true, "notification" to "notGranted"))
+        }
+
+        override fun prepareOnboardingPermissions(result: MethodChannel.Result) {
+            permissionPrepareCount += 1
+            result.success(mapOf("vpnGranted" to true, "notification" to "notGranted"))
+        }
+
         var cancelCount = 0
         var lastCancelCode: String? = null
         var connectCount = 0
@@ -1439,6 +1906,14 @@ class AndroidEngineMethodHandlerTest {
     }
 
     private class FakeEngineBridge : AndroidEngineMethodHandler.EngineBridge {
+        var unbindResult = true
+        var licensedRegistrationCount = 0
+        var failCommitReply = false
+        var failInitialStateReads = false
+        var consumerRegistrationCount = 0
+        var unbindCount = 0
+        var afterLicensedRegistration: (() -> Unit)? = null
+        private var initialOperation: JSONObject? = null
         var ready = true
         var linked = true
         var zeroTrustFailure: IOException? = null
@@ -1456,16 +1931,74 @@ class AndroidEngineMethodHandlerTest {
             requestJson: String,
         ): String? {
             commands.add(requestJson)
+            val request = JSONObject(requestJson)
+            if (request.optString("command") == "get_initial_identity_state" &&
+                failInitialStateReads
+            ) {
+                error("state unavailable")
+            }
+            when (request.optString("command")) {
+                "begin_initial_identity" -> {
+                    initialOperation = JSONObject(request.toString()).put("phase", "pending")
+                }
+
+                "finish_initial_identity" -> {
+                    initialOperation?.put("phase", request.getString("phase"))
+                    if (request.getString("phase") == "completed") {
+                        val catalog = JSONObject(profileCatalogJson)
+                        val profiles = catalog.getJSONArray("profiles")
+                        for (index in 0 until profiles.length()) {
+                            val profile = profiles.getJSONObject(index)
+                            if (profile.getString("id") == request.getString("profile_id")) {
+                                val organization = initialOperation?.optString("organization").orEmpty()
+                                profile.put(
+                                    "identity_provider",
+                                    if (organization.isEmpty()) "consumer" else "zero_trust",
+                                )
+                                profile.put("identity_organization", organization)
+                                if (request.has(
+                                        "endpoint_ipv4",
+                                    )
+                                ) {
+                                    profile.put("endpoint_v4", request.getString("endpoint_ipv4"))
+                                }
+                                if (request.has(
+                                        "endpoint_ipv6",
+                                    )
+                                ) {
+                                    profile.put("endpoint_v6", request.getString("endpoint_ipv6"))
+                                }
+                            }
+                        }
+                        profileCatalogJson = catalog.toString()
+                        if (failCommitReply) {
+                            failCommitReply = false
+                            failInitialStateReads = true
+                            error("commit reply unavailable")
+                        }
+                    }
+                }
+            }
+            if (request.optString("command") in
+                setOf("get_initial_identity_state", "begin_initial_identity", "finish_initial_identity")
+            ) {
+                return JSONObject(profileCatalogJson).put("initial_identity_operation", initialOperation).toString()
+            }
             return profileCatalogJson
         }
 
-        override fun registerConsumerWarp(locale: String): ByteArray? = byteArrayOf(1, 2, 3)
+        override fun registerConsumerWarp(locale: String): ByteArray? {
+            consumerRegistrationCount += 1
+            return byteArrayOf(1, 2, 3)
+        }
 
         override fun registerConsumerWarpWithLicense(
             locale: String,
             licenseKey: String,
         ): ByteArray? {
             consumerLicenseFailure?.let { throw it }
+            licensedRegistrationCount += 1
+            afterLicensedRegistration?.invoke()
             return byteArrayOf(4, 5, 6)
         }
 
@@ -1490,7 +2023,10 @@ class AndroidEngineMethodHandlerTest {
                 .toByteArray()
         }
 
-        override fun unbindConsumerWarp(warpSecret: ByteArray): Boolean = true
+        override fun unbindConsumerWarp(warpSecret: ByteArray): Boolean {
+            unbindCount += 1
+            return unbindResult
+        }
 
         override fun validateWarpSecret(secret: ByteArray): Int = 0
     }

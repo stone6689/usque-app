@@ -1,26 +1,36 @@
 <p align="center">
-  <img src="assets/branding/usque-readme-banner.png" alt="Usque — unofficial client compatible with Cloudflare WARP" width="100%">
+  <img src="assets/branding/usque-readme-banner.png" alt="Usque — Unofficial client compatible with Cloudflare® WARP® services" width="100%">
 </p>
 
 <p align="center">
+  English
+  ·
   <a href="README.zh-CN.md">简体中文</a>
+  ·
+  <a href="README.ja.md">日本語</a>
+  ·
+  <a href="README.ko.md">한국어</a>
+  ·
+  <a href="README.ru.md">Русский</a>
+  ·
+  <a href="README.fa.md">فارسی</a>
 </p>
 
 <p align="center">
   <a href="https://github.com/GeorgeXie2333/usque-app/actions/workflows/pr-check.yml"><img alt="PR Check" src="https://github.com/GeorgeXie2333/usque-app/actions/workflows/pr-check.yml/badge.svg"></a>
   <a href="https://github.com/GeorgeXie2333/usque-app/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/GeorgeXie2333/usque-app/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/GeorgeXie2333/usque-app/actions/workflows/build.yml"><img alt="Build" src="https://github.com/GeorgeXie2333/usque-app/actions/workflows/build.yml/badge.svg"></a>
-  <a href="LICENSE.md"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-F48120.svg"></a>
+  <a href="LICENSE.md"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-C2500C.svg"></a>
 </p>
 
 # Usque
 
-Usque is an unofficial Cloudflare WARP client for Windows and Android / Android TV. It combines a system VPN, SOCKS5, and HTTP proxy in a native Flutter interface, powered by a Rust MASQUE engine. There is no WebView.
+Usque is an unofficial client compatible with Cloudflare® WARP® services for Windows and Android / Android TV. It combines a system VPN, SOCKS5, and HTTP proxy in a native Flutter interface, powered by a Rust MASQUE engine.
 
 > [!IMPORTANT]
 > Download official packages only from [GitHub Releases](https://github.com/GeorgeXie2333/usque-app/releases). Pull Request artifacts, local builds, and untagged binaries are not official. Development-branch documentation can describe changes not yet released; check the release notes and documentation at your package's tag.
 
-Usque is an independent project. It is not affiliated with, sponsored by, or endorsed by Cloudflare. Cloudflare and WARP are trademarks of Cloudflare, Inc. Use of consumer WARP remains subject to Cloudflare's terms and privacy policy.
+Usque is an independent project. It is not affiliated with, sponsored by, or endorsed by Cloudflare, Inc. Cloudflare and WARP are trademarks and/or registered trademarks of Cloudflare, Inc. in the United States and other jurisdictions. Use of consumer WARP services remains subject to Cloudflare's terms and privacy policy.
 
 ## Screenshots
 
@@ -32,14 +42,16 @@ Usque is an independent project. It is not affiliated with, sponsored by, or end
     </td>
     <td align="center" valign="top">
       <p><strong>Android</strong></p>
-      <img src="assets/screenshots/usque-android-home.jpg" alt="Usque Home on Android" width="280">
+      <img src="assets/screenshots/usque-android-home.png" alt="Usque Home on Android" width="280">
     </td>
   </tr>
 </table>
 
+English interface previews rendered from the current source, shown disconnected.
+
 ## Download and install
 
-The release target is **v0.2.6**, a feature and reliability release for Windows and Android. Its tag workflow produces six user-facing installers plus two Windows MSI payloads reserved for automatic updates:
+These development docs prepare **v0.3.1**; application metadata and the release workflow now target **v0.3.1 / 0.3.1+25**. The [v0.3.1 readiness review](docs/RELEASE_V0.3.1_READINESS.md) records checks and remaining requirements. For published packages, use [GitHub Releases](https://github.com/GeorgeXie2333/usque-app/releases) and documentation at the matching tag. The planned package set has six installers, plus two Windows MSI files used only by in-app updates:
 
 | Platform | Minimum OS | Packages |
 | --- | --- | --- |
@@ -47,61 +59,124 @@ The release target is **v0.2.6**, a feature and reliability release for Windows 
 | Android / Android TV | Android 8.0, API 26 | arm64-v8a, x86_64, or armeabi-v7a APK |
 | Android / Android TV | Android 8.0, API 26 | Universal APK containing all three ABIs |
 
-Choose the package matching your device architecture. Use the larger universal APK when the Android ABI is unknown. Before installing, compare the package SHA-256 with `SHA256SUMS` and GitHub's asset digest, then verify the signer fingerprint published in the release notes. Stop if any value differs.
+Choose the package matching your device architecture. Windows x64 requires a CPU supporting **x86-64-v2**; ARM64 Windows uses the native ARM64 package. Use the larger universal APK when the Android ABI is unknown. Before installing, compare the package SHA-256 with `SHA256SUMS` and GitHub's asset digest, then verify the signer fingerprint published in the release notes. Stop if any value differs.
 
 Pre-1.0 packages use fixed, project-controlled self-signed certificates. Windows may show an unknown-publisher warning; Android packages are installed outside Google Play. Do not disable antivirus or the firewall, or import certificates from unofficial packages, to bypass a warning.
 
 See [Installation and removal](docs/INSTALLATION.md) for upgrades, uninstall, recovery, and Android developer-verification details, and [Code signing](docs/CODE_SIGNING.md) for official identities. Updates require confirmation before downloading and use the platform installer; there is no unattended installation.
 
+Upgrading from v0.3.0 migrates configuration from schema 23 to 24, which v0.3.0 and older clients cannot read. Review [configuration compatibility](docs/INSTALLATION.md#configuration-compatibility-when-upgrading) and any required pre-upgrade backup before upgrading; reinstalling an older package does not reverse the migration.
+
 ## First connection
 
-1. Install a verified official package and open Usque.
-2. Complete the first-run permissions and terms steps. Register a Consumer WARP identity, optionally with a WARP License Key. New WARP Secret imports are not supported.
-3. Choose the outputs you need, then connect from Home. Android requests VPN consent when VPN output is first enabled; SOCKS5/HTTP-only use does not require it.
+1. Install a [verified official package](docs/INSTALLATION.md#verify-before-installing) and open Usque.
+2. Complete the first-run permissions and terms steps. Android requires VPN consent to finish setup; granting it may disconnect another VPN but does not start a Usque connection. Notifications are optional. Register a Consumer WARP® account, optionally with a WARP License Key. If setup was interrupted, check the saved result before registering again. Usque does not accept new WARP Secret imports.
+3. Open **Proxy → TUN and local proxies** on Windows, or **Proxy → VPN and local proxies** on Android, choose the outputs, then connect from Home. These switches take effect immediately; listener form edits require **Apply changes**. Proxy-only operation does not use the granted VPN permission to start a VPN.
 
-| Output | What it does |
+| Connection option | When to use it |
 | --- | --- |
-| VPN/TUN | Routes system traffic through the tunnel, subject to your bypass and Android per-app settings. |
-| SOCKS5 | Provides a local TCP/UDP proxy; remote DNS is the default. |
-| HTTP proxy | Provides HTTP CONNECT and ordinary HTTP forwarding. |
-| Windows system proxy | Points Windows at the local HTTP listener; requires HTTP output. |
+| VPN/TUN | Route system traffic through the tunnel, with your bypass and Android per-app rules. |
+| SOCKS5 | Give compatible applications a local TCP/UDP proxy; remote DNS is the default. |
+| HTTP proxy | Give compatible applications a local HTTP proxy, including HTTPS through CONNECT. |
+| Windows system proxy | Point Windows proxy settings at Usque's HTTP proxy; HTTP output must be enabled. |
 
-VPN, SOCKS5, and HTTP are enabled by default on both platforms; Windows system proxy is off. Outputs share one MASQUE transport and can run together. Turning every output off leaves only the transport. Identities are stored per account, with one active account at a time; network settings are shared across accounts.
+VPN, SOCKS5 and HTTP are enabled by default; Windows system proxy is off.
+They share one WARP connection and can run together. Disabling all outputs keeps
+the transport connection but stops providing these application connection options.
+Each account stores its own credentials; only one account connects at a time.
+Network settings are shared by all accounts.
 
 ## Features
 
-- Opt-in [experimental L4 proxy mode](docs/L4_PROXY.md): TCP CONNECT over H3
-  for SOCKS5, HTTP and Windows/Android TUN, with DNS conversion and
-  identity-derived Consumer/Zero Trust SNI. Auto still excludes L4.
+- Optional [chain proxy](docs/CHAIN_PROXY.md): open **Proxy → Chain proxy** for
+  **OpenVPN**, **WireGuard**, [**WARP via WireGuard**](docs/WARP_WIREGUARD.md),
+  **VPN Gate**, **HTTP**, and **SOCKS5**, in that order.
+  Import VPN configurations or add proxy servers, then select and apply one.
+  VPN, SOCKS5 and HTTP share the exit; explicit direct rules still apply. Off by default.
+- Opt-in [experimental L4 mode](docs/L4_PROXY.md) proxies TCP over HTTP/3.
+  Without an OpenVPN TCP chain, it does not forward ordinary UDP; applications that need UDP
+  may not work. Auto does not select L4.
+- Automatic HTTP/3 connections with HTTP/2 fallback. IPv4 and IPv6 connection
+  attempts help find a reachable endpoint; supported H3 network changes can
+  migrate the connection. See [path behavior](docs/h3-path-infrastructure.md).
+- Full-tunnel VPN, tunneled DNS, Kill Switch, LAN access and [DIRECT/REJECT/PROXY routing rules with Ads](docs/ROUTING.md). Custom domains and CIDRs support more-specific exceptions; conflicts are checked before saving.
+- Custom [WARP exit DNS](docs/WARP_DNS.md): open **Settings → Advanced network settings → WARP DNS**, choose Plain DNS, DoH or DoT, and select **Apply changes**. Changing DNS reconnects an established session; the final chain exit keeps its own DNS policy.
+- Optional country-based direct routing. Download the selected countries' GeoIP
+  data and the global GeoSite catalog separately. Usque uses domain rules when
+  the name is visible, otherwise IP rules; unknown destinations stay in the tunnel.
+- Local [network diagnostics](docs/network-doctor.md) and a Network Quality page
+  showing latency, packet-loss readings and availability, queues and 60-second
+  trends. Standard checks read local state; Deep checks send test requests only
+  after confirmation.
+- Windows tray with a status badge, TUN and system-proxy switches, and
+  background notifications for a reconnect lasting five seconds, a connection
+  error, and recovery after a reported interruption; single-instance activation,
+  start on boot, close-to-tray, a remembered window position and keyboard shortcuts.
+  **Ctrl+1–4** selects pages, **Ctrl+S** applies changes, and **F5** refreshes VPN Gate or diagnostics. See [tray and keyboard controls](docs/INSTALLATION.md#tray-and-keyboard-controls).
+  Android Quick Settings tile, launcher shortcuts, boot recovery and TV navigation.
+  Twenty-one languages, with light and dark themes.
+- Consumer WARP Secret export to a file you choose, after confirmation. Usque
+  cannot import that file to restore the account after reinstalling.
 
-- Consumer WARP accounts, optional License Key registration, and explicit, confirmed Secret export to a file you choose. Export does not provide an import/restore workflow in Usque.
-- Auto HTTP/3 (QUIC) with HTTP/2 (TLS) fallback and IPv4/IPv6 Happy Eyeballs for the physical path. H3 supports same-family path migration and automatic outer-path PMTU discovery.
-- Full-tunnel VPN, tunneled DNS, Kill Switch, LAN access, and custom CIDR bypass rules.
-- Optional country-based direct routing: separately downloaded per-country GeoIP data and one verified global V2Fly GeoSite catalog. Known names use GeoSite; destinations without a visible name use GeoIP. Unknown destinations stay on MASQUE.
-- A local Network Quality page with RTT, loss availability, queues, PMTU, migration, direct DNS, and 60-second trends. Network Doctor offers read-only Standard checks and explicitly authorized Deep checks.
-- Windows tray, single-instance activation, start on boot, and close-to-tray; Android Quick Settings tile, launcher shortcuts, boot recovery, and TV navigation. Twenty-one language catalogs, plus light and dark themes.
-
-Android per-app proxy is an app-wide include-only setting, not an account setting. When off, all apps use the VPN. When on, only selected apps do; newly installed apps stay outside the tunnel until selected. With Android **Block connections without VPN**, unselected apps are blocked instead of bypassing it.
+Android **Per-app proxy** applies to the whole app, across accounts. When off,
+all apps use the VPN. When on, only selected apps do; newly installed apps must
+be selected. With Android **Block connections without VPN**, unselected apps
+are blocked instead of bypassing the tunnel.
 
 ## Privacy and limits
 
-- Endpoint pinning is mandatory; there is no insecure TLS mode. Identity material is kept in Windows Credential Manager or Android Keystore. The Windows UI and Engine are unprivileged; a separate Agent manages privileged network state. Android uses a dedicated `:vpn` process.
-- Proxy listeners default to loopback. Non-loopback listeners have no authentication and display a warning. Proxy-only mode is not a system-wide VPN Kill Switch.
-- Diagnostics are local and redacted, with no analytics or automatic upload; quality history stays in memory. Logs default to INFO and are limited to 7 days or 20 MiB. Never post credentials or raw diagnostic bundles in a public Issue; report vulnerabilities through [SECURITY.md](SECURITY.md).
-- Android's in-app Kill Switch does not survive the VPN process being killed. Use system **Always-on VPN** together with **Block connections without VPN** for that protection; see the [Android installation guidance](docs/INSTALLATION.md#android-and-android-tv).
+- Usque requires the WARP server's public key to match the registered key.
+  There is no option to skip this check. Credentials stay in Windows Credential
+  Manager or Android Keystore. Windows uses a separate Agent for privileged
+  network operations; Android runs the VPN in a dedicated process.
+- Proxies listen on loopback by default. SOCKS5 and HTTP support optional
+  username/password authentication; without configured credentials they require
+  no authentication. Proxy-only mode does not provide a system-wide VPN Kill Switch.
+- Diagnostics are generated locally and redacted. There is no usage analytics
+  or automatic upload, and quality history stays in memory. Logs default to INFO
+  and are limited to 7 days or 20 MiB. Do not post credentials or raw diagnostic
+  bundles in public Issues; report vulnerabilities through [SECURITY.md](SECURITY.md).
+- Android's in-app Kill Switch cannot protect traffic after the VPN process dies.
+  VPN Gate terminal failures also end the connection. To keep apps blocked after
+  the VPN ends, enable both system **Always-on VPN** and **Block connections
+  without VPN**. See [Android setup](docs/INSTALLATION.md#android-and-android-tv).
+- Usque does not combine several paths for extra bandwidth. Some quality readings,
+  including HTTP/2 packet loss and PMTU, are unavailable. A local diagnostic pass
+  does not establish that no traffic leaked or that performance improved.
 
-Direct-country DNS is an explicit choice: **System** (default), **DoH**, or **DoT**. System exposes matching domains to the physical DNS provider; DoH/DoT exposes them to your chosen encrypted resolver, with numeric bootstrap, strict TLS, and no plaintext fallback. Other VPN queries continue through WARP DNS; proxy DNS settings remain separate. Application-owned encrypted DNS hides names from Usque, so classification uses GeoIP. Rule downloads still obey Android Lockdown and any surviving Windows Kill Switch while disconnected. See [Direct DNS](docs/encrypted-direct-dns.md).
+### DNS privacy
 
-There is one selected data plane, not multipath bandwidth aggregation. L4 may briefly keep a draining QUIC session during GOAWAY. Either physical endpoint family can carry IPv4 and IPv6 inside CONNECT-IP. Migration is same-family only; automatic PMTU does not raise the configured TUN MTU, and H2 loss and PMTU are N/A. Doctor results do not prove zero externally observed leaks or measured performance gains. Protected-runner validation is optional for publication; missing or failed evidence is never a pass.
+Country-based and custom-domain direct rules use **Current network DNS** by default: matching domain queries
+go to the DNS servers on your current network, outside the VPN. You can instead
+choose **DoH** with a full HTTPS URL or **DoT** with a server name and port.
+New drafts prefill Cloudflare; saved custom settings are preserved.
+That resolver receives the queries; connection failures do not switch them to
+plaintext DNS. See [configuration steps and examples](docs/encrypted-direct-dns.md).
 
-Zero Trust enrollment is **experimental**, limited to an organization identity using the existing MASQUE Internet tunnel. It is not production-supported Cloudflare One Client compatibility. Read its [scope and validation requirements](docs/ZERO_TRUST_EXPERIMENTAL.md) before using it. macOS source is retained but not built or released; iOS, store distribution, and a public CLI are outside the current release scope.
+Other remote VPN queries use the WARP tunnel or the selected final chain exit.
+HTTP/SOCKS5 chain DNS defaults to verified Cloudflare® DoH through that proxy;
+custom or non-default inherited DNS retains TCP DNS. With these exits,
+application-selected UDP/53 queries use TCP to that resolver, with no physical DNS fallback. See the
+[chain DNS choices](docs/CHAIN_PROXY.md#http-and-socks5-exits--http-与-socks5-出口).
+Apps that use
+their own encrypted DNS hide domain names from Usque, so direct routing uses IP
+rules. Rule downloads also respect Android Lockdown and any remaining Windows
+Kill Switch while disconnected.
+
+### Experimental and unsupported features
+
+[Zero Trust enrollment](docs/ZERO_TRUST_EXPERIMENTAL.md) is experimental. It uses
+an organization identity for the MASQUE Internet tunnel and does not provide full
+Cloudflare One™ Client compatibility. macOS source is retained but not built or
+released. iOS, store distribution and a public CLI are outside this release's scope.
 
 ## Default network settings
 
 | Setting | Default |
 | --- | --- |
-| Consumer endpoint IPv4 | `162.159.198.2` |
-| Consumer endpoint IPv6 | `2606:4700:103::2` |
+| Consumer endpoint selection | Automatic selection; existing configurations retain Custom |
+| Saved custom endpoint IPv4 | `162.159.198.2` |
+| Saved custom endpoint IPv6 | `2606:4700:103::2` |
 | Port / SNI | `443` / `speed.cloudflare.com` |
 | Transport | Auto: HTTP/3, then HTTP/2 |
 | HTTP/3 congestion control | `cubic`; BBRv2, experimental BBRv3, and `reno` are selectable |
@@ -111,7 +186,13 @@ Zero Trust enrollment is **experimental**, limited to an organization identity u
 | SOCKS5 | `127.0.0.1:1080`, `[::1]:1080` |
 | HTTP proxy | `127.0.0.1:8080`, `[::1]:8080` |
 
-Proxy address, port, and DNS edits are drafts until applied. Advanced settings reset loads defaults into the draft; it does not apply them immediately. Zero Trust endpoint addresses come from registration and are not editable.
+Proxy address and port edits are drafts until applied. Proxy DNS uses the current exit by default: configure [WARP DNS](docs/WARP_DNS.md) in Advanced settings or the final DNS in the chain configuration. The Proxy page has no DNS settings; a proxy DNS choice saved by an older version keeps working.
+
+Advanced settings reset loads defaults into the draft; it does not apply them immediately.
+
+Zero Trust endpoint addresses start with registered values. In Advanced network settings, choose **Edit Zero Trust endpoints**, read the red fullscreen warning and acknowledge the risks and your authorization before editing IPv4/IPv6; then **Apply changes**. Reset stages the registered addresses; signing in again restores them and removes custom addresses. Home keeps a risk notice visible while the selected account has custom Zero Trust addresses or a running ZT session still uses them; the notice cannot be dismissed.
+
+In Advanced network settings, Automatic selection races eligible account endpoints; Custom keeps manual addresses. Port and SNI remain editable. See [automatic endpoints](docs/NETWORK_SETTINGS.md#automatic-endpoints--自动选择端点).
 
 Congestion-control changes are saved for the next manual connection or retry,
 not applied to the current session or its automatic reconnections. HTTP/2 uses
@@ -119,11 +200,12 @@ system TCP. See [HTTP/3 congestion control](docs/congestion-control.md).
 
 ## Documentation and development
 
-Start with the [documentation index](docs/README.md). Most technical documents are in English.
+Start with the [Wiki](https://github.com/GeorgeXie2333/usque-app/wiki/Home) for setup and practical tutorials. Use the [documentation index](docs/README.md) for the complete reference; most technical documents are in English.
 
 | Need | Read |
 | --- | --- |
 | Install, update, uninstall, or recover | [Installation](docs/INSTALLATION.md) |
+| Connect to Proton VPN through the WARP tunnel | [WireGuard over MASQUE tutorial](https://github.com/GeorgeXie2333/usque-app/wiki/Proton-VPN-over-MASQUE) |
 | Understand local quality checks | [Network Doctor](docs/network-doctor.md) |
 | Build and test changes safely | [Contributing](CONTRIBUTING.md) |
 | Understand implementation and verification status | [Implementation](docs/IMPLEMENTATION.md) |
@@ -135,4 +217,13 @@ Use the pinned toolchains and change-scoped checks in the contribution guide. Co
 
 Protocol behavior follows [Diniboy1123/usque](https://github.com/Diniboy1123/usque). This repository keeps a snapshot of that client in `oracle/go` for interoperability tests. The Flutter UI and Rust engine are new code. Upstream copyright stays in the license.
 
-Source is [MIT](LICENSE.md). Third-party components keep their own licenses.
+First-party source is [MIT](LICENSE.md). Third-party components keep their own
+licenses. The optional [chain proxy](docs/CHAIN_PROXY.md) embeds OpenVPN 3
+Core under MPL-2.0 and Mbed TLS under Apache-2.0. Corresponding source, reviewed
+patches and license texts are included in `third_party`; the application exposes
+the notices from its VPN Gate page. WireGuard uses BoringTun 0.7.1 (BSD-3-Clause),
+and local SVG icons use flutter_svg 2.3.0 (MIT); their notices are in the app's license registry.
+
+---
+
+Cloudflare, WARP and Cloudflare One are trademarks and/or registered trademarks of Cloudflare, Inc. in the United States and other jurisdictions.

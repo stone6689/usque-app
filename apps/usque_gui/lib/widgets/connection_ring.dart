@@ -23,6 +23,7 @@ class ConnectionRing extends StatefulWidget {
     this.size = 232,
     this.semanticLabel,
     this.compactControl = false,
+    this.presentation,
     super.key,
   });
 
@@ -33,6 +34,10 @@ class ConnectionRing extends StatefulWidget {
   final double size;
   final String? semanticLabel;
   final bool compactControl;
+
+  /// Replaces the phase bezel while a chain session is the home status.
+  /// The action label stays with the real connection control.
+  final ConnectionPresentation? presentation;
 
   @override
   State<ConnectionRing> createState() => _ConnectionRingState();
@@ -50,7 +55,7 @@ class _ConnectionRingState extends State<ConnectionRing>
   bool _reduced = false;
 
   ConnectionPresentation get _presentation =>
-      ConnectionPresentation.of(widget.phase);
+      widget.presentation ?? ConnectionPresentation.of(widget.phase);
 
   @override
   void didChangeDependencies() {
@@ -64,7 +69,8 @@ class _ConnectionRingState extends State<ConnectionRing>
   @override
   void didUpdateWidget(covariant ConnectionRing oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.phase != widget.phase) {
+    if (oldWidget.phase != widget.phase ||
+        oldWidget.presentation?.mode != widget.presentation?.mode) {
       _syncMotion();
     }
   }
@@ -75,6 +81,11 @@ class _ConnectionRingState extends State<ConnectionRing>
     final bool reduced = UsqueMotion.reduced(context);
     _applied = mode;
     _reduced = reduced;
+    if (reduced) {
+      _controller.stop();
+      _controller.value = 1;
+      return;
+    }
     if (mode == previous) {
       // Resume a scan after reduced-motion lifts; never restart one that
       // is already travelling.
@@ -145,9 +156,14 @@ class _ConnectionRingState extends State<ConnectionRing>
             ),
             _PowerButton(
               diameter: widget.size * (widget.compactControl ? 0.68 : 0.47),
+              // Match the original 244px desktop dial's content proportions.
+              contentScale: widget.compactControl ? 1 : widget.size / 244,
               label: widget.actionLabel,
               busy: widget.busy,
-              engaged: _presentation.engaged,
+              // The bezel follows the chain stage. The control stays with the
+              // real session, so an open tunnel can still be disconnected
+              // while the exit is still being applied.
+              engaged: ConnectionPresentation.of(widget.phase).engaged,
               onPressed: widget.onPressed,
             ),
           ],
@@ -160,6 +176,7 @@ class _ConnectionRingState extends State<ConnectionRing>
 class _PowerButton extends StatefulWidget {
   const _PowerButton({
     required this.diameter,
+    required this.contentScale,
     required this.label,
     required this.busy,
     required this.engaged,
@@ -167,6 +184,7 @@ class _PowerButton extends StatefulWidget {
   });
 
   final double diameter;
+  final double contentScale;
   final String label;
   final bool busy;
 
@@ -232,10 +250,10 @@ class _PowerButtonState extends State<_PowerButton> {
                   children: <Widget>[
                     if (widget.busy)
                       SizedBox(
-                        width: 22,
-                        height: 22,
+                        width: 22 * widget.contentScale,
+                        height: 22 * widget.contentScale,
                         child: CircularProgressIndicator(
-                          strokeWidth: 2.4,
+                          strokeWidth: 2.4 * widget.contentScale,
                           color: enabled ? foreground : theme.disabledColor,
                         ),
                       )
@@ -244,15 +262,18 @@ class _PowerButtonState extends State<_PowerButton> {
                         widget.engaged
                             ? LucideIcons.powerOff
                             : LucideIcons.power,
-                        size: 24,
+                        size: 24 * widget.contentScale,
                         color: enabled ? foreground : theme.disabledColor,
                       ),
-                    const SizedBox(height: 7),
+                    SizedBox(height: 7 * widget.contentScale),
                     Text(
                       widget.label,
                       maxLines: 1,
                       textAlign: TextAlign.center,
                       style: theme.textTheme.labelLarge?.copyWith(
+                        fontSize:
+                            (theme.textTheme.labelLarge?.fontSize ?? 14) *
+                            widget.contentScale,
                         color: enabled ? foreground : theme.disabledColor,
                         fontWeight: FontWeight.w700,
                       ),

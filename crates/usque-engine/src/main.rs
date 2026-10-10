@@ -1,8 +1,9 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use usque_core::{LogLevel, storage::ConfigStore};
 use usque_engine::ControlService;
 
@@ -42,8 +43,38 @@ struct Arguments {
     socket: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let mut log_shutdown = None;
+    let result = runtime.block_on(run(&mut log_shutdown));
+    // run() finishes privileged cleanup (or records its failure) first. A
+    // pending in-memory native worker must not hold process exit indefinitely.
+    finish_runtime(runtime, std::time::Duration::from_secs(5));
+    drop(log_shutdown);
+    result
+}
+
+fn finish_runtime(runtime: tokio::runtime::Runtime, grace: std::time::Duration) {
+    let started = std::time::Instant::now();
+    info!(
+        recovery_event = "ENGINE_RUNTIME_WAIT_STARTED",
+        "Waiting for Engine runtime shutdown"
+    );
+    // This bounds waiting; it does not abort native threads or free their Arc-
+    // owned memory. Any remaining threads end when this process exits.
+    runtime.shutdown_timeout(grace);
+    info!(
+        recovery_event = "ENGINE_RUNTIME_WAIT_FINISHED",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Engine runtime shutdown wait finished"
+    );
+}
+
+async fn run(
+    log_shutdown: &mut Option<LogShutdownGuard>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let arguments = Arguments::parse();
     let config_path = arguments.config.clone();
 
@@ -58,29 +89,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let store = ConfigStore::new(config_path.clone());
-    let config = store.load_or_default()?;
-    config.validate()?;
-
     if arguments.validate_only {
+        store.load_or_default()?.validate()?;
         return Ok(());
     }
-
+    // Bootstrap diagnostics before reading user configuration. Validate-only
+    // stays side-effect free, and invalid configuration still has a local cause.
+    let log_writer = usque_engine::logging::LogWriterFactory::open(&config_path)?;
+    *log_shutdown = Some(LogShutdownGuard(log_writer.clone()));
+    let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    );
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(log_writer.clone())
+                .json(),
+        )
+        .init();
+    install_panic_logging(log_writer);
+    let config = match store.load_or_default() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(
+                error_code = "ENGINE_CONFIGURATION_LOAD_FAILED",
+                "Engine configuration could not be read"
+            );
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = config.validate() {
+        tracing::error!(
+            error_code = "ENGINE_CONFIGURATION_INVALID",
+            "Engine configuration failed validation"
+        );
+        return Err(error.into());
+    }
     let default_filter = match config.preferences.log_level {
         LogLevel::Error => "error",
         LogLevel::Warn => "warn",
         LogLevel::Info => "info",
         LogLevel::Debug => "debug",
     };
-    let log_writer = usque_engine::logging::LogWriterFactory::open(&config_path)?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    if filter_handle
+        .reload(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
-        .with_ansi(false)
-        .with_writer(log_writer)
-        .json()
-        .init();
-    install_panic_logging();
+        .is_err()
+    {
+        tracing::warn!(
+            error_code = "ENGINE_LOG_FILTER_RELOAD_FAILED",
+            "Engine log filter could not be updated"
+        );
+    }
 
     let service = ControlService::open(store)?;
     if let Err(error) = service.migrate_shared_proxy_password().await {
@@ -164,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// privacy-filtered log as the rest of the Engine diagnostics. The default
 /// hook is retained so an attached debugger or stderr collector still sees
 /// Rust's normal panic report.
-fn install_panic_logging() {
+fn install_panic_logging(log_writer: usque_engine::logging::LogWriterFactory) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let location = info.location();
@@ -181,8 +244,21 @@ fn install_panic_logging() {
             panic_column = location.map(|location| location.column()),
             "unhandled Engine panic"
         );
+        if std::thread::current().name() != Some("usque-log-writer") {
+            let _ = log_writer.flush(Duration::from_millis(250));
+        }
         default_hook(info);
     }));
+}
+
+struct LogShutdownGuard(usque_engine::logging::LogWriterFactory);
+
+impl Drop for LogShutdownGuard {
+    fn drop(&mut self) {
+        // Cover ordinary and early-error exits without making diagnostic I/O
+        // an unbounded prerequisite for platform shutdown.
+        let _ = self.0.shutdown(Duration::from_secs(2));
+    }
 }
 
 #[cfg(windows)]
@@ -191,10 +267,12 @@ async fn wait_for_parent_exit(parent_pid: Option<u32>) -> std::io::Result<()> {
         std::future::pending::<()>().await;
         unreachable!();
     };
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let _guard = cancellation.clone().drop_guard();
     tokio::task::spawn_blocking(move || {
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
-            INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
         };
 
         // SAFETY: OpenProcess may be called with any PID; on success the HANDLE
@@ -203,20 +281,92 @@ async fn wait_for_parent_exit(parent_pid: Option<u32>) -> std::io::Result<()> {
         if process.is_null() {
             return Err(std::io::Error::last_os_error());
         }
-        // SAFETY: process is a live handle owned by this task.
-        let wait_result = unsafe { WaitForSingleObject(process, INFINITE) };
+        let result = wait_for_parent_signal(&cancellation, || {
+            // SAFETY: process is a live handle owned by this task. A bounded
+            // wait lets cancellation release the handle when another exit
+            // trigger wins the select in run().
+            unsafe { WaitForSingleObject(process, 100) }
+        });
         // SAFETY: process is still owned here and is closed exactly once.
         unsafe {
             CloseHandle(process);
         }
-        if wait_result == WAIT_OBJECT_0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "WaitForSingleObject returned {wait_result}"
-            )))
-        }
+        result
     })
     .await
     .map_err(|error| std::io::Error::other(error.to_string()))?
+}
+
+#[cfg(windows)]
+fn wait_for_parent_signal(
+    cancellation: &tokio_util::sync::CancellationToken,
+    mut wait: impl FnMut() -> u32,
+) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    while !cancellation.is_cancelled() {
+        match wait() {
+            WAIT_OBJECT_0 => return Ok(()),
+            WAIT_TIMEOUT => {}
+            WAIT_FAILED => return Err(std::io::Error::last_os_error()),
+            status => {
+                return Err(std::io::Error::other(format!(
+                    "unexpected process wait status {status}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_shutdown_returns_with_a_pending_worker_without_destroying_its_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let (started, entered) = std::sync::mpsc::channel();
+        let (exited, finished) = std::sync::mpsc::channel();
+        let state = Arc::new(());
+        let worker_state = Arc::clone(&state);
+        runtime.spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = waiting.recv();
+            drop(worker_state);
+            let _ = exited.send(());
+        });
+        entered
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        finish_runtime(runtime, std::time::Duration::ZERO);
+        assert_eq!(Arc::strong_count(&state), 2);
+        release.send(()).unwrap();
+        finished
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(Arc::strong_count(&state), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_parent_monitor_does_not_wait_for_the_parent_to_exit() {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut waits = 0;
+        wait_for_parent_signal(&cancel, || {
+            waits += 1;
+            cancel.cancel();
+            WAIT_TIMEOUT
+        })
+        .unwrap();
+        assert_eq!(waits, 1);
+        wait_for_parent_signal(&cancel, || {
+            panic!("already cancelled monitor must not wait")
+        })
+        .unwrap();
+    }
 }

@@ -4,6 +4,17 @@ Source: `ts_netstack_smoltcp_core 0.4.0` from crates.io
 Upstream: <https://github.com/tailscale/tailscale-rs>
 License: BSD-3-Clause
 
+The runtime and test smoltcp dependencies are pinned to `=0.14.0`, matching
+Usque's workspace dependency. Keeping one version preserves feature unification:
+the core enables IPv4, IPv6 and socket support, while Usque selects the 16 KiB
+fragmentation buffer. Updating only the workspace would leave the core on 0.13
+and compile a separate 0.14 without the required protocol features. The core's
+standalone lockfile is updated together with the workspace lockfile.
+The core's existing `std` feature now forwards to `smoltcp/std`, and standalone
+tests enable it explicitly: smoltcp 0.14's CUBIC implementation uses standard
+floating-point operations. This retains CUBIC on the application's existing
+standard-library targets without enabling smoltcp's default physical devices.
+
 Usque carries one behavior fix in `src/lib.rs`:
 
 - Before replaying a command previously returned as `WouldBlock`, discard it
@@ -41,3 +52,33 @@ sockets retain the existing close/ownership checks.
 The outer `ts_netstack_smoltcp` crate is not patched or replaced. Usque's
 first-party packet device reserves every TX queue slot before giving smoltcp
 a token, avoiding that crate's blocking bounded-pipe send implementation.
+
+Socket creation cancellation also covers TCP connect and UDP bind, including
+the interval after a response is queued and before its handle is received.
+The core retains the response sender until the response is consumed. The
+locked flume implementation leaves an unconsumed message queued when its last
+receiver drops; tests cover both queued cancellation and successful handoff.
+Disconnected connect requests abort their pending socket and immediately free
+its TCP reservation. Already cancelled creation commands allocate nothing.
+Async creation cancellation disconnects the reply and submits a nonblocking
+`ReapCancelled` wake. A full command queue already wakes the actor, whose next
+I/O pass performs the same cleanup. No packet or external interface changes.
+
+Raw socket creation now participates in the same cancellation ownership tracking
+as UDP bind and TCP connect. Unclaimed IPv6 fragment sockets are reclaimed before
+or after response delivery, including a saturated command queue. First-party
+UDP and raw wrappers own their handles exclusively and retry Close through the
+existing bounded cleanup path; the upstream best-effort socket Drop is not used
+for final DNS or chained protocol transport.
+
+An additive `BindWithReceiveBuffer` UDP command allows a bounded receive-only
+override (at most 128 KiB and 512 metadata entries). Ordinary binds and all
+transmit buffers retain the configured sizes. Only Usque's private VPN-protocol
+underlay selects this override; DNS and SOCKS UDP associations retain their
+existing allocation policy. A 64-packet burst of 1248-byte payloads previously
+delivered only 52 packets through the 64 KiB receive ring. The first-party memory
+regression also covers 300 ACK-sized packets, eight 16000-byte datagrams, packet
+order, and an abandoned public receive waiter.
+The new bind participates in the same cancelled-creation reclamation as the
+original bind. Invalid dimensions are rejected before allocation. This changes
+bounded in-memory buffering, with no physical socket, routing or platform change.

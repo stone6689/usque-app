@@ -80,6 +80,13 @@ enum DirectDnsMode {
   DIRECT_DNS_MODE_DOT = 3;
 }
 
+enum WarpDnsMode {
+  WARP_DNS_MODE_UNSPECIFIED = 0;
+  WARP_DNS_MODE_PLAIN = 1;
+  WARP_DNS_MODE_DOH = 2;
+  WARP_DNS_MODE_DOT = 3;
+}
+
 enum IdentityProvisioningMethod {
   IDENTITY_PROVISIONING_METHOD_UNSPECIFIED = 0;
   IDENTITY_PROVISIONING_METHOD_REGISTER = 1;
@@ -143,11 +150,18 @@ enum LockdownState {
   LOCKDOWN_STATE_UNKNOWN = 4;
 }
 
+enum EndpointSelection {
+  ENDPOINT_SELECTION_UNSPECIFIED = 0;
+  ENDPOINT_SELECTION_AUTOMATIC = 1;
+  ENDPOINT_SELECTION_CUSTOM = 2;
+}
+
 message EndpointSettings {
   string ipv4 = 1;
   string ipv6 = 2;
   uint32 port = 3;
   string sni = 4;
+  EndpointSelection selection = 5;
 }
 
 message ProxySettings {
@@ -174,6 +188,14 @@ message DirectDnsSettings {
   uint32 port = 5;
 }
 
+message WarpDnsSettings {
+  WarpDnsMode mode = 1;
+  string server_name = 2;
+  string doh_path = 3;
+  repeated string bootstrap_ips = 4;
+  uint32 port = 5;
+}
+
 message Profile {
   string id = 1;
   string name = 2;
@@ -194,6 +216,181 @@ message Profile {
   DirectDnsSettings direct_dns = 17;
   CongestionControlAlgorithm congestion_control = 18;
   DataPlaneMode data_plane = 19;
+  VpnGateSettings vpn_gate = 20;
+  bool disable_quic = 21;
+  ChainExitSettings chain_exit = 22;
+  repeated string bypass_domains = 23;
+  WarpDnsSettings warp_dns = 24;
+  RoutingSettings routing = 25;
+}
+
+message RoutingSettings {
+  repeated RoutingRule rules = 1;
+  bool ads_enabled = 2;
+}
+
+message RoutingRule {
+  string id = 1;
+  string kind = 2;
+  string target = 3;
+  string action = 4;
+}
+
+message ChainExitSettings {
+  bool enabled = 1;
+  string source = 2;
+  string profile_id = 3;
+  string revision = 4;
+  optional string endpoint_override_ip = 5;
+  optional uint32 endpoint_override_port = 6;
+}
+
+// Single bounded secret-bearing request. It must never enter logs/diagnostics.
+message ChainProfileRequest {
+  string action = 1;
+  string source = 2;
+  string name = 3;
+  string profile_id = 4;
+  string revision = 5;
+  bytes configuration = 6;
+  string username = 7;
+  string password = 8;
+  string private_key_password = 9;
+  ProxyExitConfiguration proxy = 10;
+}
+
+message ProxyExitConfiguration {
+  string host = 1;
+  uint32 port = 2;
+  string auth_mode = 3;
+  repeated string dns_servers = 4;
+  string dns_transport = 5;
+}
+
+// Metadata-only JSON shared with the Android JNI and Flutter model boundary.
+message ChainProfileResponse {
+  string metadata_json = 1;
+}
+
+// Bounded metadata commands; generated keys never cross this interface.
+message WarpWireguardRequest {
+  string command_json = 1;
+}
+
+message WarpWireguardResponse {
+  string metadata_json = 1;
+}
+
+message ChainExitStatus {
+  string metadata_json = 1;
+}
+
+message VpnGateSettings {
+  bool enabled = 1;
+  string server_id = 2;
+  string config_sha256 = 3;
+}
+
+message VpnGateServer {
+  string id = 1;
+  string hostname = 2;
+  string ip = 3;
+  string country_code = 4;
+  string country_name = 5;
+  optional uint64 score = 6;
+  optional uint64 ping_ms = 7;
+  optional uint64 speed_bps = 8;
+  optional uint64 num_vpn_sessions = 9;
+  string config_sha256 = 10;
+  string unsupported_reason = 11;
+  VpnGatePoolMetadata pool = 12;
+  VpnGateFavoriteMetadata favorite = 13;
+}
+
+message VpnGatePoolMetadata {
+  string first_seen_at = 1;
+  string last_seen_at = 2;
+  bool present_in_latest_source = 3;
+  string tcp_status = 4;
+  string tcp_checked_at = 5;
+  optional uint64 tcp_connect_ms = 6;
+  bool in_pool = 7;
+}
+
+message VpnGateFavoriteMetadata {
+  string config_sha256 = 1;
+  uint64 saved_at_unix_ms = 2;
+  string latest_config_sha256 = 3;
+}
+
+message VpnGateNodeRequest {
+  string operation_id = 1;
+  string action = 2;
+  string server_id = 3;
+  string config_sha256 = 4;
+  string expected_favorite_hash = 5;
+}
+
+message VpnGateNodeProgress {
+  string operation_id = 1;
+  string server_id = 2;
+  string config_sha256 = 3;
+  string stage = 4;
+  string error = 5;
+}
+
+message VpnGateCountry {
+  string country_code = 1;
+  string country_name = 2;
+  uint32 server_count = 3;
+}
+
+message FinalNetworkParameters {
+  string ipv4 = 1;
+  string ipv6 = 2;
+  repeated string dns_servers = 3;
+  uint32 mtu = 4;
+}
+
+message VpnGateStatus {
+  string stage = 1;
+  uint64 generation = 2;
+  VpnGateServer current_server = 3;
+  FinalNetworkParameters network = 4;
+  string failure = 5;
+  string warp_stage = 6;
+}
+
+message ListVpnGateRequest {
+  string country_code = 1;
+  bool unknown_country = 2;
+  uint32 offset = 3;
+  uint32 limit = 4;
+  bool include_unsupported = 5;
+  bool favorites_only = 6;
+  // Query in-memory job status without reading directory/configuration files.
+  bool status_only = 7;
+}
+
+message RefreshVpnGateRequest {
+  bool cancel = 1;
+}
+
+message VpnGateDirectory {
+  repeated VpnGateServer servers = 1;
+  repeated VpnGateCountry countries = 2;
+  uint32 total = 3;
+  uint32 source_server_count = 4;
+  optional uint64 fetched_at_unix_ms = 5;
+  string source_url = 6;
+  string refresh_stage = 7;
+  repeated string refresh_failures = 8;
+  bool cached = 9;
+  VpnGateStatus status = 10;
+  VpnGateServer saved_server = 11;
+  uint32 favorite_count = 12;
+  string source_fetched_at = 13;
+  VpnGateNodeProgress node_progress = 14;
 }
 
 message Statistics {
@@ -282,6 +479,24 @@ message Capabilities {
   bool l4_tcp = 26;
   bool l4_tun_tcp = 27;
   bool l4_dns_conversion = 28;
+  bool vpn_gate_tcp = 29;
+  bool vpn_gate_pool_favorites = 30;
+  bool application_quic_blocking = 31;
+  bool account_metadata_mutations = 32;
+  bool shared_proxy_auth_application = 33;
+  bool chain_profile_import = 34;
+  bool chain_openvpn_udp = 35;
+  bool chain_wireguard = 36;
+  bool chain_openvpn_multi_endpoint = 37;
+  bool chain_warp_wireguard = 38;
+  bool chain_http_proxy = 39;
+  bool chain_socks5_proxy = 40;
+  bool custom_bypass = 41;
+  bool automatic_endpoints = 42;
+  bool chain_proxy_encrypted_dns = 43;
+  bool encrypted_warp_dns = 44;
+  bool zero_trust_endpoint_editing = 45;
+  bool routing_rules = 46;
 }
 
 message FrontendStatus {
@@ -313,6 +528,9 @@ message ConnectionSnapshot {
   CongestionControlAlgorithm session_congestion_control = 18;
   DataPlaneMode data_plane = 19;
   L4Snapshot l4 = 20;
+  VpnGateStatus vpn_gate = 21;
+  ChainExitStatus chain_exit = 22;
+  string ads_rule_revision = 23;
 }
 
 // No destinations, DNS content, connection IDs, or credential material.
@@ -446,6 +664,10 @@ message RetryRequest {}
 message UpsertProfileRequest {
   Profile profile = 1;
 }
+message RenameProfileRequest {
+  string profile_id = 1;
+  string name = 2;
+}
 message DeleteProfileRequest {
   string profile_id = 1;
 }
@@ -512,6 +734,24 @@ message DiagnosticFinding {
   int64 started_at_unix_milliseconds = 9;
   uint64 duration_milliseconds = 10;
   string dependency_reason = 11;
+  DiagnosticObservation observation = 12;
+  repeated DiagnosticEvidence evidence = 13;
+}
+
+// Append-only optional evidence metadata. Absent metadata is unknown.
+message DiagnosticObservation {
+  string source = 1;
+  string availability = 2;
+  uint64 age_milliseconds = 3;
+  string connection_instance_id = 4;
+  uint64 network_generation = 5;
+}
+
+// Exactly one allowlisted token or unsigned number is exported.
+message DiagnosticEvidence {
+  string key = 1;
+  optional uint64 number = 2;
+  string token = 3;
 }
 
 message DiagnosticSummary {
@@ -532,6 +772,8 @@ message DiagnosticSession {
   uint32 progress_percent = 7;
   repeated DiagnosticFinding findings = 8;
   DiagnosticSummary summary = 9;
+  repeated string active_checks = 10;
+  uint64 revision = 11;
 }
 
 message StartDiagnosticsRequest {
@@ -578,6 +820,7 @@ enum ConnectionEventType {
   CONNECTION_EVENT_TYPE_PMTU_REVALIDATION_FAILED = 28;
   CONNECTION_EVENT_TYPE_DIRECT_DNS_DEGRADED = 29;
   CONNECTION_EVENT_TYPE_DIRECT_DNS_RECOVERED = 30;
+  CONNECTION_EVENT_TYPE_QUEUE_BACKPRESSURED = 31;
 }
 
 message ConnectionEvent {
@@ -590,6 +833,7 @@ message ConnectionEvent {
   string address_family = 7;
   uint64 duration_milliseconds = 8;
   TransportFailure failure = 9;
+  QueueKind queue_kind = 10;
 }
 
 message ConnectionMetrics {
@@ -688,6 +932,7 @@ enum QueueKind {
   QUEUE_KIND_TRANSPORT_TO_TUN = 6;
   QUEUE_KIND_TRANSPORT_TO_PROXY = 7;
   QUEUE_KIND_DIRECT_DNS = 8;
+  QUEUE_KIND_FINAL_DNS = 9;
 }
 
 message QueueQuality {
@@ -707,6 +952,7 @@ message QueueQuality {
   uint64 dequeue_count = 14;
   bool closed = 15;
   bool cancelled = 16;
+  QueueBackpressure backpressure = 17;
 }
 
 message PmtuQuality {
@@ -753,6 +999,7 @@ message NetworkQualitySnapshot {
   // At most 16 real source observations; not interpolated or persisted.
   repeated NetworkQualitySample samples = 9;
   UdpSocketReceiveSnapshot udp_socket_receive = 10;
+  TransportPerformance transport_performance = 11;
 }
 
 message UdpSocketReceiveSnapshot {
@@ -780,6 +1027,10 @@ message ConnectionTimeline {
   repeated ConnectionEvent events = 1;
   ConnectionMetrics metrics = 2;
   uint64 dropped_event_count = 3;
+  string connection_instance_id = 4;
+  bool retained = 5;
+  uint64 session_generation = 6;
+  DiagnosticObservation observation = 7;
 }
 message ClearAllDataRequest {
   bool confirmed = 1;
@@ -793,6 +1044,34 @@ message ProvisionIdentityRequest {
   bytes license_key = 6;
   IdentityProvisioningMethod method = 7;
   ZeroTrustEnrollment zero_trust = 8;
+}
+
+// Initial provisioning never replaces an existing identity. Transport timeouts
+// are reconciled through the durable operation state instead of replayed.
+message InitialIdentityRequest {
+  string operation_id = 1;
+  string profile_id = 2;
+  IdentityProvisioning provisioning = 3;
+  // Recover local results only; never reserve an operation or register remotely.
+  bool resume_only = 4;
+}
+message GetInitialIdentityStateRequest {
+  string profile_id = 1;
+}
+enum InitialIdentityPhase {
+  INITIAL_IDENTITY_PHASE_UNSPECIFIED = 0;
+  INITIAL_IDENTITY_PHASE_IDLE = 1;
+  INITIAL_IDENTITY_PHASE_PENDING = 2;
+  INITIAL_IDENTITY_PHASE_INTERRUPTED = 3;
+  INITIAL_IDENTITY_PHASE_COMPLETED = 4;
+  INITIAL_IDENTITY_PHASE_FAILED = 5;
+}
+message InitialIdentityState {
+  string operation_id = 1;
+  string profile_id = 2;
+  InitialIdentityPhase phase = 3;
+  string error_code = 4;
+  bool reused = 5;
 }
 
 message ZeroTrustEnrollment {
@@ -823,6 +1102,8 @@ message ProfileIdentityStatus {
   bool cleanup_pending = 5;
   IdentityProvider provider = 6;
   string organization = 7;
+  string registered_endpoint_ipv4 = 8;
+  string registered_endpoint_ipv6 = 9;
 }
 
 message ReconfigureActiveProfileRequest {
@@ -875,6 +1156,8 @@ message GeoRulesList {
   int64 last_successful_update_unix_milliseconds = 2;
   bool has_global_geosite = 3;
   int64 global_geosite_updated_unix_milliseconds = 4;
+  bool has_ads = 5;
+  string ads_revision = 6;
 }
 
 enum GeoRulesUpdateStatus {
@@ -938,6 +1221,8 @@ message NetworkSettingsState {
   repeated string deferred_fields = 8;
   string error_code = 9;
   optional bool persisted = 10;
+  // Shared settings without a registration-owned endpoint overlay.
+  Profile shared_network_profile = 11;
 }
 
 message ControlRequest {
@@ -977,6 +1262,14 @@ message ControlRequest {
     GetNetworkQualityRequest get_network_quality = 40;
     SaveNetworkSettingsRequest save_network_settings = 41;
     GetNetworkSettingsStateRequest get_network_settings_state = 42;
+    ListVpnGateRequest list_vpn_gate = 43;
+    RefreshVpnGateRequest refresh_vpn_gate = 44;
+    VpnGateNodeRequest vpn_gate_node = 45;
+    RenameProfileRequest rename_profile = 46;
+    ChainProfileRequest chain_profile = 47;
+    WarpWireguardRequest warp_wireguard = 48;
+    InitialIdentityRequest initial_identity = 49;
+    GetInitialIdentityStateRequest get_initial_identity_state = 50;
   }
 }
 
@@ -984,6 +1277,7 @@ message ProfileList {
   repeated Profile profiles = 1;
   string active_profile_id = 2;
   repeated ProfileIdentityStatus identity_statuses = 3;
+  Profile shared_network_profile = 4;
 }
 
 message UpdatePackage {
@@ -1019,6 +1313,10 @@ message ControlResponse {
     ConnectionTimeline connection_timeline = 20;
     NetworkQualitySnapshot network_quality = 21;
     NetworkSettingsState network_settings = 22;
+    VpnGateDirectory vpn_gate_directory = 23;
+    ChainProfileResponse chain_profiles = 24;
+    WarpWireguardResponse warp_wireguard = 25;
+    InitialIdentityState initial_identity_state = 26;
   }
 }
 
@@ -1070,6 +1368,10 @@ message DiagnosticSessionCancelled {
   DiagnosticSession session = 1;
 }
 
+message DiagnosticSessionSnapshot {
+  DiagnosticSession session = 1;
+}
+
 message EventEnvelope {
   uint64 sequence = 1;
   oneof payload {
@@ -1088,5 +1390,51 @@ message EventEnvelope {
     DiagnosticSessionCancelled diagnostic_session_cancelled = 22;
     NetworkQualityUpdated network_quality_updated = 23;
     NetworkSettingsState network_settings_changed = 24;
+    DiagnosticSessionSnapshot diagnostics_snapshot = 25;
   }
+}
+
+message QueueBackpressure {
+  uint64 waits = 1;
+  uint64 active = 2;
+  uint64 completed = 3;
+  uint64 cancelled = 4;
+  uint64 closed = 5;
+  uint64 errors = 6;
+  uint64 total_us = 7;
+  uint64 max_us = 8;
+  repeated uint64 buckets = 9;
+}
+
+message H2ReceivePerformance {
+  uint64 data_frames = 1;
+  uint64 data_bytes = 2;
+  uint64 assembly_copy_bytes = 3;
+  uint64 batches = 4;
+  uint64 packets = 5;
+  uint64 packet_bytes = 6;
+}
+
+message H3SendPerformance {
+  uint64 application_batches = 1;
+  uint64 application_packets = 2;
+  uint64 application_bytes = 3;
+  uint64 encode_pool_exhausted = 4;
+  uint64 datagram_queue_full = 5;
+  uint64 pmtu_deferred = 6;
+  uint64 wire_queue_full = 7;
+  uint64 quantum_limited = 8;
+  uint64 quic_no_progress_with_backlog = 9;
+  uint64 udp_would_block = 10;
+  uint64 udp_partial_sends = 11;
+  uint64 udp_message_too_large = 12;
+}
+
+message TransportPerformance {
+  H2ReceivePerformance h2 = 1;
+  H3SendPerformance h3 = 2;
+  uint64 incoming_copy_bytes = 3;
+  uint64 send_timeouts = 4;
+  repeated uint64 h2_batch_sizes = 5;
+  repeated uint64 h3_batch_sizes = 6;
 }

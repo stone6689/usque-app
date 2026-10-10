@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
+use crate::outbound_packet::OutboundPacket;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, timeout};
@@ -22,8 +23,8 @@ use usque_core::{
 use usque_protocol::{IpAddressRange, IpPrefix, PeerNetworkState};
 
 use crate::geo_direct::GeoDirectPolicy;
-use crate::h2::{MasqueTlsIdentity, TransportError, connect_h2_with_protector};
-use crate::h3::{H3MigrationResult, connect_h3_with_protector};
+use crate::h2::{MasqueTlsIdentity, TransportError};
+use crate::h3::H3MigrationResult;
 use crate::network_quality::{NetworkQualitySnapshot, spawn_network_quality_sampler_with_counters};
 use crate::packet_batch::{
     MAX_PACKET_BATCH_BYTES, PACKET_BATCH_CHANNEL_CAPACITY, PacketBatch, PacketBatchResult,
@@ -36,6 +37,7 @@ use crate::pin_refresh::EndpointPinRefresher;
 use crate::queue_metrics::{
     QueueKind, TrackedReceiver, TrackedSendErrorKind, TrackedSender, tracked_channel,
 };
+use crate::recovery_policy::RecoveryDecision;
 use crate::socket::SocketProtector;
 use crate::telemetry::{
     ConnectionAttemptTelemetry, ConnectionEventPath, ConnectionEventType, ConnectionTelemetry,
@@ -43,6 +45,11 @@ use crate::telemetry::{
 };
 use crate::tunnel::{BatchSendFuture, MasqueTunnel};
 
+#[cfg(test)]
+mod ownership_tests;
+mod reconnect;
+#[cfg(test)]
+mod reconnect_tests;
 #[cfg(test)]
 mod shutdown_tests;
 
@@ -169,6 +176,8 @@ impl TrafficCounters {
 }
 
 pub(crate) struct PacketStack {
+    pub(crate) warp_dns: Option<Arc<crate::encrypted_dns::FinalDohResolver>>,
+    pub(crate) traffic_policy: Arc<crate::application_traffic::ApplicationTrafficPolicy>,
     pub(crate) channel: Channel,
     pub(crate) protector: Arc<dyn SocketProtector>,
     pub(crate) geo_policy: Arc<GeoDirectPolicy>,
@@ -198,6 +207,7 @@ impl PacketStack {
         protector: Arc<dyn SocketProtector>,
         geo_policy: Arc<GeoDirectPolicy>,
     ) -> Result<(Self, WakingPipe), TransportError> {
+        crate::encrypted_dns::validate_warp_dns_support(profile)?;
         let cancellation = parent_cancellation.child_token();
         let protector = crate::encrypted_dns::configure_direct_dns(
             &profile.direct_dns,
@@ -211,27 +221,34 @@ impl PacketStack {
         let channel = stack.command_channel();
         let stack_task = stack.spawn_tokio();
         channel
-            .set_ips([IpAddr::V4(assigned_ipv4), IpAddr::V6(assigned_ipv6)])
+            .set_ips(
+                [IpAddr::V4(assigned_ipv4), IpAddr::V6(assigned_ipv6)]
+                    .into_iter()
+                    .filter(|ip| !ip.is_unspecified()),
+            )
             .await
             .map_err(|error| TransportError::Netstack(error.to_string()))?;
 
-        Ok((
-            Self {
-                channel,
-                protector,
-                geo_policy,
-                cancellation,
-                failure: monitor.failure.clone(),
-                counters: Arc::clone(&monitor.counters),
-                tcp_buffer_metrics,
-                health: monitor.health.clone(),
-                telemetry: monitor.telemetry.clone(),
-                quality: monitor.quality.clone(),
-                _control: monitor.control.clone(),
-                tasks: vec![stack_task],
-            },
-            pipe,
-        ))
+        let mut packet_stack = Self {
+            warp_dns: None,
+            channel,
+            traffic_policy: Arc::new(crate::application_traffic::ApplicationTrafficPolicy::new(
+                profile.disable_quic,
+            )),
+            protector,
+            geo_policy,
+            cancellation,
+            failure: monitor.failure.clone(),
+            counters: Arc::clone(&monitor.counters),
+            tcp_buffer_metrics,
+            health: monitor.health.clone(),
+            telemetry: monitor.telemetry.clone(),
+            quality: monitor.quality.clone(),
+            _control: monitor.control.clone(),
+            tasks: vec![stack_task],
+        };
+        packet_stack.configure_warp_dns(profile, assigned_addresses)?;
+        Ok((packet_stack, pipe))
     }
 
     pub(crate) async fn start_with_refresh(
@@ -241,6 +258,12 @@ impl PacketStack {
         pin_refresher: Option<Arc<dyn EndpointPinRefresher>>,
     ) -> Result<Self, TransportError> {
         crate::encrypted_dns::validate_direct_dns_support(&profile.direct_dns)?;
+        crate::encrypted_dns::validate_warp_dns_support(profile)?;
+        let geo_policy = Arc::new(
+            GeoDirectPolicy::disabled()
+                .with_custom_rules(profile)
+                .map_err(|error| TransportError::Netstack(error.to_string()))?,
+        );
         let telemetry = ConnectionTelemetry::default();
         telemetry.reset_attempt();
         let (tunnel, endpoint_family, identity, pin_refresh_attempted) =
@@ -255,6 +278,7 @@ impl PacketStack {
         tunnel.activate_network_quality();
         let transport = tunnel.transport();
         let initial_path = runtime_path(transport, endpoint_family);
+        let assigned_addresses = (identity.assigned_ipv4, identity.assigned_ipv6);
         let (config, tcp_buffer_metrics) = proxy_netstack_config(profile);
         let (stack, pipe) = bounded_piped(config);
         let channel = stack.command_channel();
@@ -320,10 +344,14 @@ impl PacketStack {
             }
         }));
 
-        Ok(Self {
+        let mut packet_stack = Self {
+            warp_dns: None,
             channel,
+            traffic_policy: Arc::new(crate::application_traffic::ApplicationTrafficPolicy::new(
+                profile.disable_quic,
+            )),
             protector: direct_protector,
-            geo_policy: Arc::new(GeoDirectPolicy::disabled()),
+            geo_policy,
             cancellation,
             failure,
             counters,
@@ -333,7 +361,53 @@ impl PacketStack {
             quality,
             _control: control,
             tasks,
-        })
+        };
+        packet_stack.configure_warp_dns(profile, assigned_addresses)?;
+        Ok(packet_stack)
+    }
+
+    fn configure_warp_dns(
+        &mut self,
+        profile: &Profile,
+        (ipv4, ipv6): (std::net::Ipv4Addr, std::net::Ipv6Addr),
+    ) -> Result<(), TransportError> {
+        if !profile.uses_encrypted_warp_dns() {
+            return Ok(());
+        }
+        let dialer = Arc::new(crate::tcp::RuntimeStackDialer {
+            inner: crate::tcp::StackDialer {
+                channel: self.channel.clone(),
+                ipv4,
+                ipv6,
+            },
+            health: self.health.clone(),
+            cancellation: self.cancellation.clone(),
+        });
+        let budget = Arc::new(crate::l4::BufferBudget::new(
+            12 * 1024 * 1024,
+            Arc::default(),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        self.warp_dns = Some(
+            crate::encrypted_dns::FinalDohResolver::for_warp(
+                &profile.warp_dns,
+                crate::dns::Resolver::new(
+                    self.channel.clone(),
+                    ipv4,
+                    ipv6,
+                    profile.dns_servers.clone(),
+                    usque_core::ProxyDnsMode::Remote,
+                    self.protector.clone(),
+                ),
+                dialer,
+                self.protector.clone(),
+                self.telemetry.network_quality(),
+                &self.cancellation,
+                budget,
+            )
+            .map_err(|error| TransportError::Dns(error.to_string()))?,
+        );
+        Ok(())
     }
 
     pub(crate) fn path(&self) -> RuntimePath {
@@ -412,6 +486,8 @@ pub(crate) fn proxy_netstack_config(profile: &Profile) -> (Config, TcpBufferMetr
         tcp_nagle_enabled: false,
         udp_buffer_size: 64 * 1024,
         udp_message_count: 128,
+        raw_buffer_size: 64 * 1024,
+        raw_message_count: 128,
         ..Config::default()
     };
     (config, metrics)
@@ -419,6 +495,21 @@ pub(crate) fn proxy_netstack_config(profile: &Profile) -> (Config, TcpBufferMetr
 
 pub(crate) fn bounded_piped(config: Config) -> (Netstack<PacketDevice>, WakingPipe) {
     bounded_piped_with_capacity(config, PROXY_PACKET_PIPE_CAPACITY)
+}
+
+/// Direct listeners keep their existing symmetric buffers, but all listener,
+/// half-open and accepted sockets now participate in the platform budget.
+pub(crate) fn direct_netstack_config(profile: &Profile) -> (Config, TcpBufferMetrics) {
+    let (mut config, metrics) = proxy_netstack_config(profile);
+    config.tcp_listener_budgeted = true;
+    let tier = TcpBufferTier {
+        receive: config.tcp_buffer_size,
+        transmit: config.tcp_buffer_size,
+    };
+    let policy = config.tcp_buffer_policy.as_mut().expect("proxy TCP policy");
+    policy.preferred = tier;
+    policy.fallback = tier;
+    (config, metrics)
 }
 
 pub(crate) fn bounded_piped_with_capacity(
@@ -457,7 +548,7 @@ impl Drop for PacketStack {
 /// here originate from the platform TUN; the transport supervisor validates
 /// them and decrements TTL/hop-limit immediately before encapsulation.
 pub struct ManagedTunnelRuntime {
-    outgoing: Option<TrackedSender<Bytes>>,
+    outgoing: Option<TrackedSender<OutboundPacket>>,
     incoming: TrackedReceiver<PacketBatch>,
     pending_incoming: PacketBatch,
     cancellation: CancellationToken,
@@ -468,6 +559,17 @@ pub struct ManagedTunnelRuntime {
     telemetry: ConnectionTelemetry,
     quality: watch::Receiver<NetworkQualitySnapshot>,
     tasks: Vec<JoinHandle<()>>,
+}
+
+/// Protocol-neutral packet boundary for an embedded, in-memory VPN. The
+/// producer owns cleanup; the existing mux owns these bounded packet queues.
+pub(crate) struct ExternalPacketChannels {
+    pub(crate) outgoing: Option<TrackedReceiver<OutboundPacket>>,
+    pub(crate) incoming: TrackedSender<PacketBatch>,
+    pub(crate) health: watch::Sender<RuntimeHealth>,
+    pub(crate) failure: watch::Sender<Option<String>>,
+    pub(crate) counters: Arc<TrafficCounters>,
+    pub(crate) cancellation: CancellationToken,
 }
 
 /// Read-only, cloneable view of a managed tunnel's live state.
@@ -487,7 +589,7 @@ pub struct ManagedTunnelMonitor {
 
 #[derive(Clone)]
 pub struct ManagedTunnelSender {
-    outgoing: TrackedSender<Bytes>,
+    outgoing: TrackedSender<OutboundPacket>,
     telemetry: ConnectionTelemetry,
 }
 
@@ -503,6 +605,16 @@ impl ManagedTunnelSender {
     }
 
     pub async fn send_owned_packet(&self, packet: Bytes) -> Result<(), TransportError> {
+        self.send_outbound_packet(OutboundPacket::Shared(packet))
+            .await
+    }
+
+    pub async fn send_mut_packet(&self, packet: BytesMut) -> Result<(), TransportError> {
+        self.send_outbound_packet(OutboundPacket::Mutable(packet))
+            .await
+    }
+
+    async fn send_outbound_packet(&self, packet: OutboundPacket) -> Result<(), TransportError> {
         crate::h2::validate_ip_packet(&packet)?;
         let packet_bytes = packet.len();
         let queued = self
@@ -510,12 +622,15 @@ impl ManagedTunnelSender {
             .max_capacity()
             .saturating_sub(self.outgoing.capacity());
         self.telemetry.observe_queue_depth(queued);
-        if self.outgoing.capacity() == 0 {
-            self.telemetry.record_queue_saturated(queued);
-        }
         self.outgoing
-            .send(packet, packet_bytes)
+            .send_observed(packet, packet_bytes)
             .await
+            .map(|wait| {
+                if let Some(wait) = wait {
+                    self.telemetry
+                        .record_queue_backpressured(QueueKind::TransportOutgoingPackets, wait);
+                }
+            })
             .map_err(|error| match error.kind {
                 TrackedSendErrorKind::Closed
                 | TrackedSendErrorKind::Cancelled
@@ -526,6 +641,25 @@ impl ManagedTunnelSender {
 }
 
 impl ManagedTunnelMonitor {
+    /// A platform guard can outlive a failed initial handshake. This monitor
+    /// carries the failure without constructing an IP stack or data channel.
+    pub fn failed(path: RuntimePath, error: &TransportError) -> Self {
+        let telemetry = ConnectionTelemetry::default();
+        Self {
+            failure: watch::channel(Some(error.to_string())).1,
+            health: watch::channel(RuntimeHealth::Failed {
+                last_path: path,
+                reconnect_count: 0,
+                message: error.to_string(),
+                failure: error.failure(None, None),
+            })
+            .1,
+            control: watch::channel(PeerNetworkState::default()).1,
+            counters: Arc::new(TrafficCounters::default()),
+            quality: initial_quality_receiver(&telemetry),
+            telemetry,
+        }
+    }
     pub(crate) fn for_streams(
         health: watch::Receiver<RuntimeHealth>,
         counters: Arc<TrafficCounters>,
@@ -605,7 +739,6 @@ impl ManagedTunnelMonitor {
     }
 }
 
-#[cfg(test)]
 fn initial_quality_receiver(
     telemetry: &ConnectionTelemetry,
 ) -> watch::Receiver<NetworkQualitySnapshot> {
@@ -614,10 +747,72 @@ fn initial_quality_receiver(
 }
 
 impl ManagedTunnelRuntime {
+    pub(crate) fn for_external_packets(
+        path: RuntimePath,
+        transport: crate::NetworkQualityTelemetry,
+    ) -> (Self, ExternalPacketChannels) {
+        let telemetry = ConnectionTelemetry::with_features(
+            crate::telemetry::CONNECTION_TIMELINE_CAPACITY,
+            transport.features(),
+        );
+        let quality = telemetry.network_quality();
+        quality.begin_connection(path.transport, path.endpoint_family);
+        let cancellation = CancellationToken::new();
+        // Two MiB in each direction, independently of the native core queues.
+        let (outgoing, outgoing_rx) = tracked_channel(quality.register_queue(
+            QueueKind::TransportOutgoingPackets,
+            256,
+            2 * 1024 * 1024,
+        ));
+        let (incoming_tx, incoming) = tracked_channel(quality.register_queue(
+            QueueKind::TransportToTun,
+            256,
+            2 * 1024 * 1024,
+        ));
+        let (failure_tx, failure) = watch::channel(None);
+        let (health_tx, health) = watch::channel(RuntimeHealth::Connected {
+            path,
+            reconnect_count: 0,
+        });
+        let counters = Arc::new(TrafficCounters::default());
+        let (quality, sampler) = crate::network_quality::spawn_external_packet_quality_sampler(
+            quality,
+            transport,
+            counters.clone(),
+            cancellation.child_token(),
+        );
+        (
+            Self {
+                outgoing: Some(outgoing),
+                incoming,
+                pending_incoming: PacketBatch::new(),
+                cancellation: cancellation.clone(),
+                failure,
+                health,
+                control: watch::channel(PeerNetworkState::default()).1,
+                counters: counters.clone(),
+                telemetry,
+                quality,
+                tasks: vec![sampler],
+            },
+            ExternalPacketChannels {
+                outgoing: Some(outgoing_rx),
+                incoming: incoming_tx,
+                health: health_tx,
+                failure: failure_tx,
+                counters,
+                cancellation,
+            },
+        )
+    }
     #[cfg(test)]
     pub(crate) fn packet_mux_test_channels(
         outgoing_capacity: usize,
-    ) -> (Self, TrackedReceiver<Bytes>, TrackedSender<PacketBatch>) {
+    ) -> (
+        Self,
+        TrackedReceiver<OutboundPacket>,
+        TrackedSender<PacketBatch>,
+    ) {
         let telemetry = ConnectionTelemetry::default();
         let quality_snapshot = initial_quality_receiver(&telemetry);
         let quality = telemetry.network_quality();
@@ -912,8 +1107,9 @@ async fn connect_initial_with_refresh(
             let Some(pin_refresher) = pin_refresher else {
                 return Err(TransportError::EndpointPinMismatch);
             };
-            let refreshed = pin_refresher.refresh(Arc::clone(&protector)).await?;
+            let refreshed = refresh_pin(profile, pin_refresher, Arc::clone(&protector)).await?;
             ensure_assignments_unchanged(identity.as_ref(), &refreshed)?;
+            ensure_endpoint_pool_unchanged(profile, identity.as_ref(), &refreshed)?;
             let refreshed = Arc::new(refreshed);
             telemetry.reset_attempt();
             match connect_with_policy(profile, refreshed.as_ref(), protector, telemetry).await {
@@ -925,6 +1121,41 @@ async fn connect_initial_with_refresh(
         }
         Err(error) => Err(error),
     }
+}
+
+async fn refresh_pin(
+    profile: &Profile,
+    refresher: &Arc<dyn EndpointPinRefresher>,
+    protector: Arc<dyn SocketProtector>,
+) -> Result<MasqueTlsIdentity, TransportError> {
+    let refresh = refresher.refresh(protector);
+    if profile.endpoint.selection == usque_core::EndpointSelection::Automatic {
+        timeout(
+            usque_core::endpoints::AUTOMATIC_PIN_REFRESH_TIMEOUT,
+            refresh,
+        )
+        .await
+        .map_err(|_| {
+            TransportError::EndpointPinRefresh(
+                "authenticated endpoint refresh timed out".to_owned(),
+            )
+        })?
+    } else {
+        refresh.await
+    }
+}
+
+fn ensure_endpoint_pool_unchanged(
+    profile: &Profile,
+    current: &MasqueTlsIdentity,
+    refreshed: &MasqueTlsIdentity,
+) -> Result<(), TransportError> {
+    if profile.endpoint.selection == usque_core::EndpointSelection::Automatic
+        && current.endpoint_pool() != refreshed.endpoint_pool()
+    {
+        return Err(TransportError::EndpointAssignmentChanged);
+    }
+    Ok(())
 }
 
 fn ensure_assignments_unchanged(
@@ -1011,6 +1242,10 @@ async fn connect_happy_eyeballs(
     protector: Arc<dyn SocketProtector>,
     telemetry: &ConnectionTelemetry,
 ) -> Result<(MasqueTunnel, AddressFamily), TransportError> {
+    if profile.endpoint.selection == usque_core::EndpointSelection::Automatic {
+        return connect_automatic_endpoints(profile, identity, transport, protector, telemetry)
+            .await;
+    }
     let (preferred, preferred_family, alternate, alternate_family) = match profile.ip_policy {
         IpPolicy::Auto | IpPolicy::PreferIpv6 | IpPolicy::Ipv6Only => (
             profile.endpoint.ipv6_socket(),
@@ -1088,23 +1323,128 @@ async fn connect_happy_eyeballs(
         protector,
         telemetry,
     );
-    match race_candidates(preferred_connect, alternate_connect, HAPPY_EYEBALLS_DELAY).await {
+    match race_candidates(
+        preferred_connect,
+        alternate_connect,
+        HAPPY_EYEBALLS_DELAY,
+        |error| {
+            RecoveryDecision::for_failure(&error.failure(Some(transport), None))
+                != RecoveryDecision::Retry
+        },
+    )
+    .await
+    {
         Ok((tunnel, false)) => Ok((tunnel, preferred_family)),
         Ok((tunnel, true)) => Ok((tunnel, alternate_family)),
-        Err((preferred_error, alternate_error)) => Err(combine_endpoint_errors(
-            preferred,
-            preferred_error,
-            alternate,
-            alternate_error,
-        )),
+        Err(CandidateErrors::Terminal(error)) => Err(error),
+        Err(CandidateErrors::Both(preferred_error, alternate_error)) => Err(
+            combine_endpoint_errors(preferred, preferred_error, alternate, alternate_error),
+        ),
     }
+}
+
+async fn connect_automatic_endpoints(
+    profile: &Profile,
+    identity: &MasqueTlsIdentity,
+    transport: Transport,
+    protector: Arc<dyn SocketProtector>,
+    telemetry: &ConnectionTelemetry,
+) -> Result<(MasqueTunnel, AddressFamily), TransportError> {
+    let policy =
+        usque_core::AutomaticEndpointPolicy::for_profile(profile, identity.endpoint_pool());
+    let connect = {
+        let profile = profile.clone();
+        let identity = identity.clone();
+        let protector = protector.clone();
+        let telemetry = telemetry.clone();
+        move |endpoint: std::net::SocketAddr, cancellation: CancellationToken| {
+            let profile = profile.clone();
+            let identity = identity.clone();
+            let protector = protector.clone();
+            let telemetry = telemetry.clone();
+            async move {
+                let family = if endpoint.is_ipv4() {
+                    AddressFamily::Ipv4
+                } else {
+                    AddressFamily::Ipv6
+                };
+                connect_endpoint_cancellable(
+                    transport,
+                    EndpointCandidate::new(endpoint, family),
+                    &profile.endpoint.sni,
+                    &identity,
+                    usize::from(profile.mtu),
+                    profile.congestion_control,
+                    protector,
+                    &telemetry,
+                    cancellation,
+                )
+                .await
+                .map(|tunnel| (tunnel, family))
+            }
+        }
+    };
+    if transport == Transport::Http3 {
+        let targets = crate::endpoint_race::h3_targets(policy, profile.ip_policy)
+            .into_iter()
+            .filter(|target| {
+                protector.endpoint_family_available(target.endpoint) != Some(false)
+                    && !crate::endpoint_race::excludes_dns_server(profile, target.endpoint)
+            })
+            .collect();
+        return crate::endpoint_race::race_batch(targets, None, connect).await;
+    }
+    let (mut ipv4, mut ipv6) = crate::endpoint_race::h2_candidates(policy)?;
+    ipv4.retain(|endpoint| {
+        protector.endpoint_family_available(*endpoint) != Some(false)
+            && !crate::endpoint_race::excludes_dns_server(profile, *endpoint)
+    });
+    ipv6.retain(|endpoint| {
+        protector.endpoint_family_available(*endpoint) != Some(false)
+            && !crate::endpoint_race::excludes_dns_server(profile, *endpoint)
+    });
+    let (mut preferred, mut alternate) =
+        if matches!(profile.ip_policy, IpPolicy::PreferIpv4 | IpPolicy::Ipv4Only) {
+            (ipv4, ipv6)
+        } else {
+            (ipv6, ipv4)
+        };
+    while !preferred.is_empty() || !alternate.is_empty() {
+        let targets = crate::endpoint_race::next_h2_batch(&mut preferred, &mut alternate);
+        match crate::endpoint_race::race_batch(
+            targets,
+            Some(usque_core::endpoints::AUTOMATIC_H2_BATCH_TIMEOUT),
+            connect.clone(),
+        )
+        .await
+        {
+            Ok(connected) => return Ok(connected),
+            Err(error)
+                if RecoveryDecision::for_failure(&error.failure(Some(transport), None))
+                    != RecoveryDecision::Retry =>
+            {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+    }
+    Err(TransportError::AllEndpointsFailed(
+        "automatic endpoint cycle exhausted".to_owned(),
+    ))
+}
+
+#[derive(Debug)]
+enum CandidateErrors<E> {
+    Terminal(E),
+    Both(E, E),
 }
 
 async fn race_candidates<P, A, T, E>(
     preferred: P,
     alternate: A,
     delay: Duration,
-) -> Result<(T, bool), (E, E)>
+    terminal: impl Fn(&E) -> bool,
+) -> Result<(T, bool), CandidateErrors<E>>
 where
     P: Future<Output = Result<T, E>>,
     A: Future<Output = Result<T, E>>,
@@ -1113,11 +1453,14 @@ where
     tokio::pin!(alternate);
     match timeout(delay, &mut preferred).await {
         Ok(Ok(value)) => return Ok((value, false)),
+        Ok(Err(error)) if terminal(&error) => return Err(CandidateErrors::Terminal(error)),
         Ok(Err(preferred_error)) => {
             return alternate
                 .await
                 .map(|value| (value, true))
-                .map_err(|alternate_error| (preferred_error, alternate_error));
+                .map_err(|alternate_error| {
+                    CandidateErrors::Both(preferred_error, alternate_error)
+                });
         }
         Err(_) => {}
     }
@@ -1125,17 +1468,19 @@ where
     tokio::select! {
         result = &mut preferred => match result {
             Ok(value) => Ok((value, false)),
+            Err(error) if terminal(&error) => Err(CandidateErrors::Terminal(error)),
             Err(preferred_error) => alternate
                 .await
                 .map(|value| (value, true))
-                .map_err(|alternate_error| (preferred_error, alternate_error)),
+                .map_err(|alternate_error| CandidateErrors::Both(preferred_error, alternate_error)),
         },
         result = &mut alternate => match result {
             Ok(value) => Ok((value, true)),
+            Err(error) if terminal(&error) => Err(CandidateErrors::Terminal(error)),
             Err(alternate_error) => preferred
                 .await
                 .map(|value| (value, false))
-                .map_err(|preferred_error| (preferred_error, alternate_error)),
+                .map_err(|preferred_error| CandidateErrors::Both(preferred_error, alternate_error)),
         },
     }
 }
@@ -1173,6 +1518,35 @@ async fn connect_endpoint(
     protector: Arc<dyn SocketProtector>,
     telemetry: &ConnectionTelemetry,
 ) -> Result<MasqueTunnel, TransportError> {
+    connect_endpoint_cancellable(
+        transport,
+        target,
+        sni,
+        identity,
+        profile_inner_mtu,
+        congestion_control,
+        protector,
+        telemetry,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "protected endpoint racing carries exact path settings and cancellation"
+)]
+async fn connect_endpoint_cancellable(
+    transport: Transport,
+    target: EndpointCandidate,
+    sni: &str,
+    identity: &MasqueTlsIdentity,
+    profile_inner_mtu: usize,
+    congestion_control: usque_core::CongestionControlAlgorithm,
+    protector: Arc<dyn SocketProtector>,
+    telemetry: &ConnectionTelemetry,
+    cancellation: CancellationToken,
+) -> Result<MasqueTunnel, TransportError> {
     let EndpointCandidate {
         socket: endpoint,
         family,
@@ -1186,9 +1560,10 @@ async fn connect_endpoint(
             TransportStage::EndpointResolution,
         );
         let network_generation = protector.network_generation();
+        let attempt_cancellation = cancellation.child_token();
         let connecting = async {
             match transport {
-                Transport::Http3 => connect_h3_with_protector(
+                Transport::Http3 => crate::h3::connect_h3_with_cancellation(
                     endpoint,
                     sni,
                     identity,
@@ -1198,18 +1573,20 @@ async fn connect_endpoint(
                     },
                     Arc::clone(&protector),
                     Some(&attempt),
+                    attempt_cancellation.clone(),
                 )
                 .await
-                .map(MasqueTunnel::Http3),
-                Transport::Http2 => connect_h2_with_protector(
+                .map(|tunnel| MasqueTunnel::Http3(Box::new(tunnel))),
+                Transport::Http2 => crate::h2::connect_h2_with_cancellation(
                     endpoint,
                     sni,
                     identity,
                     protector.as_ref(),
                     Some(&attempt),
+                    &attempt_cancellation,
                 )
                 .await
-                .map(MasqueTunnel::Http2),
+                .map(|tunnel| MasqueTunnel::Http2(Box::new(tunnel))),
             }
         };
         tokio::pin!(connecting);
@@ -1225,6 +1602,10 @@ async fn connect_endpoint(
                             None,
                         );
                     }
+                    // Automatic endpoint races cooperatively close losing
+                    // candidates. Keep cleanup, but do not report that local
+                    // cancellation as a remote H3/H2 connection failure.
+                    Err(TransportError::TunnelClosed) if cancellation.is_cancelled() => {}
                     Err(error) => {
                         let failure = error.failure(Some(transport), Some(family));
                         telemetry.record(
@@ -1239,6 +1620,9 @@ async fn connect_endpoint(
                 return result;
             },
             _ = wait_for_network_change(&protector, network_generation), if network_generation.is_some() => {
+                attempt_cancellation.cancel();
+                let _ = connecting.await;
+                if cancellation.is_cancelled() { return Err(TransportError::TunnelClosed); }
                 telemetry.increment_network_change();
                 telemetry.record(
                     ConnectionEventType::NetworkChanged,
@@ -1272,6 +1656,14 @@ fn combine_endpoint_errors(
     alternate: std::net::SocketAddr,
     alternate_error: TransportError,
 ) -> TransportError {
+    if RecoveryDecision::for_failure(&preferred_error.failure(None, None)) == RecoveryDecision::Stop
+    {
+        return preferred_error;
+    }
+    if RecoveryDecision::for_failure(&alternate_error.failure(None, None)) == RecoveryDecision::Stop
+    {
+        return alternate_error;
+    }
     if matches!(&preferred_error, TransportError::EndpointPinMismatch)
         || matches!(&alternate_error, TransportError::EndpointPinMismatch)
     {
@@ -1308,7 +1700,7 @@ enum PacketIo {
         buffered_outgoing: Option<Bytes>,
     },
     Channel {
-        outgoing: TrackedReceiver<Bytes>,
+        outgoing: TrackedReceiver<OutboundPacket>,
         incoming: TrackedSender<PacketBatch>,
         buffered_outgoing: Option<Bytes>,
     },
@@ -1373,9 +1765,7 @@ impl PacketIo {
                     Some(packet.freeze())
                 }),
                 Self::Channel { outgoing, .. } => outgoing.recv().await.map(|packet| {
-                    let mut packet = packet
-                        .try_into_mut()
-                        .unwrap_or_else(|packet| bytes::BytesMut::from(packet.as_ref()));
+                    let mut packet = packet.into_mut();
                     if let Err(error) = prepare_forwarded_packet(&mut packet) {
                         tracing::warn!(%error, "discarded malformed packet from the TUN source");
                         return None;
@@ -1414,7 +1804,7 @@ impl PacketIo {
                         return TryOutgoingPacket::Empty;
                     }
                     match rx.try_recv() {
-                        Some(packet) => packet,
+                        Some(packet) => OutboundPacket::Shared(packet),
                         None => return TryOutgoingPacket::Closed,
                     }
                 }
@@ -1426,9 +1816,7 @@ impl PacketIo {
                     }
                 },
             };
-            let mut packet = packet
-                .try_into_mut()
-                .unwrap_or_else(|packet| bytes::BytesMut::from(packet.as_ref()));
+            let mut packet = packet.into_mut();
             if let Err(error) = prepare_forwarded_packet(&mut packet) {
                 tracing::warn!(%error, "discarded malformed packet while building a MASQUE batch");
                 continue;
@@ -1467,7 +1855,7 @@ impl PacketIo {
                 let tx = tx.clone();
                 Box::pin(async move {
                     while let Some(packet) = batch.pop_front() {
-                        tx.send_async(&packet).await;
+                        tx.send_owned_async(packet).await;
                     }
                     true
                 })
@@ -1520,6 +1908,8 @@ async fn run_transport_supervisor(
     let mut backoff_index = 0usize;
     let mut probe_generation = 0u32;
     let mut recovery_policy = crate::recovery_policy::AutoRecoveryPolicy::default();
+    let mut reconnect_schedule =
+        reconnect::ReconnectSchedule::new(protector.as_ref(), profile.ip_policy);
 
     loop {
         active_tunnel.activate_network_quality();
@@ -1548,6 +1938,21 @@ async fn run_transport_supervisor(
         )
         .await;
         probe_generation = probe_generation.wrapping_add(1);
+
+        let outcome = if cancellation.is_cancelled() {
+            ActiveOutcome::Shutdown
+        } else {
+            match outcome {
+                ActiveOutcome::Reconnect(failure) => {
+                    match RecoveryDecision::for_failure(&failure) {
+                        RecoveryDecision::Stop => ActiveOutcome::Terminal(failure),
+                        RecoveryDecision::RefreshPin => ActiveOutcome::PinMismatch,
+                        RecoveryDecision::Retry => ActiveOutcome::Reconnect(failure),
+                    }
+                }
+                outcome => outcome,
+            }
+        };
 
         // Candidate failures only add timeline events. The supervisor alone
         // ends the selected connection when its bearing tunnel stops.
@@ -1701,14 +2106,33 @@ async fn run_transport_supervisor(
                     backoff_index = 0;
                 }
                 loop {
-                    reconnect_count = reconnect_count.saturating_add(1);
+                    if cancellation.is_cancelled() {
+                        return;
+                    }
+                    if RecoveryDecision::for_failure(&failure) == RecoveryDecision::Stop {
+                        let message = failure.code.to_string();
+                        health_tx.send_replace(RuntimeHealth::Failed {
+                            last_path: active_path,
+                            reconnect_count,
+                            message: message.clone(),
+                            failure: failure.clone(),
+                        });
+                        telemetry.record(
+                            ConnectionEventType::Failed,
+                            Some(failure.stage),
+                            ConnectionEventPath::new(failure.transport, failure.address_family),
+                            None,
+                            Some(failure),
+                        );
+                        report_failure(&cancellation, &failure_tx, message);
+                        return;
+                    }
                     let attempt = backoff_index as u32 + 1;
                     let delay = jitter_duration(
                         RECONNECT_DELAYS[backoff_index],
                         H3_PROBE_JITTER_PERCENT,
                         reconnect_count,
                     );
-                    backoff_index = (backoff_index + 1).min(RECONNECT_DELAYS.len() - 1);
                     let reason = failure.code.to_string();
                     telemetry.set_reconnect(reconnect_count, &failure);
                     telemetry.record(
@@ -1725,16 +2149,26 @@ async fn run_transport_supervisor(
                         reason,
                         failure: failure.clone(),
                     });
-                    if !wait_while_dropping_packets(
-                        delay,
-                        &mut packet_io,
-                        &cancellation,
-                        Arc::clone(&protector),
-                    )
-                    .await
-                    {
+                    let Some(reset_backoff) = reconnect_schedule
+                        .wait(delay, &mut packet_io, &cancellation)
+                        .await
+                    else {
                         return;
+                    };
+                    if reset_backoff {
+                        backoff_index = 0;
                     }
+                    reconnect_count = reconnect_count.saturating_add(1);
+                    let attempt = backoff_index as u32 + 1;
+                    backoff_index = (backoff_index + 1).min(RECONNECT_DELAYS.len() - 1);
+                    telemetry.set_reconnect(reconnect_count, &failure);
+                    health_tx.send_replace(RuntimeHealth::Reconnecting {
+                        last_path: active_path,
+                        attempt,
+                        reconnect_count,
+                        reason: failure.code.to_string(),
+                        failure: failure.clone(),
+                    });
 
                     // Clone only the attempt policy. The user's explicit H3/H2
                     // choice, identity, exact egress protection, and saved
@@ -1746,15 +2180,19 @@ async fn run_transport_supervisor(
                         protector.network_generation(),
                         Instant::now(),
                     );
-                    match connect_while_dropping_packets(
-                        &reconnect_profile,
-                        Arc::clone(&identity),
-                        Arc::clone(&protector),
-                        &mut packet_io,
-                        &cancellation,
-                        &telemetry,
-                    )
-                    .await
+                    match reconnect_schedule
+                        .connect(
+                            connect_while_dropping_packets(
+                                &reconnect_profile,
+                                Arc::clone(&identity),
+                                Arc::clone(&protector),
+                                &mut packet_io,
+                                &cancellation,
+                                &telemetry,
+                            ),
+                            &cancellation,
+                        )
+                        .await
                     {
                         Some(Ok((tunnel, family))) => {
                             active_tunnel = tunnel;
@@ -1845,11 +2283,23 @@ async fn refresh_and_retry_connection(
         Some(pin_refresher) => pin_refresher,
         None => return Some(Err(TransportError::EndpointPinMismatch)),
     };
-    let refreshed = match pin_refresher.refresh(Arc::clone(&protector)).await {
-        Ok(refreshed) => refreshed,
-        Err(error) => return Some(Err(error)),
+    let refresh = refresh_pin(profile, pin_refresher, Arc::clone(&protector));
+    tokio::pin!(refresh);
+    let refreshed = loop {
+        tokio::select! {
+            biased;
+            _ = context.cancellation.cancelled() => return None,
+            result = &mut refresh => match result {
+                Ok(refreshed) => break refreshed,
+                Err(error) => return Some(Err(error)),
+            },
+            batch = context.packet_io.receive_outgoing_batch() => { batch?; },
+        }
     };
     if let Err(error) = ensure_assignments_unchanged(current, &refreshed) {
+        return Some(Err(error));
+    }
+    if let Err(error) = ensure_endpoint_pool_unchanged(profile, current, &refreshed) {
         return Some(Err(error));
     }
     let refreshed = Arc::new(refreshed);
@@ -2092,6 +2542,7 @@ async fn pump_active_tunnel(
                         ));
                     }
                     Err(_) => {
+                        crate::transport_performance::add(&telemetry.network_quality().performance().send_timeouts, 1);
                         break ActiveOutcome::Reconnect(
                             TransportFailure::new(
                                 TransportFailureCode::PacketSendTimeout,
@@ -2432,31 +2883,6 @@ async fn wait_for_probe(
     }
 }
 
-async fn wait_while_dropping_packets(
-    delay: Duration,
-    packet_io: &mut PacketIo,
-    cancellation: &CancellationToken,
-    protector: Arc<dyn SocketProtector>,
-) -> bool {
-    let wait = sleep(delay);
-    tokio::pin!(wait);
-    let network_generation = protector.network_generation();
-    loop {
-        tokio::select! {
-            _ = cancellation.cancelled() => return false,
-            _ = &mut wait => return true,
-            _ = wait_for_network_change(&protector, network_generation), if network_generation.is_some() => {
-                return true;
-            }
-            batch = packet_io.receive_outgoing_batch() => {
-                if batch.is_none() {
-                    return false;
-                }
-            }
-        }
-    }
-}
-
 async fn connect_while_dropping_packets(
     profile: &Profile,
     identity: Arc<MasqueTlsIdentity>,
@@ -2656,7 +3082,7 @@ fn prepare_forwarded_packet(packet: &mut [u8]) -> Result<(), TransportError> {
     match packet.first().map(|byte| byte >> 4) {
         Some(4) => prepare_ipv4(packet),
         Some(6) => {
-            if packet.len() < 40 || packet[7] <= 1 {
+            if packet[7] <= 1 {
                 return Err(TransportError::MalformedIpPacket);
             }
             packet[7] -= 1;
@@ -2667,15 +3093,8 @@ fn prepare_forwarded_packet(packet: &mut [u8]) -> Result<(), TransportError> {
 }
 
 fn prepare_ipv4(packet: &mut [u8]) -> Result<(), TransportError> {
-    if packet.len() < 20 {
-        return Err(TransportError::MalformedIpPacket);
-    }
     let header_length = usize::from(packet[0] & 0x0f) * 4;
-    if header_length < 20 || packet.len() < header_length || packet[8] <= 1 {
-        return Err(TransportError::MalformedIpPacket);
-    }
-    let total_length = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
-    if total_length < header_length || total_length > packet.len() {
+    if packet[8] <= 1 {
         return Err(TransportError::MalformedIpPacket);
     }
     packet[8] -= 1;
@@ -2703,6 +3122,319 @@ fn ipv4_header_checksum(header: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DeferredEndpointProtection {
+        calls: std::sync::Mutex<Vec<(std::net::SocketAddr, Instant)>>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        released: CancellationToken,
+        ipv4: bool,
+        ipv6: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SocketProtector for DeferredEndpointProtection {
+        fn protect(&self, _: crate::socket::SocketHandle) -> Result<(), String> {
+            panic!("MASQUE must use exact endpoint protection");
+        }
+        async fn protect_masque_endpoint_generation(
+            &self,
+            _: crate::socket::SocketHandle,
+            endpoint: std::net::SocketAddr,
+            _: crate::socket::DirectProtocol,
+            generation: u64,
+        ) -> Result<crate::socket::DirectEgressLease, String> {
+            assert_eq!(generation, 7);
+            struct Active(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for Active {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            self.active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _active = Active(self.active.clone());
+            self.calls.lock().unwrap().push((endpoint, Instant::now()));
+            self.released.cancelled().await;
+            // Stop before connecting or sending any packet on the workstation.
+            Err("fixture endpoint protection denied".to_owned())
+        }
+        fn endpoint_family_available(&self, endpoint: std::net::SocketAddr) -> Option<bool> {
+            Some(if endpoint.is_ipv4() {
+                self.ipv4
+            } else {
+                self.ipv6
+            })
+        }
+        fn network_generation(&self) -> Option<u64> {
+            Some(7)
+        }
+    }
+
+    fn automatic_test_identity() -> MasqueTlsIdentity {
+        let key = usque_core::MasqueKeyPair::generate();
+        let mut identity = MasqueTlsIdentity::new(
+            key.private_sec1_der().unwrap(),
+            &key.public_spki_der().unwrap(),
+            "172.16.0.2".parse().unwrap(),
+            "2001:db8::2".parse().unwrap(),
+        )
+        .unwrap();
+        identity.entitlement = Some(usque_core::ConsumerEntitlement::Free);
+        identity
+    }
+
+    #[tokio::test]
+    async fn cancelled_h3_candidate_does_not_report_connection_failure() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let identity = automatic_test_identity();
+        let telemetry = ConnectionTelemetry::default();
+        let cancellation = CancellationToken::new();
+        let connecting = connect_endpoint_cancellable(
+            Transport::Http3,
+            EndpointCandidate::new(peer.local_addr().unwrap(), AddressFamily::Ipv4),
+            "cancelled-candidate.test",
+            &identity,
+            usize::from(usque_core::config::DEFAULT_MTU),
+            Default::default(),
+            crate::socket::noop_socket_protector(),
+            &telemetry,
+            cancellation.clone(),
+        );
+        let cancel_after_first_packet = async {
+            let mut packet = [0; 2048];
+            peer.recv_from(&mut packet).await.unwrap();
+            // A winning sibling cancels this candidate after its driver starts.
+            cancellation.cancel();
+        };
+        let (result, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(connecting, cancel_after_first_packet)
+        })
+        .await
+        .expect("cancelled handshake must finish driver cleanup");
+        assert!(matches!(result, Err(TransportError::TunnelClosed)));
+        assert!(
+            telemetry
+                .snapshot()
+                .events
+                .iter()
+                .all(|event| event.event_type != ConnectionEventType::Failed),
+            "an intentionally cancelled candidate is not a failed connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_cancellation_does_not_hide_socket_protection_failure() {
+        struct Denied(CancellationToken);
+        #[async_trait::async_trait]
+        impl SocketProtector for Denied {
+            fn protect(&self, _: crate::socket::SocketHandle) -> Result<(), String> {
+                // Reproduce a real setup error concurrent with race cleanup.
+                self.0.cancel();
+                Err("fixture protection failure".into())
+            }
+        }
+        let identity = automatic_test_identity();
+        let telemetry = ConnectionTelemetry::default();
+        let cancellation = CancellationToken::new();
+        let result = connect_endpoint_cancellable(
+            Transport::Http3,
+            EndpointCandidate::new("127.0.0.1:443".parse().unwrap(), AddressFamily::Ipv4),
+            "denied-candidate.test",
+            &identity,
+            usize::from(usque_core::config::DEFAULT_MTU),
+            Default::default(),
+            Arc::new(Denied(cancellation.clone())),
+            &telemetry,
+            cancellation,
+        )
+        .await;
+        assert!(matches!(result, Err(TransportError::SocketProtection(_))));
+        let failed = telemetry
+            .snapshot()
+            .events
+            .into_iter()
+            .filter(|event| event.event_type == ConnectionEventType::Failed)
+            .collect::<Vec<_>>();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].failure.as_ref().unwrap().code,
+            TransportFailureCode::SocketProtectionFailed
+        );
+    }
+
+    async fn wait_for_endpoint_calls(protector: &DeferredEndpointProtection, expected: usize) {
+        for _ in 0..1000 {
+            if protector.calls.lock().unwrap().len() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(protector.calls.lock().unwrap().len(), expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_h3_all_eight_requests_overlap_with_family_delay() {
+        let protector = Arc::new(DeferredEndpointProtection {
+            calls: Default::default(),
+            active: Arc::new(0.into()),
+            released: CancellationToken::new(),
+            ipv4: true,
+            ipv6: true,
+        });
+        let started = Instant::now();
+        let task = tokio::spawn({
+            let protector = protector.clone();
+            async move {
+                let profile = Profile {
+                    transport: TransportPolicy::Http3,
+                    ..Profile::default()
+                };
+                connect_automatic_endpoints(
+                    &profile,
+                    &automatic_test_identity(),
+                    Transport::Http3,
+                    protector,
+                    &ConnectionTelemetry::default(),
+                )
+                .await
+            }
+        });
+        wait_for_endpoint_calls(&protector, 4).await;
+        assert!(
+            protector
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(endpoint, at)| endpoint.is_ipv6() && *at == started)
+        );
+        tokio::time::advance(Duration::from_millis(249)).await;
+        assert_eq!(protector.calls.lock().unwrap().len(), 4);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_for_endpoint_calls(&protector, 8).await;
+        assert_eq!(
+            protector.active.load(std::sync::atomic::Ordering::SeqCst),
+            8
+        );
+        let calls = protector.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(endpoint, _)| *endpoint)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            8
+        );
+        assert!(
+            calls
+                .iter()
+                .filter(|(endpoint, _)| endpoint.is_ipv4())
+                .all(|(_, at)| *at - started == Duration::from_millis(250))
+        );
+        protector.released.cancel();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(TransportError::SocketProtection(_))
+        ));
+        assert_eq!(
+            protector.active.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_h3_filters_forced_and_unavailable_families_before_requests() {
+        for (policy, ipv4, ipv6, expected_ipv4) in [
+            (IpPolicy::Ipv4Only, true, true, true),
+            (IpPolicy::Ipv6Only, true, true, false),
+            (IpPolicy::Auto, true, false, true),
+            (IpPolicy::PreferIpv4, false, true, false),
+        ] {
+            let protector = Arc::new(DeferredEndpointProtection {
+                calls: Default::default(),
+                active: Arc::new(0.into()),
+                released: CancellationToken::new(),
+                ipv4,
+                ipv6,
+            });
+            let started = Instant::now();
+            let task = tokio::spawn({
+                let protector = protector.clone();
+                async move {
+                    let profile = Profile {
+                        transport: TransportPolicy::Http3,
+                        ip_policy: policy,
+                        ..Profile::default()
+                    };
+                    connect_automatic_endpoints(
+                        &profile,
+                        &automatic_test_identity(),
+                        Transport::Http3,
+                        protector,
+                        &ConnectionTelemetry::default(),
+                    )
+                    .await
+                }
+            });
+            wait_for_endpoint_calls(&protector, 4).await;
+            assert!(
+                protector
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(endpoint, at)| endpoint.is_ipv4() == expected_ipv4 && *at == started)
+            );
+            protector.released.cancel();
+            assert!(task.await.unwrap().is_err());
+            assert_eq!(
+                protector.active.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_pin_refresh_has_one_global_sixty_second_deadline() {
+        struct BlockedRefresh {
+            calls: std::sync::atomic::AtomicUsize,
+            stopped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl EndpointPinRefresher for BlockedRefresh {
+            async fn refresh(
+                &self,
+                _: Arc<dyn SocketProtector>,
+            ) -> Result<MasqueTlsIdentity, TransportError> {
+                struct Stopped(Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for Stopped {
+                    fn drop(&mut self) {
+                        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _stopped = Stopped(self.stopped.clone());
+                std::future::pending().await
+            }
+        }
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refresher = Arc::new(BlockedRefresh {
+            calls: 0.into(),
+            stopped: stopped.clone(),
+        });
+        let erased: Arc<dyn EndpointPinRefresher> = refresher.clone();
+        let started = Instant::now();
+        let result = refresh_pin(
+            &Profile::default(),
+            &erased,
+            crate::socket::noop_socket_protector(),
+        )
+        .await;
+        assert!(matches!(result, Err(TransportError::EndpointPinRefresh(_))));
+        assert_eq!(started.elapsed(), Duration::from_secs(60));
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn migration_policy_keeps_h2_and_cross_family_changes_on_full_reconnect() {
@@ -2767,7 +3499,10 @@ mod tests {
     pub(super) fn test_packet_channel(
         kind: QueueKind,
         capacity: usize,
-    ) -> (TrackedSender<Bytes>, TrackedReceiver<Bytes>) {
+    ) -> (
+        TrackedSender<OutboundPacket>,
+        TrackedReceiver<OutboundPacket>,
+    ) {
         tracked_channel(crate::queue_metrics::QueueMetrics::new(
             kind,
             capacity,
@@ -2786,11 +3521,11 @@ mod tests {
         ))
     }
 
-    fn test_managed_sender(
+    pub(super) fn test_managed_sender(
         capacity: usize,
     ) -> (
         ManagedTunnelSender,
-        TrackedReceiver<Bytes>,
+        TrackedReceiver<OutboundPacket>,
         ConnectionTelemetry,
     ) {
         let telemetry = ConnectionTelemetry::default();
@@ -2829,6 +3564,35 @@ mod tests {
         assert_eq!(packet[7], 63);
     }
 
+    #[test]
+    fn rejected_forwarded_packets_remain_unchanged() {
+        let ipv4 = [
+            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 1, 1, 1, 1, 8, 8, 8, 8,
+        ];
+        let mut ipv6 = [0_u8; 40];
+        ipv6[0] = 0x60;
+        ipv6[7] = 64;
+        let mut packets = vec![Vec::new(), ipv4[..19].to_vec(), ipv6[..39].to_vec()];
+        for (offset, value) in [(0, 0x44), (0, 0x46), (3, 19), (3, 21), (8, 0), (8, 1)] {
+            let mut packet = ipv4;
+            packet[offset] = value;
+            packets.push(packet.to_vec());
+        }
+        for (offset, value) in [(5, 1), (7, 0), (7, 1)] {
+            let mut packet = ipv6;
+            packet[offset] = value;
+            packets.push(packet.to_vec());
+        }
+        for mut packet in packets {
+            let original = packet.clone();
+            assert!(matches!(
+                prepare_forwarded_packet(&mut packet),
+                Err(TransportError::MalformedIpPacket)
+            ));
+            assert_eq!(packet, original);
+        }
+    }
+
     #[tokio::test]
     async fn managed_sender_backpressures_instead_of_dropping_or_closing() {
         let (sender, mut receiver, telemetry) = test_managed_sender(1);
@@ -2842,13 +3606,13 @@ mod tests {
             tokio::spawn(async move { blocked_sender.send_owned_packet(blocked_packet).await });
         tokio::task::yield_now().await;
         assert!(!blocked.is_finished());
-        assert_eq!(receiver.recv().await.unwrap(), first);
+        assert_eq!(receiver.recv().await.unwrap().freeze(), first);
         timeout(Duration::from_secs(1), blocked)
             .await
             .expect("sender did not resume after capacity returned")
             .unwrap()
             .unwrap();
-        assert_eq!(receiver.recv().await.unwrap(), second);
+        assert_eq!(receiver.recv().await.unwrap().freeze(), second);
 
         let metrics = telemetry.snapshot().metrics;
         assert_eq!(metrics.send_queue_drop_count, 0);
@@ -2881,7 +3645,7 @@ mod tests {
         for sequence in 0..130_u16 {
             let packet = test_ipv4_packet(sequence);
             let bytes = packet.len();
-            outgoing_tx.try_send(packet, bytes).unwrap();
+            outgoing_tx.try_send(packet.into(), bytes).unwrap();
         }
         drop(outgoing_tx);
         let mut packet_io = PacketIo::Channel {
@@ -2994,6 +3758,7 @@ mod tests {
             },
             async { Ok::<_, &'static str>("ipv4") },
             Duration::from_millis(20),
+            |_| false,
         )
         .await
         .unwrap();
@@ -3007,6 +3772,7 @@ mod tests {
             async { Err::<&'static str, _>("ipv6 failed") },
             async { Ok::<_, &'static str>("ipv4") },
             Duration::from_secs(1),
+            |_| false,
         )
         .await
         .unwrap();
@@ -3023,6 +3789,7 @@ mod tests {
             },
             async { Err::<&'static str, _>("ipv4 failed") },
             Duration::from_millis(10),
+            |_| false,
         )
         .await
         .unwrap();

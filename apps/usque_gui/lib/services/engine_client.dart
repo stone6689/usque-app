@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ui';
 
 import 'package:flutter/services.dart';
@@ -6,8 +7,29 @@ import 'package:flutter/services.dart';
 import '../models/app_models.dart';
 import '../models/diagnostics_models.dart';
 import '../models/network_settings.dart';
+import '../models/onboarding_models.dart';
 
 export '../models/network_settings.dart';
+export '../models/onboarding_models.dart';
+
+abstract interface class InitialIdentityClient {
+  Future<InitialIdentityState> initializeIdentity(
+    UsqueProfile profile, {
+    required String operationId,
+    required IdentityProvisioningMethod method,
+    bool resumeOnly = false,
+    String? licenseKey,
+    String? teamName,
+    String? callbackUri,
+  });
+
+  Future<InitialIdentityState> getInitialIdentityState(String profileId);
+}
+
+abstract interface class OnboardingPermissionsClient {
+  Future<OnboardingPermissionState> getOnboardingPermissions();
+  Future<OnboardingPermissionState> prepareOnboardingPermissions();
+}
 
 class EngineException implements Exception {
   const EngineException(this.code, this.message, {this.retryable = false});
@@ -62,6 +84,8 @@ abstract interface class EngineClient {
 
   Future<void> upsertProfile(UsqueProfile profile);
 
+  Future<void> renameProfile(String profileId, String name);
+
   Future<void> deleteProfile(String profileId);
 
   Future<void> setActiveProfile(String profileId);
@@ -112,8 +136,6 @@ abstract interface class EngineClient {
   Future<void> setStartOnBoot(bool enabled);
 
   Future<void> setCloseToTray(bool enabled);
-
-  Future<void> setWarpProtocolAssociation(bool enabled);
 
   Future<void> requestAddQuickSettingsTile();
 
@@ -177,7 +199,226 @@ abstract interface class EngineClient {
   void dispose();
 }
 
-class MethodChannelEngineClient implements EngineClient {
+abstract interface class VpnGateClient {
+  Future<VpnGateDirectory> listVpnGate({
+    String? countryCode,
+    bool unknownCountry = false,
+    int offset = 0,
+    int limit = 50,
+    bool favoritesOnly = false,
+    bool statusOnly = false,
+  });
+  Future<void> refreshVpnGate({bool cancel = false});
+  Future<void> vpnGateNode(VpnGateNodeRequest request);
+}
+
+abstract interface class WarpWireguardClient {
+  Future<Map<Object?, Object?>> warpWireguard(Map<String, Object?> request);
+}
+
+/// A document read once by the platform picker. Never contains a path or URI.
+class ChainConfigurationFile {
+  const ChainConfigurationFile({
+    required this.name,
+    this.configuration,
+    this.errorCode,
+  });
+  final String name;
+  final String? configuration;
+  final String? errorCode;
+}
+
+abstract interface class ChainProfileClient {
+  Future<ChainProfileResult> chainProfile(Map<String, Object?> request);
+  Future<List<ChainConfigurationFile>> pickChainConfigurations();
+}
+
+Future<List<ChainConfigurationFile>> pickChainConfigurationFiles() async {
+  const channel = MethodChannel('io.github.georgexie2333.usque/engine');
+  List<Object?>? files;
+  try {
+    files = await channel.invokeListMethod<Object?>('readChainConfigurations');
+  } on MissingPluginException {
+    throw const EngineException(
+      'CHAIN_FILE_UNAVAILABLE',
+      'File picker unavailable.',
+    );
+  } on PlatformException catch (error) {
+    final code = switch (error.code) {
+      'CHAIN_FILE_UNAVAILABLE' ||
+      'CHAIN_FILE_BUSY' ||
+      'CHAIN_FILE_COUNT_LIMIT' => error.code,
+      _ => 'CHAIN_FILE_READ_FAILED',
+    };
+    throw EngineException(code, 'Configuration files could not be read.');
+  }
+  if (files == null) return const [];
+  if (files.length > 128) {
+    throw const EngineException(
+      'CHAIN_FILE_COUNT_LIMIT',
+      'Select at most 128 files.',
+    );
+  }
+  return files
+      .map((entry) {
+        final file = entry as Map<Object?, Object?>;
+        final name = file['name'] as String? ?? '';
+        final error = file['error'] as String?;
+        if (error != null) {
+          return ChainConfigurationFile(name: name, errorCode: error);
+        }
+        final bytes = file['bytes'] as Uint8List?;
+        if (bytes == null || bytes.isEmpty) {
+          return ChainConfigurationFile(
+            name: name,
+            errorCode: 'CHAIN_FILE_READ_FAILED',
+          );
+        }
+        if (bytes.length > 128 * 1024) {
+          return ChainConfigurationFile(
+            name: name,
+            errorCode: 'CHAIN_FILE_TOO_LARGE',
+          );
+        }
+        // Platform replies may be immutable. Wipe only our own mutable copy.
+        final owned = Uint8List.fromList(bytes);
+        try {
+          return ChainConfigurationFile(
+            name: name,
+            configuration: utf8.decode(owned),
+          );
+        } on FormatException {
+          return ChainConfigurationFile(
+            name: name,
+            errorCode: 'CHAIN_FILE_ENCODING_INVALID',
+          );
+        } finally {
+          owned.fillRange(0, owned.length, 0);
+        }
+      })
+      .toList(growable: false);
+}
+
+class MethodChannelEngineClient
+    implements
+        EngineClient,
+        VpnGateClient,
+        ChainProfileClient,
+        WarpWireguardClient,
+        InitialIdentityClient,
+        OnboardingPermissionsClient {
+  @override
+  Future<InitialIdentityState> initializeIdentity(
+    UsqueProfile profile, {
+    required String operationId,
+    required IdentityProvisioningMethod method,
+    bool resumeOnly = false,
+    String? licenseKey,
+    String? teamName,
+    String? callbackUri,
+  }) async {
+    final value = await _invoke<Map<Object?, Object?>>('initializeIdentity', {
+      'operation_id': operationId,
+      'profile_id': profile.id,
+      'method': method.name,
+      'resume_only': resumeOnly,
+      'license_key': licenseKey,
+      'team_name': teamName,
+      'callback_uri': callbackUri,
+      'terms_accepted': true,
+      'locale': PlatformDispatcher.instance.locale.toLanguageTag(),
+    }).timeout(const Duration(seconds: 90));
+    if (value == null) {
+      throw const EngineException(
+        'INITIAL_IDENTITY_UNSUPPORTED',
+        'Initial setup unavailable.',
+      );
+    }
+    return InitialIdentityState.fromMap(value);
+  }
+
+  @override
+  Future<InitialIdentityState> getInitialIdentityState(String profileId) async {
+    final value = await _invoke<Map<Object?, Object?>>(
+      'getInitialIdentityState',
+      {'profile_id': profileId},
+    ).timeout(const Duration(seconds: 5));
+    if (value == null) {
+      throw const EngineException(
+        'INITIAL_IDENTITY_UNSUPPORTED',
+        'Initial setup unavailable.',
+      );
+    }
+    return InitialIdentityState.fromMap(value);
+  }
+
+  @override
+  Future<OnboardingPermissionState> getOnboardingPermissions() async =>
+      OnboardingPermissionState.fromMap(
+        await _invoke<Map<Object?, Object?>>(
+              'getOnboardingPermissions',
+            ).timeout(const Duration(seconds: 5)) ??
+            const {},
+      );
+
+  @override
+  Future<OnboardingPermissionState> prepareOnboardingPermissions() async =>
+      OnboardingPermissionState.fromMap(
+        await _invoke<Map<Object?, Object?>>('prepareOnboardingPermissions') ??
+            const {},
+      );
+
+  @override
+  Future<Map<Object?, Object?>> warpWireguard(
+    Map<String, Object?> request,
+  ) async =>
+      await _invoke<Map<Object?, Object?>>('warpWireguard', request) ??
+      const {};
+  @override
+  Future<ChainProfileResult> chainProfile(Map<String, Object?> request) async =>
+      ChainProfileResult.fromMap(
+        await _invoke<Map<Object?, Object?>>('chainProfile', request) ??
+            const {},
+      );
+  @override
+  Future<List<ChainConfigurationFile>> pickChainConfigurations() =>
+      pickChainConfigurationFiles();
+  @override
+  Future<VpnGateDirectory> listVpnGate({
+    String? countryCode,
+    bool unknownCountry = false,
+    int offset = 0,
+    int limit = 50,
+    bool favoritesOnly = false,
+    bool statusOnly = false,
+  }) async {
+    final result = await _invoke<Map<Object?, Object?>>('listVpnGate', {
+      'country_code': countryCode,
+      'unknown_country': unknownCountry,
+      'offset': offset,
+      'limit': limit,
+      'favorites_only': favoritesOnly,
+      'status_only': statusOnly,
+    });
+    if (result == null) {
+      throw const EngineException(
+        'VPN_GATE_UNAVAILABLE',
+        'The catalogue service is unavailable.',
+      );
+    }
+    return VpnGateDirectory.fromMap(result);
+  }
+
+  @override
+  Future<void> refreshVpnGate({bool cancel = false}) async {
+    await _invoke<Object?>('refreshVpnGate', {'cancel': cancel});
+  }
+
+  @override
+  Future<void> vpnGateNode(VpnGateNodeRequest request) async {
+    await _invoke<Object?>('vpnGateNode', request.toMap());
+  }
+
   @override
   Future<NetworkSettingsState> saveNetworkSettings(
     String operationId,
@@ -334,6 +575,11 @@ class MethodChannelEngineClient implements EngineClient {
       );
     }
     return ProfileCatalog(
+      sharedNetwork: map['shared_network_profile'] is Map
+          ? UsqueProfile.fromMap(
+              Map<String, Object?>.from(map['shared_network_profile'] as Map),
+            )
+          : null,
       profiles: decodedProfiles,
       activeProfileId: active,
       identityStates: _identityStatesFromMap(map),
@@ -370,9 +616,6 @@ class MethodChannelEngineClient implements EngineClient {
 
   @override
   Future<void> setCloseToTray(bool enabled) async {}
-
-  @override
-  Future<void> setWarpProtocolAssociation(bool enabled) async {}
 
   @override
   Future<void> requestAddQuickSettingsTile() =>
@@ -418,6 +661,10 @@ class MethodChannelEngineClient implements EngineClient {
   @override
   Future<void> upsertProfile(UsqueProfile profile) =>
       _invoke<void>('upsertProfile', profile.toMap());
+
+  @override
+  Future<void> renameProfile(String profileId, String name) =>
+      _invoke<void>('renameProfile', {'profile_id': profileId, 'name': name});
 
   @override
   Future<void> deleteProfile(String profileId) =>
@@ -503,7 +750,13 @@ class MethodChannelEngineClient implements EngineClient {
     required String username,
     required String password,
     bool confirmed = true,
-  }) {
+  }) async {
+    if ((await getCapabilities())?.sharedProxyAuthApplication != true) {
+      throw const EngineException(
+        'PROXY_AUTH_UNSUPPORTED',
+        'Update the Engine before saving shared credentials.',
+      );
+    }
     return _invoke<void>('updateProxyAuth', <String, Object>{
       'profile_id': profileId,
       'username': username,
@@ -717,6 +970,8 @@ GeoRulesList _geoRulesListFromMap(Map<Object?, Object?> map) {
     lastSuccessfulUpdateUnixMilliseconds:
         (map['last_successful_update_unix_milliseconds'] as num?)?.toInt() ?? 0,
     hasGlobalGeosite: map['has_global_geosite'] as bool? ?? false,
+    hasAds: map['has_ads'] == true,
+    adsRevision: map['ads_revision'] as String? ?? '',
     globalGeositeUpdatedUnixMilliseconds:
         (map['global_geosite_updated_unix_milliseconds'] as num?)?.toInt() ?? 0,
   );
@@ -795,6 +1050,10 @@ Map<String, ProfileIdentityStatus> _identityStatusesFromMap(
         orElse: () => IdentityProvider.consumer,
       ),
       organization: value['organization'] as String? ?? '',
+      registeredEndpointIpv4:
+          value['registered_endpoint_ipv4'] as String? ?? '',
+      registeredEndpointIpv6:
+          value['registered_endpoint_ipv6'] as String? ?? '',
     );
   }
   return Map<String, ProfileIdentityStatus>.unmodifiable(statuses);

@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::dns::QuerySocket as StackUdpSocket;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, UdpSocket};
@@ -12,7 +13,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use ts_netstack_smoltcp::CreateSocket;
 use ts_netstack_smoltcp::netcore::Channel;
-use ts_netstack_smoltcp::netsock::{TcpListener as StackTcpListener, UdpSocket as StackUdpSocket};
+use ts_netstack_smoltcp::netsock::TcpListener as StackTcpListener;
 
 use crate::encrypted_dns::{DirectDnsError, DirectDnsQueryContext, DirectDnsResolver};
 use crate::geo_direct::{GeoDirectPolicy, GeoRoute};
@@ -38,6 +39,7 @@ const MAX_HINT_TTL: Duration = Duration::from_secs(60 * 60);
 const HINT_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 const RCODE_FORMERR: u16 = 1;
 const RCODE_SERVFAIL: u16 = 2;
+const RCODE_REFUSED: u16 = 5;
 
 pub(crate) fn validate_query_bytes(bytes: &[u8]) -> Result<(), String> {
     parse_query(bytes)
@@ -47,8 +49,16 @@ pub(crate) fn validate_query_bytes(bytes: &[u8]) -> Result<(), String> {
 
 pub(crate) fn validate_response_bytes(query: &[u8], response: &[u8]) -> Result<(), String> {
     let query = parse_query(query).map_err(|_| "invalid DNS query".to_owned())?;
-    validate_response(&query, response)?;
     response_hints(response, &query).map(|_| ())
+}
+
+/// Failover applies to a configured resolver set, never an app-chosen target.
+pub(crate) fn validate_resolver_response(query: &[u8], response: &[u8]) -> Result<(), String> {
+    validate_response_bytes(query, response)?;
+    match u16::from_be_bytes([response[2], response[3]]) & 0x000f {
+        0 | 3 => Ok(()),
+        _ => Err("DNS resolver returned an error".into()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +71,11 @@ enum QueryTransport {
 enum QueryRoute {
     Direct,
     Tunnel,
+}
+
+struct QueryContext {
+    route: QueryRoute,
+    deadline: tokio::time::Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +97,8 @@ struct ParsedQuery {
 struct HintState {
     direct_until: Option<Instant>,
     tunnel_until: Option<Instant>,
+    explicit_proxy_until: Option<Instant>,
+    explicit_direct_until: Option<Instant>,
     last_seen: Instant,
 }
 
@@ -124,6 +141,26 @@ impl DnsRouteCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         sync_generation(&mut table, generation, now);
         prune_hints_if_needed(&mut table, now, false);
+        if policy.rejects_ip(ip) {
+            return GeoRoute::Reject;
+        }
+        if let Some(hint) = table.hints.get(&ip)
+            && (hint.explicit_proxy_until.is_some_and(|until| until > now)
+                || hint.direct_until.is_some_and(|until| until > now)
+                    && hint.tunnel_until.is_some_and(|until| until > now))
+        {
+            return GeoRoute::Tunnel;
+        }
+        if table
+            .hints
+            .get(&ip)
+            .is_some_and(|hint| hint.explicit_direct_until.is_some_and(|until| until > now))
+        {
+            return GeoRoute::Direct;
+        }
+        if let Some(route) = policy.custom_ip(ip) {
+            return route;
+        }
         let dns_direct = table.hints.get(&ip).is_some_and(|hint| {
             hint.direct_until.is_some_and(|until| until > now)
                 && !hint.tunnel_until.is_some_and(|until| until > now)
@@ -132,6 +169,47 @@ impl DnsRouteCache {
             GeoRoute::Direct
         } else {
             policy.route_ip(ip)
+        }
+    }
+
+    fn observe_policy(
+        &self,
+        response: &[u8],
+        query: &ParsedQuery,
+        route: QueryRoute,
+        generation: Option<u64>,
+        policy: &GeoDirectPolicy,
+    ) {
+        self.observe(response, query, route, generation);
+        let direct = query
+            .questions
+            .iter()
+            .any(|question| policy.custom_host(&question.name) == Some(GeoRoute::Direct));
+        let proxy = query
+            .questions
+            .iter()
+            .any(|question| policy.custom_host(&question.name) == Some(GeoRoute::Tunnel));
+        if !direct && !proxy {
+            return;
+        }
+        let mut table = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if table.generation != generation {
+            return;
+        }
+        let now = Instant::now();
+        for (ip, ttl) in response_hints(response, query).unwrap_or_default() {
+            if ttl == 0 {
+                continue;
+            }
+            let until = Some(now + Duration::from_secs(u64::from(ttl)).min(MAX_HINT_TTL));
+            if let Some(hint) = table.hints.get_mut(&ip) {
+                if proxy {
+                    hint.explicit_proxy_until = hint.explicit_proxy_until.max(until);
+                }
+                if direct {
+                    hint.explicit_direct_until = hint.explicit_direct_until.max(until);
+                }
+            }
         }
     }
 
@@ -171,11 +249,13 @@ impl DnsRouteCache {
             let hint = table.hints.entry(ip).or_insert(HintState {
                 direct_until: None,
                 tunnel_until: None,
+                explicit_proxy_until: None,
+                explicit_direct_until: None,
                 last_seen: now,
             });
             match route {
-                QueryRoute::Direct => hint.direct_until = Some(until),
-                QueryRoute::Tunnel => hint.tunnel_until = Some(until),
+                QueryRoute::Direct => hint.direct_until = hint.direct_until.max(Some(until)),
+                QueryRoute::Tunnel => hint.tunnel_until = hint.tunnel_until.max(Some(until)),
             }
             hint.last_seen = now;
         }
@@ -202,6 +282,8 @@ fn prune_hints(table: &mut HintTable, now: Instant) {
     table.hints.retain(|_, hint| {
         hint.direct_until.is_some_and(|until| until > now)
             || hint.tunnel_until.is_some_and(|until| until > now)
+            || hint.explicit_proxy_until.is_some_and(|until| until > now)
+            || hint.explicit_direct_until.is_some_and(|until| until > now)
     });
 }
 
@@ -212,6 +294,9 @@ pub(crate) struct SplitDnsResolver {
     assigned_ipv4: Ipv4Addr,
     assigned_ipv6: Ipv6Addr,
     tunnel_servers: Vec<SocketAddr>,
+    final_exit: bool,
+    final_tcp: Option<Arc<crate::dns_stream::StreamDns>>,
+    final_doh: Option<Arc<crate::encrypted_dns::FinalDohResolver>>,
     policy: Arc<GeoDirectPolicy>,
     protector: Arc<dyn SocketProtector>,
     hints: Arc<DnsRouteCache>,
@@ -234,6 +319,9 @@ impl SplitDnsResolver {
             stream_dns: Some(dns),
             assigned_ipv4: Ipv4Addr::UNSPECIFIED,
             assigned_ipv6: Ipv6Addr::UNSPECIFIED,
+            final_exit: false,
+            final_tcp: None,
+            final_doh: None,
             tunnel_servers: servers.iter().map(|ip| SocketAddr::new(*ip, 53)).collect(),
             policy,
             protector,
@@ -245,8 +333,24 @@ impl SplitDnsResolver {
         }
     }
 
+    pub(crate) fn with_doh(
+        mut self,
+        doh: Option<Arc<crate::encrypted_dns::FinalDohResolver>>,
+    ) -> Self {
+        self.final_doh = doh;
+        self
+    }
+
     pub(crate) fn hints(&self) -> Arc<DnsRouteCache> {
         self.hints.clone()
+    }
+
+    pub(crate) fn routing_refusal(&self, query: &[u8]) -> Option<Vec<u8>> {
+        routing_dns_refused(query, &self.policy)
+    }
+
+    pub(crate) fn filter_routing_response(&self, query: &[u8], response: Vec<u8>) -> Vec<u8> {
+        filter_routing_dns_response(query, response, &self.policy)
     }
 
     pub(crate) async fn handle_l4(&self, query: &[u8], udp: bool) -> Vec<u8> {
@@ -267,6 +371,13 @@ impl SplitDnsResolver {
             Ok(query) => query,
             Err(_) => return error_response(query_bytes, RCODE_FORMERR),
         };
+        if query
+            .questions
+            .iter()
+            .any(|question| self.policy.route_host(&question.name) == GeoRoute::Reject)
+        {
+            return error_response(query_bytes, RCODE_REFUSED);
+        }
         let route = match classify_query(&query, &self.policy) {
             Ok(route) => route,
             Err(()) => return error_response(query_bytes, RCODE_SERVFAIL),
@@ -303,7 +414,10 @@ impl SplitDnsResolver {
                     )
                     .await
                 }
-                QueryRoute::Tunnel => self.query_tunnel(query_bytes, &query, transport).await,
+                QueryRoute::Tunnel => {
+                    self.query_tunnel(query_bytes, &query, transport, deadline)
+                        .await
+                }
             }
         })
         .await;
@@ -321,8 +435,23 @@ impl SplitDnsResolver {
                     complete_queue_entry(&mut direct_queue_entry);
                     return error_response(query_bytes, RCODE_SERVFAIL);
                 }
-                self.hints
-                    .observe(&response, &query, route, network_generation);
+                if let Err(error) = response_hints_filtered(&response, &query, Some(&self.policy)) {
+                    return error_response(
+                        query_bytes,
+                        if error == "routing_rejected" {
+                            RCODE_REFUSED
+                        } else {
+                            RCODE_SERVFAIL
+                        },
+                    );
+                }
+                self.hints.observe_policy(
+                    &response,
+                    &query,
+                    route,
+                    network_generation,
+                    &self.policy,
+                );
                 if system_metrics {
                     self.quality.record_direct_dns_success(started.elapsed());
                 }
@@ -379,8 +508,17 @@ impl SplitDnsResolver {
         if servers.is_empty() {
             return Err("physical network supplied no DNS server".to_owned());
         }
-        self.query_servers(query_bytes, query, transport, &servers, true)
-            .await
+        self.query_servers(
+            query_bytes,
+            query,
+            transport,
+            &servers,
+            QueryContext {
+                route: QueryRoute::Direct,
+                deadline: context.deadline,
+            },
+        )
+        .await
     }
 
     async fn query_tunnel(
@@ -388,9 +526,112 @@ impl SplitDnsResolver {
         query_bytes: &[u8],
         query: &ParsedQuery,
         transport: QueryTransport,
+        deadline: tokio::time::Instant,
     ) -> Result<Vec<u8>, String> {
-        self.query_servers(query_bytes, query, transport, &self.tunnel_servers, false)
+        if let Some(doh) = &self.final_doh {
+            let response = doh
+                .query(query_bytes, deadline)
+                .await
+                .map_err(|error| error.to_string())?;
+            validate_resolver_response(query_bytes, &response)?;
+            return Ok(
+                if transport == QueryTransport::Udp && response.len() > MAX_UDP_MESSAGE {
+                    truncated_response(query_bytes)
+                } else {
+                    response.to_vec()
+                },
+            );
+        }
+        if self.stream_dns.is_some() {
+            return crate::final_dns::query_tcp(
+                &self.tunnel_servers,
+                deadline,
+                |server, deadline| async move {
+                    let response = self
+                        .query_servers(
+                            query_bytes,
+                            query,
+                            QueryTransport::Tcp,
+                            &[server],
+                            QueryContext {
+                                route: QueryRoute::Tunnel,
+                                deadline,
+                            },
+                        )
+                        .await?;
+                    Ok(
+                        if transport == QueryTransport::Udp && response.len() > MAX_UDP_MESSAGE {
+                            truncated_response(query_bytes)
+                        } else {
+                            response
+                        },
+                    )
+                },
+            )
+            .await;
+        }
+        if self.final_exit {
+            if transport == QueryTransport::Tcp {
+                return crate::final_dns::query(
+                    &self.tunnel_servers,
+                    deadline,
+                    |server, deadline| async move {
+                        self.query_servers(
+                            query_bytes,
+                            query,
+                            QueryTransport::Tcp,
+                            &[server],
+                            QueryContext {
+                                route: QueryRoute::Tunnel,
+                                deadline,
+                            },
+                        )
+                        .await
+                    },
+                )
+                .await;
+            }
+            crate::final_dns::query_auto(
+                &self.tunnel_servers,
+                deadline,
+                |server, method, deadline| async move {
+                    let method = match method {
+                        crate::final_dns::Transport::Udp => QueryTransport::Udp,
+                        crate::final_dns::Transport::Tcp => QueryTransport::Tcp,
+                    };
+                    let response = self
+                        .query_servers(
+                            query_bytes,
+                            query,
+                            method,
+                            &[server],
+                            QueryContext {
+                                route: QueryRoute::Tunnel,
+                                deadline,
+                            },
+                        )
+                        .await?;
+                    Ok(if response.len() > MAX_UDP_MESSAGE {
+                        truncated_response(query_bytes)
+                    } else {
+                        response
+                    })
+                },
+            )
             .await
+        } else {
+            self.query_servers(
+                query_bytes,
+                query,
+                transport,
+                &self.tunnel_servers,
+                QueryContext {
+                    route: QueryRoute::Tunnel,
+                    deadline,
+                },
+            )
+            .await
+        }
     }
 
     async fn query_servers(
@@ -399,19 +640,24 @@ impl SplitDnsResolver {
         query: &ParsedQuery,
         transport: QueryTransport,
         servers: &[SocketAddr],
-        direct: bool,
+        context: QueryContext,
     ) -> Result<Vec<u8>, String> {
+        let QueryContext { route, deadline } = context;
         let mut failures = Vec::new();
         for server in servers {
-            let response = match (transport, direct) {
-                (QueryTransport::Udp, true) => {
+            let response = match (transport, route) {
+                (QueryTransport::Udp, QueryRoute::Direct) => {
                     direct_udp(self.protector.as_ref(), *server, query_bytes).await
                 }
-                (QueryTransport::Tcp, true) => {
+                (QueryTransport::Tcp, QueryRoute::Direct) => {
                     direct_tcp(self.protector.as_ref(), *server, query_bytes).await
                 }
-                (QueryTransport::Udp, false) => self.tunnel_udp(*server, query_bytes).await,
-                (QueryTransport::Tcp, false) => self.tunnel_tcp(*server, query_bytes).await,
+                (QueryTransport::Udp, QueryRoute::Tunnel) => {
+                    self.tunnel_udp(*server, query_bytes).await
+                }
+                (QueryTransport::Tcp, QueryRoute::Tunnel) => {
+                    self.tunnel_tcp(*server, query_bytes, deadline).await
+                }
             };
             let mut response = match response {
                 Ok(response) => response,
@@ -425,10 +671,10 @@ impl SplitDnsResolver {
                 continue;
             }
             if transport == QueryTransport::Udp && response_is_truncated(&response) {
-                let retry = if direct {
+                let retry = if route == QueryRoute::Direct {
                     direct_tcp(self.protector.as_ref(), *server, query_bytes).await
                 } else {
-                    self.tunnel_tcp(*server, query_bytes).await
+                    self.tunnel_tcp(*server, query_bytes, deadline).await
                 };
                 response = match retry {
                     Ok(response) => response,
@@ -442,7 +688,7 @@ impl SplitDnsResolver {
                     continue;
                 }
             }
-            if let Err(error) = response_hints(&response, query) {
+            if let Err(error) = validate_resolver_response(query_bytes, &response) {
                 failures.push(format!("{server}: {error}"));
                 continue;
             }
@@ -473,11 +719,11 @@ impl SplitDnsResolver {
             },
             next_udp_port(),
         );
-        let socket = self
+        let channel = self
             .tunnel_channel
             .as_ref()
-            .ok_or_else(|| "DNS transport unavailable".to_owned())?
-            .udp_bind(local)
+            .ok_or_else(|| "DNS transport unavailable".to_owned())?;
+        let socket = crate::dns::QuerySocket::bind(channel.clone(), local)
             .await
             .map_err(|error| error.to_string())?;
         socket
@@ -494,10 +740,15 @@ impl SplitDnsResolver {
         Ok(response.to_vec())
     }
 
-    async fn tunnel_tcp(&self, server: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String> {
-        if let Some(dns) = &self.stream_dns {
+    async fn tunnel_tcp(
+        &self,
+        server: SocketAddr,
+        query: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<u8>, String> {
+        if let Some(dns) = self.final_tcp.as_ref().or(self.stream_dns.as_ref()) {
             return dns
-                .query(server, query, tokio::time::Instant::now() + DNS_TIMEOUT)
+                .query(server, query, deadline)
                 .await
                 .map_err(|e| e.to_string());
         }
@@ -513,10 +764,13 @@ impl SplitDnsResolver {
             .tunnel_channel
             .as_ref()
             .ok_or_else(|| "DNS transport unavailable".to_owned())?;
-        let stream = timeout(DNS_TIMEOUT, channel.tcp_connect(local, server))
-            .await
-            .map_err(|_| "connect timed out".to_owned())?
-            .map_err(|error| error.to_string())?;
+        let stream = tokio::time::timeout_at(
+            deadline,
+            crate::stack_tcp::StackTcpStream::connect(channel.clone(), local, server),
+        )
+        .await
+        .map_err(|_| "connect timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
         exchange_tcp(stream, query).await
     }
 }
@@ -536,12 +790,25 @@ pub(crate) struct SplitDnsConfig {
     tunnel_channel: Channel,
     assigned_addresses: (Ipv4Addr, Ipv6Addr),
     tunnel_dns_servers: Vec<IpAddr>,
+    final_exit: bool,
+    final_doh: Option<Arc<crate::encrypted_dns::FinalDohResolver>>,
     policy: Arc<GeoDirectPolicy>,
     protector: Arc<dyn SocketProtector>,
     quality: NetworkQualityTelemetry,
 }
 
 impl SplitDnsConfig {
+    pub(crate) fn with_doh(
+        mut self,
+        resolver: Option<Arc<crate::encrypted_dns::FinalDohResolver>>,
+    ) -> Self {
+        self.final_doh = resolver;
+        self
+    }
+    pub(crate) fn with_final_exit(mut self, enabled: bool) -> Self {
+        self.final_exit = enabled;
+        self
+    }
     pub(crate) fn new(
         tunnel_channel: Channel,
         assigned_addresses: (Ipv4Addr, Ipv6Addr),
@@ -554,6 +821,8 @@ impl SplitDnsConfig {
             tunnel_channel,
             assigned_addresses,
             tunnel_dns_servers: tunnel_dns_servers.to_vec(),
+            final_exit: false,
+            final_doh: None,
             policy,
             protector,
             quality,
@@ -567,21 +836,25 @@ impl SplitDnsRuntime {
         config: SplitDnsConfig,
         cancellation: &CancellationToken,
     ) -> Result<Self, String> {
-        if config.tunnel_dns_servers.is_empty() {
-            return Err("the WARP DNS server list is empty".to_owned());
-        }
         let encrypted = config.protector.direct_dns_resolver().is_some();
-        if !encrypted && config.protector.physical_dns_servers().is_empty() {
+        if config.policy.needs_direct_dns()
+            && !encrypted
+            && config.protector.physical_dns_servers().is_empty()
+        {
             return Err("the selected physical network has no DNS server".to_owned());
         }
-        let udp_v4 = internal_channel
-            .udp_bind(SocketAddr::new(SPLIT_DNS_IPV4.into(), DNS_PORT))
-            .await
-            .map_err(|error| error.to_string())?;
-        let udp_v6 = internal_channel
-            .udp_bind(SocketAddr::new(SPLIT_DNS_IPV6.into(), DNS_PORT))
-            .await
-            .map_err(|error| error.to_string())?;
+        let udp_v4 = StackUdpSocket::bind(
+            internal_channel.clone(),
+            SocketAddr::new(SPLIT_DNS_IPV4.into(), DNS_PORT),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let udp_v6 = StackUdpSocket::bind(
+            internal_channel.clone(),
+            SocketAddr::new(SPLIT_DNS_IPV6.into(), DNS_PORT),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         let tcp_v4 = internal_channel
             .tcp_listen(SocketAddr::new(SPLIT_DNS_IPV4.into(), DNS_PORT))
             .await
@@ -605,10 +878,21 @@ impl SplitDnsRuntime {
             ))
         };
         let resolver = SplitDnsResolver {
-            tunnel_channel: Some(config.tunnel_channel),
+            tunnel_channel: Some(config.tunnel_channel.clone()),
             stream_dns: None,
             assigned_ipv4: config.assigned_addresses.0,
             assigned_ipv6: config.assigned_addresses.1,
+            final_tcp: config.final_exit.then(|| {
+                Arc::new(crate::dns_stream::StreamDns::over_stack(
+                    config.tunnel_channel.clone(),
+                    config.assigned_addresses.0,
+                    config.assigned_addresses.1,
+                    config.protector.clone(),
+                    cancellation.child_token(),
+                ))
+            }),
+            final_exit: config.final_exit,
+            final_doh: config.final_doh,
             tunnel_servers: config
                 .tunnel_dns_servers
                 .into_iter()
@@ -658,41 +942,75 @@ async fn run_udp_server(
     cancellation: CancellationToken,
 ) {
     let (responses_tx, mut responses_rx) = mpsc::channel::<DnsUdpReply>(MAX_IN_FLIGHT);
-    loop {
-        tokio::select! {
-            _ = cancellation.cancelled() => break,
-            response = responses_rx.recv() => {
-                let Some(response) = response else { break; };
-                let body = reply_for_generation(&response.query, response.response, response.generation, resolver.protector.network_generation());
-                let _ = socket.send_to(response.client, &body).await;
-            }
-            query = socket.recv_from_bytes() => {
-                let Ok((client, query)) = query else { break; };
-                if query.len() > MAX_UDP_MESSAGE {
-                    let _ = socket.send_to(client, &error_response(&query, RCODE_FORMERR)).await;
-                    continue;
-                }
-                let Ok(task_permit) = resolver.service_tasks.clone().try_acquire_owned() else {
-                    let _ = socket.send_to(client, &error_response(&query, RCODE_SERVFAIL)).await;
-                    continue;
+    let children = cancellation.child_token();
+    let receive = async {
+        loop {
+            // This socket RPC remains alive while the independent writer sends
+            // replies. Cancelling a completed Recv RPC would discard its packet.
+            let Ok((client, query)) = socket.recv_from_bytes().await else {
+                break;
+            };
+            let generation = resolver.protector.network_generation();
+            let permit = if query.len() <= MAX_UDP_MESSAGE {
+                resolver.service_tasks.clone().try_acquire_owned().ok()
+            } else {
+                None
+            };
+            let Some(permit) = permit else {
+                let code = if query.len() > MAX_UDP_MESSAGE {
+                    RCODE_FORMERR
+                } else {
+                    RCODE_SERVFAIL
                 };
-                let resolver = resolver.clone();
-                let responses = responses_tx.clone();
-                let child = cancellation.child_token();
-                let generation = resolver.protector.network_generation();
-                tokio::spawn(async move {
-                    let _task_permit = task_permit;
-                    tokio::select! {
-                        _ = child.cancelled() => {},
-                        _ = async {
-                            let response = resolver.handle(&query, QueryTransport::Udp).await;
-                            let _ = responses.send(DnsUdpReply { client, response, query: query.to_vec(), generation, _permit: _task_permit }).await;
-                        } => {},
-                    }
-                });
+                // Rejected oversized datagrams must not inflate the bounded
+                // reply queue beyond its normal per-query byte allowance.
+                let query = query.slice(..query.len().min(MAX_UDP_MESSAGE));
+                if responses_tx
+                    .send(DnsUdpReply {
+                        client,
+                        response: error_response(&query, code),
+                        query: query.to_vec(),
+                        generation,
+                        _permit: None,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            };
+            let resolver = resolver.clone();
+            let responses = responses_tx.clone();
+            let child = children.child_token();
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = child.cancelled() => {},
+                    _ = async {
+                        let response = resolver.handle(&query, QueryTransport::Udp).await;
+                        let _ = responses.send(DnsUdpReply { client, response, query: query.to_vec(),
+                            generation, _permit: Some(permit) }).await;
+                    } => {},
+                }
+            });
+        }
+    };
+    let send = async {
+        while let Some(response) = responses_rx.recv().await {
+            let body = reply_for_generation(
+                &response.query,
+                response.response,
+                response.generation,
+                resolver.protector.network_generation(),
+            );
+            if socket.send_to(response.client, &body).await.is_err() {
+                break;
             }
         }
-    }
+    };
+    tokio::select! { biased; _ = cancellation.cancelled() => {}, _ = receive => {}, _ = send => {} }
+    children.cancel();
 }
 
 struct DnsUdpReply {
@@ -700,7 +1018,7 @@ struct DnsUdpReply {
     query: Vec<u8>,
     response: Vec<u8>,
     generation: Option<u64>,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 fn reply_for_generation(
@@ -783,7 +1101,7 @@ async fn run_tcp_server(
     }
 }
 
-async fn direct_udp(
+pub(crate) async fn direct_udp(
     protector: &dyn SocketProtector,
     server: SocketAddr,
     query: &[u8],
@@ -938,7 +1256,7 @@ fn parse_questions(packet: &[u8], count: usize) -> Result<(Vec<Question>, usize)
     Ok((questions, offset))
 }
 
-fn validate_response(query: &ParsedQuery, response: &[u8]) -> Result<(), String> {
+fn validate_response(query: &ParsedQuery, response: &[u8]) -> Result<usize, String> {
     if response.len() < 12 || response.len() > MAX_TCP_MESSAGE {
         return Err("invalid DNS response length".to_owned());
     }
@@ -953,11 +1271,11 @@ fn validate_response(query: &ParsedQuery, response: &[u8]) -> Result<(), String>
     if question_count != query.questions.len() {
         return Err("DNS response question count mismatch".to_owned());
     }
-    let (questions, _) = parse_questions(response, question_count)?;
+    let (questions, question_end) = parse_questions(response, question_count)?;
     if questions != query.questions {
         return Err("DNS response question mismatch".to_owned());
     }
-    Ok(())
+    Ok(question_end)
 }
 
 pub(crate) fn validate_dns_query(query: &[u8]) -> Result<(), String> {
@@ -997,6 +1315,69 @@ pub(crate) async fn physical_wire_query(
         }
     }
     Err("query_failed".to_owned())
+}
+
+/// Resolve known direct traffic while checking observable CNAME answers before
+/// opening a data socket. Opaque platform resolvers retain their existing path.
+pub(crate) async fn resolve_direct_routed(
+    protector: &dyn SocketProtector,
+    host: &str,
+    port: u16,
+    policy: &GeoDirectPolicy,
+) -> Result<Vec<SocketAddr>, String> {
+    let encrypted = protector.direct_dns_resolver();
+    if encrypted.is_none() && protector.physical_dns_servers().is_empty() {
+        return protector.resolve_direct(host, port).await;
+    }
+    let generation = protector.network_generation().unwrap_or_default();
+    let context = DirectDnsQueryContext {
+        network_generation: generation,
+        deadline: tokio::time::Instant::now() + DNS_TIMEOUT,
+    };
+    let query = |kind| {
+        let encrypted = encrypted.clone();
+        async move {
+            let wire = build_host_query(host, kind, next_udp_port())?;
+            let parsed = parse_query(&wire)?;
+            let response = if let Some(resolver) = encrypted {
+                resolver
+                    .query(Bytes::from(wire), context)
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else {
+                Bytes::from(physical_wire_query(protector, &wire, generation).await?)
+            };
+            response_hints_filtered(&response, &parsed, Some(policy))
+        }
+    };
+    let (v4, v6) = tokio::join!(query(1), query(28));
+    if protector.network_generation().unwrap_or_default() != generation {
+        return Err("network_changed".into());
+    }
+    let mut addresses = Vec::new();
+    for result in [v4, v6] {
+        match result {
+            Ok(values) => {
+                addresses.extend(values.into_iter().map(|(ip, _)| SocketAddr::new(ip, port)))
+            }
+            Err(error) if error == "routing_rejected" => return Err(error),
+            Err(_) => {}
+        }
+    }
+    addresses.retain(|address| !address.ip().is_unspecified() && !address.ip().is_multicast());
+    let had_addresses = !addresses.is_empty();
+    addresses.retain(|address| !policy.rejects_ip(address.ip()));
+    if had_addresses && addresses.is_empty() {
+        return Err("routing_rejected".into());
+    }
+    addresses.sort();
+    addresses.dedup();
+    addresses.truncate(16);
+    if addresses.is_empty() {
+        Err("direct_resolution_failed".into())
+    } else {
+        Ok(addresses)
+    }
 }
 
 pub(crate) async fn resolve_encrypted_host(
@@ -1054,7 +1435,104 @@ fn response_is_truncated(response: &[u8]) -> bool {
 }
 
 fn response_hints(response: &[u8], query: &ParsedQuery) -> Result<Vec<(IpAddr, u32)>, String> {
-    validate_response(query, response)?;
+    response_hints_filtered(response, query, None)
+}
+
+pub(crate) fn routing_dns_refused(query: &[u8], policy: &GeoDirectPolicy) -> Option<Vec<u8>> {
+    let parsed = parse_query(query).ok()?;
+    parsed
+        .questions
+        .iter()
+        .any(|question| policy.route_host(&question.name) == GeoRoute::Reject)
+        .then(|| error_response(query, RCODE_REFUSED))
+}
+
+pub(crate) fn check_routing_dns_response(
+    query: &[u8],
+    response: &[u8],
+    policy: &GeoDirectPolicy,
+) -> Result<(), String> {
+    let parsed = parse_query(query)?;
+    response_hints_filtered(response, &parsed, Some(policy)).map(|_| ())
+}
+
+pub(crate) fn filter_routing_dns_response(
+    query: &[u8],
+    response: Vec<u8>,
+    policy: &GeoDirectPolicy,
+) -> Vec<u8> {
+    match check_routing_dns_response(query, &response, policy) {
+        Ok(()) => response,
+        Err(error) => error_response(
+            query,
+            if error == "routing_rejected" {
+                RCODE_REFUSED
+            } else {
+                RCODE_SERVFAIL
+            },
+        ),
+    }
+}
+
+/// Per-association correlation for raw SOCKS UDP DNS. At most four 4 KiB queries
+/// survive for four seconds; unmatched/late responses never bypass inspection.
+#[derive(Default)]
+pub(crate) struct RoutingDnsQueries {
+    pending: VecDeque<(Instant, SocketAddr, ParsedQuery, Vec<u8>)>,
+}
+
+impl RoutingDnsQueries {
+    pub(crate) fn record(&mut self, server: SocketAddr, query: &[u8]) -> bool {
+        self.prune();
+        if query.len() > MAX_UDP_MESSAGE {
+            return false;
+        }
+        let Ok(parsed) = parse_query(query) else {
+            return false;
+        };
+        self.pending.retain(|(_, endpoint, existing, _)| {
+            *endpoint != server
+                || existing.id != parsed.id
+                || existing.questions != parsed.questions
+        });
+        if self.pending.len() >= 4 {
+            return false;
+        }
+        self.pending
+            .push_back((Instant::now(), server, parsed, query.to_vec()));
+        true
+    }
+
+    pub(crate) fn filter(
+        &mut self,
+        server: SocketAddr,
+        response: &[u8],
+        policy: &GeoDirectPolicy,
+    ) -> Option<Vec<u8>> {
+        self.prune();
+        let index = self.pending.iter().position(|(_, endpoint, parsed, _)| {
+            *endpoint == server && validate_response(parsed, response).is_ok()
+        })?;
+        let (_, _, _, query) = self.pending.remove(index)?;
+        Some(filter_routing_dns_response(
+            &query,
+            response.to_vec(),
+            policy,
+        ))
+    }
+
+    fn prune(&mut self) {
+        self.pending
+            .retain(|(created, _, _, _)| created.elapsed() < DNS_TIMEOUT);
+    }
+}
+
+fn response_hints_filtered(
+    response: &[u8],
+    query: &ParsedQuery,
+    policy: Option<&GeoDirectPolicy>,
+) -> Result<Vec<(IpAddr, u32)>, String> {
+    let mut offset = validate_response(query, response)?;
     let answer_count = usize::from(read_u16(response, 6)?);
     let authority_count = usize::from(read_u16(response, 8)?);
     let additional_count = usize::from(read_u16(response, 10)?);
@@ -1065,7 +1543,6 @@ fn response_hints(response: &[u8], query: &ParsedQuery) -> Result<Vec<(IpAddr, u
     {
         return Err("DNS response record count exceeds the supported bound".to_owned());
     }
-    let (_, mut offset) = parse_questions(response, query.questions.len())?;
     let mut cnames: HashMap<String, (String, u32)> = HashMap::new();
     let mut addresses: HashMap<String, Vec<(IpAddr, u32)>> = HashMap::new();
     for _ in 0..answer_count {
@@ -1129,9 +1606,20 @@ fn response_hints(response: &[u8], query: &ParsedQuery) -> Result<Vec<(IpAddr, u
         let mut name = question.name.clone();
         let mut chain_ttl = u32::MAX;
         let mut seen = HashSet::new();
-        for _ in 0..=MAX_CNAME_DEPTH {
+        for depth in 0..=MAX_CNAME_DEPTH {
             if !seen.insert(name.clone()) {
-                break;
+                return Err("CNAME chain cycle".into());
+            }
+            if let Some(policy) = policy {
+                let explicit_allow = matches!(
+                    policy.custom_host(&question.name),
+                    Some(GeoRoute::Direct | GeoRoute::Tunnel)
+                );
+                if policy.custom_host(&name) == Some(GeoRoute::Reject)
+                    || !explicit_allow && policy.route_host(&name) == GeoRoute::Reject
+                {
+                    return Err("routing_rejected".into());
+                }
             }
             if let Some(values) = addresses.get(&name) {
                 for (ip, ttl) in values {
@@ -1145,6 +1633,9 @@ fn response_hints(response: &[u8], query: &ParsedQuery) -> Result<Vec<(IpAddr, u
             let Some((target, ttl)) = cnames.get(&name) else {
                 break;
             };
+            if depth == MAX_CNAME_DEPTH {
+                return Err("CNAME chain exceeds the supported bound".into());
+            }
             chain_ttl = chain_ttl.min(*ttl);
             name.clone_from(target);
         }
@@ -1445,7 +1936,268 @@ fn read_u32(packet: &[u8], offset: usize) -> Result<u32, String> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_host_query(name: &str) -> Vec<u8> {
+    build_host_query(name, 1, 123).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn test_cname_response(query: &[u8], targets: &[String]) -> Vec<u8> {
+    let parsed = parse_query(query).unwrap();
+    let mut owner = parsed.questions[0].name.clone();
+    let wire_name = |name: &str| {
+        let wire = test_host_query(name);
+        wire[12..wire.len() - 4].to_vec()
+    };
+    let mut response = error_response(query, 0);
+    response[6..8].copy_from_slice(&((targets.len() + 1) as u16).to_be_bytes());
+    for target in targets {
+        response.extend(wire_name(&owner));
+        response.extend([0, 5, 0, 1, 0, 0, 0, 60]);
+        let target_wire = wire_name(target);
+        response.extend((target_wire.len() as u16).to_be_bytes());
+        response.extend(target_wire);
+        owner.clone_from(target);
+    }
+    response.extend(wire_name(&owner));
+    response.extend([0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 7]);
+    response
+}
+
+#[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn final_dns_uses_and_reuses_tcp_when_udp_has_no_answer() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio_util::task::AbortOnDropHandle;
+        use ts_netstack_smoltcp::HasChannel;
+        use ts_netstack_smoltcp::netcore::{Config, NetstackControl};
+        let (client, mut a) = crate::netstack::bounded_piped(Config::default());
+        let (server, mut b) = crate::netstack::bounded_piped(Config::default());
+        let client_channel = client.command_channel();
+        let server_channel = server.command_channel();
+        let _client = AbortOnDropHandle::new(client.spawn_tokio());
+        let _server = AbortOnDropHandle::new(server.spawn_tokio());
+        let client_ip = Ipv4Addr::new(10, 8, 0, 2);
+        let server_ip = Ipv4Addr::new(10, 8, 0, 3);
+        client_channel
+            .set_ips([IpAddr::V4(client_ip)])
+            .await
+            .unwrap();
+        server_channel
+            .set_ips([IpAddr::V4(server_ip)])
+            .await
+            .unwrap();
+        let _pipe = AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(packet) = a.rx.recv_async() => { b.tx.send_owned_async(packet).await; },
+                    Some(packet) = b.rx.recv_async() => { a.tx.send_owned_async(packet).await; },
+                    else => break,
+                }
+            }
+        }));
+        let listener = server_channel
+            .tcp_listen(SocketAddr::new(server_ip.into(), 53))
+            .await
+            .unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = connections.clone();
+        let _peer = AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                let Ok(mut stream) = listener.accept().await else {
+                    break;
+                };
+                accepted.fetch_add(1, Ordering::SeqCst);
+                tasks.spawn(async move {
+                    while let Ok(length) = stream.read_u16().await {
+                        let mut request = vec![0; usize::from(length)];
+                        stream.read_exact(&mut request).await.unwrap();
+                        let mut response = error_response(&request, 0); // valid NODATA
+                        if parse_query(&request).unwrap().questions[0].name == "truncated.example" {
+                            response[2] |= 2;
+                        }
+                        stream.write_u16(response.len() as u16).await.unwrap();
+                        stream.write_all(&response).await.unwrap();
+                    }
+                });
+            }
+        }));
+        let protector = Arc::new(crate::socket::NoopSocketProtector);
+        let resolver = SplitDnsResolver {
+            tunnel_channel: Some(client_channel.clone()),
+            stream_dns: None,
+            assigned_ipv4: client_ip,
+            assigned_ipv6: Ipv6Addr::UNSPECIFIED,
+            tunnel_servers: vec![SocketAddr::new(server_ip.into(), 53)],
+            final_exit: true,
+            final_doh: None,
+            final_tcp: Some(Arc::new(crate::dns_stream::StreamDns::over_stack(
+                client_channel.clone(),
+                client_ip,
+                Ipv6Addr::UNSPECIFIED,
+                protector.clone(),
+                CancellationToken::new(),
+            ))),
+            policy: Arc::new(GeoDirectPolicy::disabled()),
+            protector: protector.clone(),
+            hints: Arc::new(DnsRouteCache::default()),
+            permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            service_tasks: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            quality: NetworkQualityTelemetry::default(),
+            direct_queue: None,
+        };
+        for id in 1..=2 {
+            let request = query(id, "memory.example");
+            let started = tokio::time::Instant::now();
+            let response = resolver.handle(&request, QueryTransport::Udp).await;
+            assert_eq!(read_u16(&response, 2).unwrap() & 15, 0);
+            validate_response_bytes(&request, &response).unwrap();
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "sequential hedges reuse their TCP connection"
+        );
+        let rejected = resolver
+            .handle(&query(3, "truncated.example"), QueryTransport::Udp)
+            .await;
+        assert_eq!(read_u16(&rejected, 2).unwrap() & 15, RCODE_SERVFAIL);
+        // The SOCKS/HTTP resolver uses the same policy, independently of the
+        // synthetic system-VPN DNS listener, and accepts valid negative answers.
+        let resolver = crate::dns::Resolver::new(
+            client_channel,
+            client_ip,
+            Ipv6Addr::UNSPECIFIED,
+            vec![server_ip.into()],
+            usque_core::ProxyDnsMode::Remote,
+            protector,
+        )
+        .with_final_exit(true, CancellationToken::new());
+        let started = tokio::time::Instant::now();
+        assert!(resolver.resolve("memory.example").await.is_err()); // NODATA for A and AAAA
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(connections.load(Ordering::SeqCst), 3); // Two simultaneous questions, bounded pool.
+    }
+
+    #[tokio::test]
+    async fn concurrent_udp_queries_survive_reply_delivery() {
+        use ts_netstack_smoltcp::netcore::smoltcp::{iface::SocketSet, socket::udp as raw_udp};
+        use ts_netstack_smoltcp::netcore::{Request, Response, flume, udp};
+        const COUNT: usize = 128;
+        let mut sockets = SocketSet::new(vec![]);
+        let buffer =
+            || raw_udp::PacketBuffer::new(vec![raw_udp::PacketMetadata::EMPTY; 1], vec![0; 512]);
+        let handle = sockets.add(raw_udp::Socket::new(buffer(), buffer()));
+        let (commands, requests) = flume::bounded::<Request>(16);
+        let (seen, mut replies) = mpsc::channel(COUNT);
+        let stack = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut next = 0;
+            let mut pending = Vec::new();
+            while let Ok(request) = requests.recv_async().await {
+                let response = match request.command {
+                    ts_netstack_smoltcp::netcore::Command::Udp(udp::Command::Bind { endpoint }) => {
+                        udp::Response::Bound {
+                            handle,
+                            local: endpoint,
+                        }
+                        .into()
+                    }
+                    ts_netstack_smoltcp::netcore::Command::Udp(udp::Command::Recv { .. }) => {
+                        if next == COUNT {
+                            pending.push(request.resp);
+                            continue;
+                        }
+                        next += 1;
+                        udp::Response::RecvFrom {
+                            remote: "127.0.0.1:55001".parse().unwrap(),
+                            buf: Bytes::from(query(next as u16, "memory.example")),
+                            truncated: None,
+                        }
+                        .into()
+                    }
+                    ts_netstack_smoltcp::netcore::Command::Udp(udp::Command::Send {
+                        buf, ..
+                    }) => {
+                        seen.send(read_u16(&buf, 0).unwrap()).await.unwrap();
+                        Response::Ok
+                    }
+                    _ => Response::Ok,
+                };
+                // A queued RPC result can be ready at the same time as an
+                // earlier DNS reply. Dropping the receive future loses it.
+                let _ = request.resp.send(response);
+                tokio::task::yield_now().await;
+            }
+        }));
+        let socket = StackUdpSocket::bind(commands.downgrade(), "198.18.0.1:53".parse().unwrap())
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let resolver = SplitDnsResolver {
+            tunnel_channel: None,
+            stream_dns: None,
+            assigned_ipv4: "10.8.0.2".parse().unwrap(),
+            assigned_ipv6: Ipv6Addr::UNSPECIFIED,
+            tunnel_servers: vec![],
+            final_exit: true,
+            final_tcp: None,
+            final_doh: None,
+            policy: Arc::new(GeoDirectPolicy::disabled()),
+            protector: Arc::new(crate::socket::NoopSocketProtector),
+            hints: Arc::new(DnsRouteCache::default()),
+            permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            service_tasks: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            quality: NetworkQualityTelemetry::default(),
+            direct_queue: None,
+        };
+        let server = tokio::spawn(run_udp_server(socket, resolver, cancel.clone()));
+        let mut received = HashSet::new();
+        let result = timeout(Duration::from_secs(2), async {
+            while received.len() < COUNT {
+                assert!(received.insert(replies.recv().await.unwrap()));
+            }
+        })
+        .await;
+        cancel.cancel();
+        server.await.unwrap();
+        drop(stack);
+        assert!(
+            result.is_ok(),
+            "received only {} of {COUNT} queries",
+            received.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_final_dns_returns_servfail_without_fallback_or_delay() {
+        let resolver = SplitDnsResolver {
+            tunnel_channel: None,
+            stream_dns: None,
+            assigned_ipv4: "10.8.0.2".parse().unwrap(),
+            assigned_ipv6: Ipv6Addr::UNSPECIFIED,
+            tunnel_servers: vec![],
+            final_exit: true,
+            final_tcp: None,
+            final_doh: None,
+            policy: Arc::new(GeoDirectPolicy::disabled()),
+            protector: Arc::new(crate::socket::NoopSocketProtector),
+            hints: Arc::new(DnsRouteCache::default()),
+            permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            service_tasks: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            quality: NetworkQualityTelemetry::default(),
+            direct_queue: None,
+        };
+        let started = tokio::time::Instant::now();
+        let response = resolver
+            .handle(&query(31, "private.example"), QueryTransport::Udp)
+            .await;
+        assert_eq!(read_u16(&response, 0).unwrap(), 31);
+        assert_eq!(read_u16(&response, 2).unwrap() & 15, RCODE_SERVFAIL);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
     use super::*;
     use crate::geo_direct::GeoDirectClassifier;
     use crate::socket::{SocketHandle, SocketProtector};
@@ -1481,6 +2233,9 @@ pub(crate) mod tests {
             assigned_ipv4: Ipv4Addr::new(172, 16, 0, 2),
             assigned_ipv6: "2001:db8::2".parse().unwrap(),
             tunnel_servers: Vec::new(),
+            final_exit: false,
+            final_tcp: None,
+            final_doh: None,
             policy: Arc::new(policy()),
             protector,
             hints: Arc::new(DnsRouteCache::default()),
@@ -1589,6 +2344,153 @@ pub(crate) mod tests {
         response
     }
 
+    #[tokio::test]
+    async fn reject_only_dns_refuses_before_upstream_or_admission() {
+        let policy = crate::geo_direct::routing_test_policy(&[(
+            "example.com",
+            usque_core::RoutingAction::Reject,
+        )]);
+        let resolver = SplitDnsResolver {
+            tunnel_channel: None,
+            stream_dns: None,
+            assigned_ipv4: Ipv4Addr::UNSPECIFIED,
+            assigned_ipv6: Ipv6Addr::UNSPECIFIED,
+            tunnel_servers: Vec::new(),
+            final_exit: false,
+            final_tcp: None,
+            final_doh: None,
+            policy: Arc::new(policy),
+            protector: Arc::new(crate::socket::NoopSocketProtector),
+            hints: Arc::new(DnsRouteCache::default()),
+            permits: Arc::new(Semaphore::new(0)),
+            service_tasks: Arc::new(Semaphore::new(0)),
+            quality: NetworkQualityTelemetry::default(),
+            direct_queue: None,
+        };
+        for transport in [QueryTransport::Udp, QueryTransport::Tcp] {
+            for request in [query(11, "example.com"), mixed_query()] {
+                let response = resolver.handle(&request, transport).await;
+                assert_eq!(read_u16(&response, 2).unwrap() & 15, RCODE_REFUSED);
+                assert_eq!(&response[..2], &request[..2]);
+            }
+        }
+        assert!(resolver.hints.inner.lock().unwrap().hints.is_empty());
+    }
+
+    #[test]
+    fn cname_rejection_and_explicit_proxy_hints() {
+        let policy = crate::geo_direct::routing_test_policy(&[
+            ("alias.test", usque_core::RoutingAction::Reject),
+            ("proxy.test", usque_core::RoutingAction::Proxy),
+        ]);
+        let request = query(13, "allowed.test");
+        let mut response = error_response(&request, 0);
+        response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 60]);
+        let alias = query(0, "alias.test");
+        let encoded = &alias[12..alias.len() - 4];
+        response.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+        response.extend_from_slice(encoded);
+        assert_eq!(
+            check_routing_dns_response(&request, &response, &policy).unwrap_err(),
+            "routing_rejected"
+        );
+        let request = query(14, "proxy.test");
+        let parsed = parse_query(&request).unwrap();
+        let response = a_response(&request, 60, [203, 0, 113, 9]);
+        let cache = DnsRouteCache::default();
+        cache.observe_policy(&response, &parsed, QueryRoute::Tunnel, Some(1), &policy);
+        assert_eq!(
+            cache.route_ip(
+                "203.0.113.9".parse().unwrap(),
+                Some(1),
+                &super::tests::policy()
+            ),
+            GeoRoute::Tunnel
+        );
+        assert_eq!(
+            cache.route_ip(
+                "203.0.113.9".parse().unwrap(),
+                Some(2),
+                &super::tests::policy()
+            ),
+            GeoRoute::Direct
+        );
+    }
+
+    #[test]
+    fn explicit_proxy_survives_shorter_shared_ip_observations_and_pruning() {
+        let policy = crate::geo_direct::routing_test_policy(&[
+            ("proxy.test", usque_core::RoutingAction::Proxy),
+            ("203.0.113.7", usque_core::RoutingAction::Direct),
+        ]);
+        let cache = DnsRouteCache::default();
+        for (host, ttl) in [("proxy.test", 3600), ("other.test", 1), ("proxy.test", 1)] {
+            let request = query(9, host);
+            cache.observe_policy(
+                &a_response(&request, ttl, [203, 0, 113, 7]),
+                &parse_query(&request).unwrap(),
+                QueryRoute::Tunnel,
+                Some(1),
+                &policy,
+            );
+        }
+        let ip = "203.0.113.7".parse().unwrap();
+        {
+            let mut table = cache.inner.lock().unwrap();
+            let future = Instant::now() + Duration::from_secs(30);
+            // Explicit lifetimes remain meaningful independently of ordinary observations.
+            table.hints.get_mut(&ip).unwrap().tunnel_until = Some(Instant::now());
+            prune_hints(&mut table, future);
+            assert!(table.hints[&ip].explicit_proxy_until.unwrap() > future);
+        }
+        assert_eq!(cache.route_ip(ip, Some(1), &policy), GeoRoute::Tunnel);
+        assert_eq!(cache.route_ip(ip, Some(2), &policy), GeoRoute::Direct);
+    }
+
+    #[test]
+    fn cname_depth_bound_is_terminal_and_raw_udp_replies_are_correlated() {
+        let policy = crate::geo_direct::routing_test_policy(&[(
+            "blocked.test",
+            usque_core::RoutingAction::Reject,
+        )]);
+        let request = query(20, "allowed.test");
+        let mut names = (0..MAX_CNAME_DEPTH)
+            .map(|n| format!("hop{n}.test"))
+            .collect::<Vec<_>>();
+        names.push("blocked.test".into());
+        let too_deep = test_cname_response(&request, &names);
+        assert!(check_routing_dns_response(&request, &too_deep, &policy).is_err());
+        assert_eq!(
+            filter_routing_dns_response(&request, too_deep, &policy)[3] & 15,
+            RCODE_SERVFAIL as u8
+        );
+        let response = test_cname_response(&request, &["blocked.test".into()]);
+        let server = "192.0.2.53:53".parse().unwrap();
+        let other = "192.0.2.54:53".parse().unwrap();
+        let mut pending = RoutingDnsQueries::default();
+        assert!(pending.filter(server, &response, &policy).is_none());
+        assert!(pending.record(server, &request));
+        assert_eq!(
+            pending.filter(server, &response, &policy).unwrap()[3] & 15,
+            RCODE_REFUSED as u8
+        );
+        assert!(pending.filter(server, &response, &policy).is_none());
+        for id in 0..4 {
+            assert!(pending.record(server, &query(id, "allowed.test")));
+        }
+        assert!(!pending.record(server, &query(5, "allowed.test")));
+        for (created, _, _, _) in &mut pending.pending {
+            *created -= DNS_TIMEOUT;
+        }
+        assert!(pending.record(server, &request));
+        assert_eq!(pending.pending.len(), 1);
+        assert!(pending.record(other, &request));
+        let failure = error_response(&request, RCODE_SERVFAIL);
+        assert!(pending.filter(server, &failure, &policy).is_some());
+        assert!(pending.filter(other, &response, &policy).is_some());
+    }
+
     #[test]
     fn classifies_before_upstream_selection() {
         let direct = parse_query(&query(1, "www.example.cn")).unwrap();
@@ -1634,6 +2536,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn compressed_response_questions_supply_the_answer_offset() {
+        let mut request = query(9, "www.example.cn");
+        let first_question_end = request.len();
+        request[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        append_name(&mut request, "www.example.cn");
+        request.extend_from_slice(&[0, 1, 0, 1]);
+        let parsed = parse_query(&request).unwrap();
+
+        let mut response = request[..first_question_end].to_vec();
+        response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+        let response_question_end = response.len();
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 198, 51, 100, 7]);
+
+        assert!(response_question_end < parsed.question_end);
+        assert_eq!(
+            validate_response(&parsed, &response).unwrap(),
+            response_question_end
+        );
+        validate_response_bytes(&request, &response).unwrap();
+        assert_eq!(
+            response_hints(&response, &parsed).unwrap(),
+            vec![(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 60)]
+        );
+    }
+
+    #[test]
     fn cname_hints_ignore_unrelated_additional_records_and_reject_trailing_bytes() {
         let request = query(8, "www.example.cn");
         let parsed = parse_query(&request).unwrap();
@@ -1654,6 +2584,33 @@ pub(crate) mod tests {
         let mut response = request.clone();
         response[2..4].copy_from_slice(&0x8183_u16.to_be_bytes());
         assert!(response_hints(&response, &parsed).unwrap().is_empty());
+    }
+
+    #[test]
+    fn custom_domain_hints_conflicts_and_network_generation_remain_scoped() {
+        let profile = usque_core::Profile {
+            bypass_domains: vec!["example.cn".into()],
+            ..Default::default()
+        };
+        let policy = GeoDirectPolicy::disabled()
+            .with_custom_rules(&profile)
+            .unwrap();
+        let request = query(9, "www.example.cn");
+        assert_eq!(policy.route_host("www.example.cn"), GeoRoute::Direct);
+        let parsed = parse_query(&request).unwrap();
+        let response = a_response(&request, 60, [198, 51, 100, 7]);
+        let cache = DnsRouteCache::default();
+        let ip = "198.51.100.7".parse().unwrap();
+        cache.observe(&response, &parsed, QueryRoute::Direct, Some(1));
+        assert_eq!(cache.route_ip(ip, Some(1), &policy), GeoRoute::Direct);
+        cache.observe(&response, &parsed, QueryRoute::Tunnel, Some(1));
+        assert_eq!(cache.route_ip(ip, Some(1), &policy), GeoRoute::Tunnel);
+        assert_eq!(cache.route_ip(ip, Some(2), &policy), GeoRoute::Tunnel);
+        let fresh = DnsRouteCache::default();
+        assert_eq!(
+            fresh.route_ip(ip, Some(2), &GeoDirectPolicy::disabled()),
+            GeoRoute::Tunnel
+        );
     }
 
     #[test]
@@ -1716,6 +2673,8 @@ pub(crate) mod tests {
                     HintState {
                         direct_until: Some(now - Duration::from_secs(1)),
                         tunnel_until: None,
+                        explicit_proxy_until: None,
+                        explicit_direct_until: None,
                         last_seen: now - Duration::from_secs(1),
                     },
                 )]),
@@ -1734,6 +2693,8 @@ pub(crate) mod tests {
         let expired = HintState {
             direct_until: Some(now - Duration::from_secs(1)),
             tunnel_until: None,
+            explicit_proxy_until: None,
+            explicit_direct_until: None,
             last_seen: now - Duration::from_secs(1),
         };
         let mut table = HintTable {
@@ -1772,14 +2733,73 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn direct_candidate_limit_is_applied_after_ip_rejection() {
+        let server = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let protector = LocalDnsProtector {
+            server: server.local_addr().unwrap(),
+            generation: Arc::new(AtomicU64::new(1)),
+        };
+        let task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut wire = [0; 4096];
+                let (length, peer) = server.recv_from(&mut wire).await.unwrap();
+                let request = &wire[..length];
+                let parsed = parse_query(request).unwrap();
+                let mut response = error_response(request, 0);
+                if parsed.questions[0].query_type == 1 {
+                    response[6..8].copy_from_slice(&16_u16.to_be_bytes());
+                    for n in 1..=16 {
+                        response.extend([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, n]);
+                    }
+                } else {
+                    response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+                    response.extend([0xc0, 12, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]);
+                    response.extend("2001:db8::7".parse::<Ipv6Addr>().unwrap().octets());
+                }
+                server.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let policy = crate::geo_direct::routing_test_policy(&[(
+            "192.0.2.0/24",
+            usque_core::RoutingAction::Reject,
+        )]);
+        let addresses = resolve_direct_routed(&protector, "service.test", 443, &policy)
+            .await
+            .unwrap();
+        assert_eq!(
+            addresses,
+            ["[2001:db8::7]:443".parse::<SocketAddr>().unwrap()]
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn physical_resolver_retries_truncated_udp_over_tcp() {
-        let udp = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let port = udp.local_addr().unwrap().port();
-        let tcp = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-            .await
-            .unwrap();
+        // TCP and UDP reservations differ on Windows. Retain both successful
+        // binds, retrying only port conflicts/restrictions with a finite bound.
+        // If the host blocks all candidates this still fails, never skips.
+        let mut pair = None;
+        for _ in 0..32 {
+            let tcp = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = tcp.local_addr().unwrap().port();
+            match tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).await {
+                Ok(udp) => {
+                    pair = Some((tcp, udp, port));
+                    break;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    ) => {}
+                Err(error) => panic!("loopback UDP bind failed: {error}"),
+            }
+        }
+        let (tcp, udp, port) = pair.expect("no shared loopback TCP/UDP port available");
         let udp_task = tokio::spawn(async move {
             let mut packet = [0_u8; 512];
             for _ in 0..2 {

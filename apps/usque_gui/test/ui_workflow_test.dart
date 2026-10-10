@@ -84,7 +84,7 @@ Finder fieldWithLabel(String label) => find
 
 void main() {
   testWidgets(
-    'phone keeps protection and both rates above the fold and opens quality',
+    'phone keeps protection and both rates above the fold and opens quality from Settings',
     (tester) async {
       final app = await pumpWorkflow(
         tester,
@@ -100,7 +100,13 @@ void main() {
         expect(tester.getBottomLeft(find.text(label)).dy, lessThan(navTop));
       }
       expect(find.text('Protocol'), findsNothing);
-      final quality = find.byKey(const ValueKey('home-network-quality'));
+      expect(find.byKey(const ValueKey('home-network-quality')), findsNothing);
+      expect(find.byKey(const ValueKey('home-diagnostics')), findsNothing);
+      app.selectSection(AppSection.settings);
+      await tester.pumpAndSettle();
+      final quality = find.widgetWithText(ActionRow, 'Network quality');
+      await tester.ensureVisible(quality);
+      await tester.pumpAndSettle();
       expect(quality.hitTestable(), findsOneWidget);
       await tester.tap(quality);
       await tester.pumpAndSettle();
@@ -108,12 +114,25 @@ void main() {
       await tester.binding.handlePopRoute();
       await tester.pumpAndSettle();
       expect(find.byType(NetworkQualityScreen), findsNothing);
+      app.selectSection(AppSection.home);
+      await tester.pumpAndSettle();
       await tester.ensureVisible(find.text('Connection details'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Connection details'));
       await tester.pumpAndSettle();
-      expect(find.text('Protocol'), findsOneWidget);
-      expect(find.text('SOCKS5 · Enabled · not running'), findsOneWidget);
+      final details = find.byKey(
+        const ValueKey('home-connection-detail-values'),
+      );
+      expect(find.text('Protocol'), findsNothing);
+      expect(
+        find.descendant(of: details, matching: find.text('Exit IP:')),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(of: details, matching: find.textContaining('SOCKS5')),
+        findsOneWidget,
+      );
+      expect(find.text('SOCKS5 · Enabled · not running'), findsNothing);
       expect(tester.takeException(), isNull);
     },
   );

@@ -2,8 +2,8 @@ package io.github.georgexie2333.usque
 
 /**
  * Decides whether an Android reconnect may keep the existing VpnService TUN
- * file descriptor. Kill Switch armed + same addresses/DNS/MTU/routes retains
- * the fd so physical traffic stays black-holed while native restarts.
+ * file descriptor. Automatic network recovery or an armed Kill Switch keeps
+ * matching addresses/DNS/MTU/routes in place while native restarts.
  */
 internal enum class TunRestartDecision {
     RETAIN,
@@ -19,9 +19,12 @@ internal data class TunIdentity(
     val dnsV6: String,
     val allowLan: Boolean,
     val bypassCidrs: List<String>,
+    val splitDnsEnabled: Boolean = false,
     val perAppEnabled: Boolean = false,
     val perAppPackages: List<String> = emptyList(),
     val dataPlane: String = "connect_ip",
+    val vpnGateEnabled: Boolean = false,
+    val warpDnsMode: String = "plain",
 ) {
     fun sameForReuse(other: TunIdentity): Boolean = this == other
 
@@ -33,12 +36,15 @@ internal data class TunIdentity(
             TunIdentity(
                 profileId = profile.id,
                 dataPlane = profile.dataPlane,
+                vpnGateEnabled = profile.vpnGateEnabled,
+                warpDnsMode = profile.warpDnsMode,
                 mtu = profile.mtu,
                 dnsMode = profile.dnsMode,
                 dnsV4 = profile.dnsIpv4.hostAddress ?: profile.dnsIpv4.toString(),
                 dnsV6 = profile.dnsIpv6.hostAddress ?: profile.dnsIpv6.toString(),
                 allowLan = profile.allowLan,
                 bypassCidrs = profile.bypassCidrs,
+                splitDnsEnabled = profile.splitDnsEnabled,
                 perAppEnabled = perApp.enabled,
                 perAppPackages = perApp.packageNames,
             )
@@ -52,8 +58,9 @@ internal object TunRestartPolicy {
         hasCurrentFd: Boolean,
         sameIdentity: Boolean,
         userRequestedDisconnect: Boolean,
+        networkRecovery: Boolean = false,
     ): TunRestartDecision {
-        if (userRequestedDisconnect || !tunnelFrontend || !hasCurrentFd || !killSwitch) {
+        if (userRequestedDisconnect || !tunnelFrontend || !hasCurrentFd || (!killSwitch && !networkRecovery)) {
             return TunRestartDecision.TEARDOWN
         }
         return if (sameIdentity) {

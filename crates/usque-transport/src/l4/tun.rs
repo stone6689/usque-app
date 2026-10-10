@@ -1,5 +1,5 @@
-//! TCP-only TUN bridge. Unhandled traffic is consumed, never returned to a
-//! packet tunnel or a physical UDP socket. DNS is parsed before any dial.
+//! Flow-based TUN bridge with optional final-exit datagrams. Unsupported proxy
+//! traffic is consumed without fallback. DNS is parsed before any dial.
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
@@ -19,13 +19,14 @@ use usque_core::Profile;
 
 use super::performance::{MeasuredSender, QueuedPacket, TunWriteObserver};
 use super::stream::BufferLease;
-use super::tun_stream::{OnceListener, TunStream};
-use super::tun_wire::{TcpReset, reply_allowed, udp_response, udp_unreachable, valid_transport};
+use super::tun_reject::UdpRejector;
+use super::tun_wire::{TcpReset, reply_allowed, udp_response, valid_transport};
 use super::{BufferBudget, L4Metrics, Limits};
 use crate::direct_gateway::{NatPacket, rewrite_destination, rewrite_source};
 use crate::geo_direct::{GeoRoute, RoutedTcpStream, connect_direct_ip};
 use crate::h2::TransportError;
 use crate::split_dns::{SPLIT_DNS_IPV4, SPLIT_DNS_IPV6, SplitDnsResolver};
+use crate::stack_tcp::{OnceListener, StackTcpStream as TunStream};
 use crate::tcp::{FlowClass, ProxyServices, TcpTarget};
 
 const PACKETS: usize = 64;
@@ -72,6 +73,21 @@ pub(crate) struct L4TunIo {
 }
 
 impl L4TunIo {
+    #[cfg(test)]
+    pub(crate) fn memory_test_io() -> (Self, mpsc::Receiver<QueuedPacket>) {
+        let (outgoing, receiver) = mpsc::channel(1);
+        let (_incoming, incoming) = mpsc::channel(1);
+        (
+            Self {
+                metrics: Arc::new(L4Metrics::default()),
+                outgoing: MeasuredSender::new(outgoing, Arc::default()),
+                incoming,
+                cancellation: CancellationToken::new(),
+                mtu: 1280,
+            },
+            receiver,
+        )
+    }
     pub(crate) fn write_observer(&self) -> TunWriteObserver {
         TunWriteObserver::new(self.metrics.performance.clone())
     }
@@ -200,13 +216,16 @@ impl TunBridge {
             .set_ips([IpAddr::V4(SPLIT_DNS_IPV4), IpAddr::V6(SPLIT_DNS_IPV6)])
             .await
             .map_err(|_| TransportError::Netstack("L4 TUN addresses unavailable".to_owned()))?;
-        let resolver = Arc::new(SplitDnsResolver::for_l4(
-            dns.clone(),
-            &profile.dns_servers,
-            services.geo_policy.clone(),
-            services.protector.clone(),
-            quality,
-        ));
+        let resolver = Arc::new(
+            SplitDnsResolver::for_l4(
+                dns.clone(),
+                services.resolver.servers(),
+                services.geo_policy.clone(),
+                services.protector.clone(),
+                quality,
+            )
+            .with_doh(services.resolver.final_doh()),
+        );
         let flows = Arc::new(Mutex::new(Flows::default()));
         let (outgoing, mut packets) = mpsc::channel::<QueuedPacket>(PACKETS);
         let outgoing = MeasuredSender::new(outgoing, metrics.performance.tun_ingress.clone());
@@ -252,13 +271,18 @@ impl TunBridge {
         let pump_metrics = metrics.clone();
         let flow_tasks = tokio_util::task::TaskTracker::new();
         let tracked_flows = flow_tasks.clone();
+        let udp_idle = profile.proxy.udp_idle_timeout_seconds;
+        let udp_enabled = profile.data_plane != usque_core::DataPlaneMode::L4Proxy;
+        let routing_rejector = crate::routing_reject::RoutingRejector::default();
+        let udp_rejector =
+            UdpRejector::new(response_tx.clone(), metrics.clone(), cancellation.clone());
         let task = tokio::spawn(async move {
+            let mut udp_flows =
+                super::tun_udp::UdpFlows::new(udp_idle, resolver.hints(), udp_rejector.clone());
             let mut jobs = JoinSet::new();
             let dns_permits = Arc::new(Semaphore::new(80));
             let tcp_permits = Arc::new(Semaphore::new(limits.active));
             let mut sweep = tokio::time::interval(Duration::from_secs(1));
-            let mut icmp_window = Instant::now();
-            let mut icmp_count = 0u16;
             loop {
                 let packet = tokio::select! {
                     _ = task_cancel.cancelled() => break,
@@ -272,10 +296,29 @@ impl TunBridge {
                     }
                     packet = packets.recv() => match packet { Some(p) => p.into_bytes(), None => break },
                 };
+                let internal_dns = NatPacket::parse(&packet).is_some_and(|meta| {
+                    meta.destination_port == 53
+                        && matches!(
+                            meta.destination,
+                            IpAddr::V4(SPLIT_DNS_IPV4) | IpAddr::V6(SPLIT_DNS_IPV6)
+                        )
+                });
+                if !internal_dns
+                    && crate::routing_reject::destination(&packet)
+                        .is_some_and(|ip| services.geo_policy.rejects_ip(ip))
+                {
+                    if let Some(reply) = routing_rejector.reply(&packet) {
+                        let _ = response_tx.try_send(reply);
+                    }
+                    continue;
+                }
                 let Some(meta) = NatPacket::parse(&packet) else {
                     pump_metrics.update(|m| m.unsupported_packets += 1);
                     continue;
                 };
+                if !services.dialer.is_ready() {
+                    continue;
+                }
                 if !valid_transport(&packet, &meta) || !reply_allowed(&meta) {
                     pump_metrics.update(|m| m.unsupported_packets += 1);
                     continue;
@@ -302,18 +345,39 @@ impl TunBridge {
                             let wire = udp_response(&meta, &response);
                             tokio::select! { _ = cancel.cancelled() => {}, _ = replies.send(wire) => {} }
                         }));
+                    } else if services.traffic_policy.blocks_udp(meta.destination_port)
+                        && resolver.hints().route_ip(
+                            meta.destination,
+                            services.protector.network_generation(),
+                            &services.geo_policy,
+                        ) != GeoRoute::Direct
+                    {
+                        // Reject known tunnel policy failures before a new
+                        // source can consume a worker's shared TCP slot/buffers.
+                        // Workers recheck after routing changes or direct failure.
+                        udp_rejector.reject(&packet, &meta);
+                    } else if udp_enabled
+                        && (services.udp.is_some()
+                            || resolver.hints().route_ip(
+                                meta.destination,
+                                services.protector.network_generation(),
+                                &services.geo_policy,
+                            ) == GeoRoute::Direct)
+                        && udp_flows.enqueue(
+                            meta,
+                            packet.clone(),
+                            &services,
+                            &response_tx,
+                            &tcp_permits,
+                            &budget,
+                            &tracked_flows,
+                            &task_cancel,
+                            mtu,
+                        )
+                    {
+                        // The bounded worker owns this datagram until relay completion.
                     } else {
-                        pump_metrics.update(|m| m.udp_rejected += 1);
-                        if icmp_window.elapsed() >= Duration::from_secs(1) {
-                            icmp_window = Instant::now();
-                            icmp_count = 0;
-                        }
-                        if icmp_count < 32
-                            && let Some(error) = udp_unreachable(&packet, &meta)
-                        {
-                            icmp_count += 1;
-                            let _ = response_tx.try_send(error);
-                        }
+                        udp_rejector.reject(&packet, &meta);
                     }
                     continue;
                 }
@@ -646,6 +710,9 @@ async fn connect_target(
     route: GeoRoute,
     services: &ProxyServices,
 ) -> Result<RoutedTcpStream, ()> {
+    if route == GeoRoute::Reject {
+        return Err(());
+    }
     if route == GeoRoute::Direct
         && let Ok((stream, lease)) = connect_direct_ip(services.protector.as_ref(), remote).await
     {
@@ -674,19 +741,24 @@ async fn dns_query(
     meta: &NatPacket,
     query: &[u8],
 ) -> Vec<u8> {
+    if let Some(refused) = resolver.routing_refusal(query) {
+        return refused;
+    }
     if matches!(
         meta.destination,
         IpAddr::V4(SPLIT_DNS_IPV4) | IpAddr::V6(SPLIT_DNS_IPV6)
     ) {
         resolver.handle_l4(query, true).await
     } else {
-        dns.query(
-            SocketAddr::new(meta.destination, 53),
-            query,
-            Instant::now() + Duration::from_secs(4),
-        )
-        .await
-        .unwrap_or_else(|_| crate::split_dns::l4_dns_error(query))
+        let response = dns
+            .query(
+                SocketAddr::new(meta.destination, 53),
+                query,
+                Instant::now() + Duration::from_secs(4),
+            )
+            .await
+            .unwrap_or_else(|_| crate::split_dns::l4_dns_error(query));
+        resolver.filter_routing_response(query, response)
     }
 }
 

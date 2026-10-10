@@ -29,6 +29,7 @@ enum Command {
         session_id: String,
     },
     Get,
+    Reset,
     Observe {
         profile: Option<AndroidProfile>,
         session_id: String,
@@ -53,6 +54,10 @@ pub(crate) fn command(path: &str, request: &str) -> Result<String, String> {
     }
     let command: Command =
         serde_json::from_str(request).map_err(|_| "invalid network settings message")?;
+    #[cfg(feature = "wireguard")]
+    if matches!(&command, Command::Save { .. } | Command::Reset) && !crate::warp_wireguard::stop() {
+        return Err("WARP_GENERATION_CLEANUP_PENDING".into());
+    }
     let store = ConfigStore::new(path);
     let mut state = STATE
         .get_or_init(|| Mutex::new(NetworkSettingsState::default()))
@@ -76,14 +81,47 @@ pub(crate) fn command(path: &str, request: &str) -> Result<String, String> {
                 changed_fields,
             };
             let commit = store.update(|config| {
-                merge_patch(config, &patch)
-                    .map_err(|error| StoreError::NetworkSettings(error.to_string()))
+                if patch.values.custom_chain().is_none()
+                    && patch.changed_fields.iter().any(|f| f == "vpn_gate")
+                {
+                    crate::vpngate::pin_settings(
+                        path,
+                        &patch.values.vpn_gate,
+                        &config.network.vpn_gate,
+                    )
+                    .map_err(StoreError::NetworkSettings)?;
+                }
+                let profile = merge_patch(config, &patch)
+                    .map_err(|error| StoreError::NetworkSettings(error.to_string()))?;
+                if profile.chain_enabled() && profile.custom_chain().is_some() {
+                    crate::chain_exit::prepare(
+                        path.parent().ok_or_else(|| {
+                            StoreError::NetworkSettings("Invalid storage path".into())
+                        })?,
+                        &profile,
+                    )
+                    .map_err(StoreError::NetworkSettings)?;
+                }
+                Ok(profile)
             });
             let stored = match commit {
-                Ok((_, profile)) => profile,
+                Ok((config, profile)) => {
+                    state.shared_network_profile = Some(
+                        config
+                            .network
+                            .hydrate(&usque_core::config::Account::default_account()),
+                    );
+                    profile
+                }
                 Err(StoreError::CommitUncertain(_)) => {
-                    state.stored_profile =
-                        store.load().ok().and_then(|config| config.active_profile());
+                    if let Ok(config) = store.load() {
+                        state.shared_network_profile = Some(
+                            config
+                                .network
+                                .hydrate(&usque_core::config::Account::default_account()),
+                        );
+                        state.stored_profile = config.active_profile();
+                    }
                     state.operation_id = Some(operation_id);
                     state.persisted = None;
                     state.apply_status = ApplyStatus::Unknown;
@@ -91,7 +129,7 @@ pub(crate) fn command(path: &str, request: &str) -> Result<String, String> {
                     state.advance();
                     return encode(&state, None);
                 }
-                Err(_) => return Err("NETWORK_SETTINGS_SAVE_FAILED".into()),
+                Err(error) => return Err(save_failure(error)),
             };
             let phase = match phase.as_str() {
                 "connected" => ConnectionPhase::Connected,
@@ -123,14 +161,22 @@ pub(crate) fn command(path: &str, request: &str) -> Result<String, String> {
                 }
             }
         }
+        Command::Reset => {
+            *state = NetworkSettingsState::default();
+        }
         Command::Get => {
             let _lock = store
                 .lock_exclusive()
                 .map_err(|_| "NETWORK_SETTINGS_UNCONFIRMED")?;
-            state.stored_profile = store
+            let config = store
                 .load_or_default()
-                .map_err(|_| "NETWORK_SETTINGS_UNCONFIRMED")?
-                .active_profile();
+                .map_err(|_| "NETWORK_SETTINGS_UNCONFIRMED")?;
+            state.stored_profile = config.active_profile();
+            state.shared_network_profile = Some(
+                config
+                    .network
+                    .hydrate(&usque_core::config::Account::default_account()),
+            );
         }
         Command::Observe {
             profile,
@@ -171,6 +217,27 @@ pub(crate) fn command(path: &str, request: &str) -> Result<String, String> {
     encode(&state, target.as_ref())
 }
 
+fn save_failure(error: StoreError) -> String {
+    if let StoreError::NetworkSettings(message) = error {
+        let message = message
+            .strip_prefix("network settings validation failed: ")
+            .unwrap_or(&message);
+        let parts = message.split(':').collect::<Vec<_>>();
+        let count = match parts[0] {
+            "ROUTING_RULE_CONFLICT" => Some(2),
+            "ROUTING_RULE_INVALID" => Some(1),
+            "ROUTING_RULE_LIMIT" | "ROUTING_UPGRADE_REQUIRED" => Some(0),
+            _ => None,
+        };
+        if count.is_some_and(|count| parts.len() == count + 1)
+            && parts[1..].iter().all(|id| Uuid::parse_str(id).is_ok())
+        {
+            return message.to_owned();
+        }
+    }
+    "NETWORK_SETTINGS_SAVE_FAILED".into()
+}
+
 fn profile_value(profile: &usque_core::Profile) -> Value {
     android_profile_value(profile, None, false)
 }
@@ -180,6 +247,11 @@ fn encode(
     target: Option<&usque_core::Profile>,
 ) -> Result<String, String> {
     let mut result = serde_json::to_value(state).map_err(|_| "network settings encoding failed")?;
+    result["shared_network_profile"] = state
+        .shared_network_profile
+        .as_ref()
+        .map(profile_value)
+        .unwrap_or(Value::Null);
     result["stored_profile"] = state
         .stored_profile
         .as_ref()
@@ -198,6 +270,53 @@ fn encode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_validation_errors_are_definitive_and_preserve_rule_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles-v2.json");
+        let store = ConfigStore::new(&path);
+        let config = usque_core::AppConfig::default();
+        store.save(&config).unwrap();
+        let mut profile = config.active_profile().unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        profile.routing.rules = vec![
+            usque_core::RoutingRule {
+                id: first,
+                kind: usque_core::RoutingMatch::Domain,
+                target: "bücher.example".into(),
+                action: usque_core::RoutingAction::Direct,
+            },
+            usque_core::RoutingRule {
+                id: second,
+                kind: usque_core::RoutingMatch::Domain,
+                target: "xn--bcher-kva.example".into(),
+                action: usque_core::RoutingAction::Reject,
+            },
+        ];
+        let save = |profile: &usque_core::Profile, field| {
+            command(
+                path.to_str().unwrap(),
+                &json!({
+                    "command":"save", "operation_id":Uuid::new_v4(), "account_id":profile.id,
+                    "values":profile_value(profile), "changed_fields":[field],
+                    "phase":"disconnected", "available":false, "session_id":"1"
+                })
+                .to_string(),
+            )
+        };
+        assert_eq!(
+            save(&profile, "routing").unwrap_err(),
+            format!("ROUTING_RULE_CONFLICT:{first}:{second}")
+        );
+        profile.routing = Default::default();
+        assert_eq!(
+            save(&profile, "bypass_domains").unwrap_err(),
+            "ROUTING_UPGRADE_REQUIRED"
+        );
+        assert!(store.load().unwrap().network.routing.rules.is_empty());
+    }
 
     #[test]
     fn host_uses_shared_policy_and_never_activates_an_earlier_deferred_edit() {

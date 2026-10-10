@@ -25,7 +25,153 @@ export 'control_codec.dart'
 /// Desktop [EngineClient] that coordinates request serialization, codec, and
 /// transport. Public API, MethodChannel names, named pipes, and protobuf wire
 /// data are unchanged from the pre-split client.
-class DesktopEngineClient implements EngineClient {
+class DesktopEngineClient
+    implements
+        EngineClient,
+        VpnGateClient,
+        ChainProfileClient,
+        WarpWireguardClient,
+        InitialIdentityClient {
+  @override
+  Future<InitialIdentityState> initializeIdentity(
+    UsqueProfile profile, {
+    required String operationId,
+    required IdentityProvisioningMethod method,
+    bool resumeOnly = false,
+    String? licenseKey,
+    String? teamName,
+    String? callbackUri,
+  }) => _serialized(() async {
+    final license = Uint8List.fromList(utf8.encode(licenseKey ?? ''));
+    final callback = Uint8List.fromList(utf8.encode(callbackUri ?? ''));
+    try {
+      final provisioning = ControlPayloadWriter()
+        ..enumeration(1, _identityProvisioningWireValue(method))
+        ..boolean(3, true)
+        ..string(4, Platform.localeName)
+        ..bytes(6, license);
+      if (method == IdentityProvisioningMethod.zeroTrust) {
+        provisioning.message(
+          7,
+          (ControlPayloadWriter()
+                ..string(1, teamName ?? '')
+                ..bytes(2, callback))
+              .takeBytes(),
+        );
+      }
+      final payload = ControlPayloadWriter()
+        ..string(1, operationId)
+        ..string(2, profile.id)
+        ..message(3, provisioning.takeBytes())
+        ..boolean(4, resumeOnly);
+      return _requireInitialIdentityState(
+        await _request(49, payload.takeBytes()),
+      );
+    } finally {
+      license.fillRange(0, license.length, 0);
+      callback.fillRange(0, callback.length, 0);
+    }
+  });
+
+  @override
+  Future<InitialIdentityState> getInitialIdentityState(String profileId) =>
+      _serialized(() async {
+        final payload = ControlPayloadWriter()..string(1, profileId);
+        return _requireInitialIdentityState(
+          await _request(50, payload.takeBytes()),
+        );
+      });
+
+  InitialIdentityState _requireInitialIdentityState(ControlResponse response) =>
+      response.initialIdentityState ??
+      (throw const EngineException(
+        'INITIAL_IDENTITY_UNSUPPORTED',
+        'Initial setup unavailable.',
+      ));
+
+  @override
+  Future<Map<Object?, Object?>> warpWireguard(Map<String, Object?> request) =>
+      _serialized(() async {
+        final payload = ControlPayloadWriter()..string(1, jsonEncode(request));
+        return (await _request(48, payload.takeBytes())).warpWireguard ??
+            const {};
+      });
+  @override
+  Future<ChainProfileResult> chainProfile(Map<String, Object?> request) =>
+      _serialized(() async {
+        final payload = ControlPayloadWriter()
+          ..string(1, request['action'] as String? ?? 'list')
+          ..string(2, request['source'] as String? ?? '')
+          ..string(3, request['name'] as String? ?? '')
+          ..string(4, request['profile_id'] as String? ?? '')
+          ..string(5, request['revision'] as String? ?? '')
+          ..string(6, request['configuration'] as String? ?? '')
+          ..string(7, request['username'] as String? ?? '')
+          ..string(8, request['password'] as String? ?? '')
+          ..string(9, request['private_key_password'] as String? ?? '');
+        if (request['proxy'] case final Map<String, Object?> proxy) {
+          final nested = ControlPayloadWriter()
+            ..string(1, proxy['host'] as String)
+            ..unsigned(2, proxy['port'] as int)
+            ..string(3, proxy['auth_mode'] as String)
+            ..string(5, proxy['dns_transport'] as String? ?? 'auto');
+          for (final server in proxy['dns_servers'] as List? ?? const []) {
+            nested.string(4, server as String);
+          }
+          payload.message(10, nested.takeBytes());
+        }
+        return (await _request(47, payload.takeBytes())).chainProfiles ??
+            (throw const EngineException(
+              'CHAIN_PROFILE_UNAVAILABLE',
+              'Chain profiles are unavailable.',
+            ));
+      });
+  @override
+  Future<List<ChainConfigurationFile>> pickChainConfigurations() =>
+      pickChainConfigurationFiles();
+  @override
+  Future<VpnGateDirectory> listVpnGate({
+    String? countryCode,
+    bool unknownCountry = false,
+    int offset = 0,
+    int limit = 50,
+    bool favoritesOnly = false,
+    bool statusOnly = false,
+  }) => _serialized(() async {
+    final request = ControlPayloadWriter()
+      ..string(1, countryCode ?? '')
+      ..boolean(2, unknownCountry)
+      ..unsigned(3, offset)
+      ..unsigned(4, limit)
+      ..boolean(6, favoritesOnly)
+      ..boolean(7, statusOnly);
+    final response = await _request(43, request.takeBytes());
+    return response.vpnGateDirectory ??
+        (throw const EngineException(
+          'VPN_GATE_UNAVAILABLE',
+          'The catalogue service is unavailable.',
+        ));
+  });
+  @override
+  Future<void> refreshVpnGate({bool cancel = false}) => _serialized(() async {
+    await _request(
+      44,
+      (ControlPayloadWriter()..boolean(1, cancel)).takeBytes(),
+    );
+  });
+  @override
+  Future<void> vpnGateNode(VpnGateNodeRequest request) => _serialized(() async {
+    await _request(
+      45,
+      (ControlPayloadWriter()
+            ..string(1, request.operationId)
+            ..string(2, request.action)
+            ..string(3, request.serverId)
+            ..string(4, request.configSha256)
+            ..string(5, request.expectedFavoriteHash))
+          .takeBytes(),
+    );
+  });
   @override
   Future<NetworkSettingsState> saveNetworkSettings(
     String operationId,
@@ -70,6 +216,7 @@ class DesktopEngineClient implements EngineClient {
   final ControlCodec _codec;
   final Duration Function(int payloadField)? _requestTimeoutOverride;
   Future<void> _requestTail = Future<void>.value();
+  int _connectionIntent = 0;
 
   @override
   bool get supportsSnapshotEvents => _transport.supportsSnapshotEvents;
@@ -110,6 +257,25 @@ class DesktopEngineClient implements EngineClient {
       _serialized(() => _upsertProfile(profile));
 
   @override
+  Future<void> renameProfile(String profileId, String name) =>
+      _serialized(() async {
+        final capabilities = (await _request(24, Uint8List(0))).capabilities;
+        if (!(capabilities?.accountMetadataMutations ?? false)) {
+          throw const EngineException(
+            'ACCOUNT_METADATA_UNSUPPORTED',
+            'Update the Engine to rename an account safely.',
+          );
+        }
+        await _request(
+          46,
+          (ControlPayloadWriter()
+                ..string(1, profileId)
+                ..string(2, name))
+              .takeBytes(),
+        );
+      });
+
+  @override
   Future<void> deleteProfile(String profileId) {
     return _serialized(() async {
       final payload = ControlPayloadWriter()..string(1, profileId);
@@ -134,7 +300,6 @@ class DesktopEngineClient implements EngineClient {
     String? callbackUri,
   }) {
     return _serialized(() async {
-      await _upsertProfile(profile);
       final license = Uint8List.fromList(utf8.encode(licenseKey ?? ''));
       final callback = Uint8List.fromList(utf8.encode(callbackUri ?? ''));
       try {
@@ -210,6 +375,13 @@ class DesktopEngineClient implements EngineClient {
     bool confirmed = true,
   }) {
     return _serialized(() async {
+      final capabilities = (await _request(24, Uint8List(0))).capabilities;
+      if (capabilities?.sharedProxyAuthApplication != true) {
+        throw const EngineException(
+          'PROXY_AUTH_UNSUPPORTED',
+          'Update the Engine before saving shared credentials.',
+        );
+      }
       final secret = Uint8List.fromList(utf8.encode(password));
       try {
         final payload = ControlPayloadWriter()
@@ -312,15 +484,6 @@ class DesktopEngineClient implements EngineClient {
       });
 
   @override
-  Future<void> setWarpProtocolAssociation(bool enabled) async {
-    if (!Platform.isWindows) return;
-    await _transport.invokePlatformMethod<void>(
-      'setWarpProtocolAssociation',
-      <String, Object?>{'enabled': enabled},
-    );
-  }
-
-  @override
   Future<void> requestAddQuickSettingsTile() async {}
 
   @override
@@ -344,15 +507,21 @@ class DesktopEngineClient implements EngineClient {
 
   @override
   Future<EngineSnapshot> connect(UsqueProfile profile) {
+    final intent = ++_connectionIntent;
     return _serialized(() async {
       final payload = ControlPayloadWriter()..string(1, profile.id);
-      final response = await _request(12, payload.takeBytes());
+      final response = await _request(
+        12,
+        payload.takeBytes(),
+        connectionIntent: intent,
+      );
       return response.snapshot ?? const EngineSnapshot();
     });
   }
 
   @override
   Future<EngineSnapshot> disconnect() async {
+    _connectionIntent++;
     // Disconnect is a priority safety operation. Do not queue it behind
     // profile persistence, status reads, or other non-critical requests.
     final response = await _request(13, Uint8List(0));
@@ -361,8 +530,13 @@ class DesktopEngineClient implements EngineClient {
 
   @override
   Future<EngineSnapshot> retry() {
+    final intent = ++_connectionIntent;
     return _serialized(() async {
-      final response = await _request(14, Uint8List(0));
+      final response = await _request(
+        14,
+        Uint8List(0),
+        connectionIntent: intent,
+      );
       return response.snapshot ?? const EngineSnapshot();
     });
   }
@@ -590,6 +764,7 @@ class DesktopEngineClient implements EngineClient {
     return _serialized(() async {
       final payload = ControlPayloadWriter()..boolean(1, confirmed);
       await _request(22, payload.takeBytes());
+      await _transport.resetEventStream();
     });
   }
 
@@ -599,7 +774,12 @@ class DesktopEngineClient implements EngineClient {
     await _request(15, request.takeBytes());
   }
 
-  Future<ControlResponse> _request(int payloadField, Uint8List payload) async {
+  Future<ControlResponse> _request(
+    int payloadField,
+    Uint8List payload, {
+    int? connectionIntent,
+  }) async {
+    _checkConnectionIntent(connectionIntent);
     if (_transport.isDisposed) {
       throw const EngineException(
         'ENGINE_CLOSED',
@@ -623,6 +803,7 @@ class DesktopEngineClient implements EngineClient {
 
     Object? lastError;
     for (var attempt = 0; attempt < 20; attempt++) {
+      _checkConnectionIntent(connectionIntent);
       Uint8List responseFrame;
       try {
         responseFrame = await _transport
@@ -640,7 +821,8 @@ class DesktopEngineClient implements EngineClient {
         lastError = error;
         // Production: stop retrying once the sidecar process handle is gone.
         // Test transports have no live process, so errors surface immediately.
-        if (payloadField == 41 || !_transport.hasLiveProcess) {
+        const safeReads = {10, 11, 24, 33, 38, 39, 40, 42, 43};
+        if (!safeReads.contains(payloadField) || !_transport.hasLiveProcess) {
           break;
         }
         await Future<void>.delayed(const Duration(milliseconds: 50));
@@ -672,6 +854,15 @@ class DesktopEngineClient implements EngineClient {
     return requestTimeoutForPayload(payloadField);
   }
 
+  void _checkConnectionIntent(int? expected) {
+    if (expected != null && expected != _connectionIntent) {
+      throw const EngineException(
+        'ENGINE_REQUEST_CANCELLED',
+        'The connection request was cancelled.',
+      );
+    }
+  }
+
   Future<T> _serialized<T>(Future<T> Function() operation) {
     final completer = Completer<T>();
     _requestTail = _requestTail.then((_) async {
@@ -694,9 +885,19 @@ class DesktopEngineClient implements EngineClient {
 @visibleForTesting
 Duration requestTimeoutForPayload(int payloadField) {
   switch (payloadField) {
+    case 49:
+      // Four bounded registration HTTP requests plus local commit margin.
+      return const Duration(seconds: 90);
+    case 50:
+      return const Duration(seconds: 5);
     case 12:
     case 14:
-      return const Duration(seconds: 55);
+      // Covers the maximum automatic endpoint cycle, chain startup and native
+      // reporting margin. Native code applies the profile's narrower budget.
+      return const Duration(seconds: 715);
+    case 27:
+      // A legacy cold reconfigure may connect the target and then roll back.
+      return const Duration(seconds: 1415);
     case 23:
     case 26:
     case 29:

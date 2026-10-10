@@ -18,29 +18,32 @@ internal data class AndroidVpnProfile(
     val allowLan: Boolean,
     val bypassCidrs: List<String>,
     val geoDirectCountries: List<String> = emptyList(),
+    val bypassDomains: List<String> = emptyList(),
     val directDnsMode: String = "physicalSystem",
     val dataPlane: String = "connect_ip",
+    val vpnGateEnabled: Boolean = false,
+    val customChain: Boolean = false,
+    val proxyChainEnabled: Boolean = false,
+    val warpDnsMode: String = "plain",
+    val routingDomainRules: Boolean = false,
+    val routingDirectDomains: Boolean = false,
 ) {
     // ipPolicy controls only the physical MASQUE endpoint. CONNECT-IP remains
     // dual-stack regardless of which outer address family carries it.
-    val includeIpv4: Boolean
-        get() = true
-
-    val includeIpv6: Boolean
-        get() = true
-
     val dnsServers: List<InetAddress>
-        get() =
-            buildList {
-                if (includeIpv4) add(dnsIpv4)
-                if (includeIpv6) add(dnsIpv6)
-            }
+        get() = listOf(dnsIpv4, dnsIpv6)
 
     val splitDnsEnabled: Boolean
-        get() = geoDirectCountries.isNotEmpty() || dataPlane == "l4_proxy"
+        get() =
+            (geoDirectCountries.isNotEmpty() || bypassDomains.isNotEmpty() || routingDomainRules) ||
+                (vpnGateEnabled && (dnsMode == "tunnel" || customChain)) ||
+                (dataPlane == "l4_proxy" && !vpnGateEnabled) ||
+                (warpDnsMode != "plain" && !vpnGateEnabled)
 
     val requiresPhysicalDns: Boolean
-        get() = geoDirectCountries.isNotEmpty() && directDnsMode == "physicalSystem"
+        get() =
+            (geoDirectCountries.isNotEmpty() || bypassDomains.isNotEmpty() || routingDirectDomains) &&
+                directDnsMode == "physicalSystem"
 
     companion object {
         private val profileIdPattern =
@@ -97,16 +100,27 @@ internal data class AndroidVpnProfile(
                 parseNumericAddress(source.requiredString("dns_v4", 64), false) as Inet4Address
             val dnsIpv6 =
                 parseNumericAddress(source.requiredString("dns_v6", 128), true) as Inet6Address
+            val warpDnsMode = source.optJSONObject("warp_dns")?.optString("mode", "plain") ?: "plain"
+            require(warpDnsMode in setOf("plain", "doh", "dot")) { "Invalid WARP DNS mode" }
+            val ordinaryEncryptedDns = warpDnsMode != "plain" && !ChainProfileFields.enabled(source)
             val endpointIpv4 =
                 parseNumericAddress(source.requiredString("endpoint_v4", 64), false) as Inet4Address
             val endpointIpv6 =
                 parseNumericAddress(source.requiredString("endpoint_v6", 128), true) as Inet6Address
-            val activeDnsServers = listOf(dnsIpv4, dnsIpv6)
+            val endpointSelection = source.optString("endpoint_selection", "custom")
+            require(endpointSelection in setOf("automatic", "custom")) { "Invalid endpoint selection" }
+            val configuredDnsServers = listOf(dnsIpv4, dnsIpv6)
+            val activeDnsServers = if (ordinaryEncryptedDns) emptyList() else configuredDnsServers
+            if (endpointSelection == "custom") {
+                require(
+                    activeDnsServers.none { server -> server == endpointIpv4 || server == endpointIpv6 },
+                ) { "VPN DNS server cannot equal a protected MASQUE endpoint" }
+            }
+            // Rust hydrates registration-owned endpoints in Custom mode.
+            // Automatic selection filters DNS clashes against real candidates
+            // in Rust; the dormant custom pair does not describe that pool.
             require(
-                activeDnsServers.none { server -> server == endpointIpv4 || server == endpointIpv6 },
-            ) { "VPN DNS server cannot equal a protected MASQUE endpoint" }
-            require(
-                activeDnsServers.none { server ->
+                configuredDnsServers.none { server ->
                     server.isAnyLocalAddress ||
                         server.isLoopbackAddress ||
                         server.isLinkLocalAddress ||
@@ -116,13 +130,14 @@ internal data class AndroidVpnProfile(
             ) { "VPN DNS server must be a routable unicast address" }
             require(
                 activeDnsServers.none { server ->
-                    VpnRoutePlanner.isAddressExcluded(server, allowLan, bypassCidrs)
+                    VpnRoutePlanner.isAddressExcluded(server, allowLan, emptyList())
                 },
             ) { "VPN DNS server cannot be covered by a LAN or CIDR bypass" }
             // Encrypted DNS uses numeric bootstrap, not physical DNS metadata.
             val directDnsMode =
                 source.optJSONObject("direct_dns")?.optString("mode", "physicalSystem") ?: "physicalSystem"
             require(directDnsMode in setOf("physicalSystem", "doh", "dot")) { "Invalid direct DNS mode" }
+            val routing = ApplicationRoutingFields.parse(source)
             return AndroidVpnProfile(
                 id = id,
                 name = name,
@@ -130,13 +145,20 @@ internal data class AndroidVpnProfile(
                 mtu = mtu,
                 dnsMode = dnsMode,
                 dataPlane = dataPlane,
+                vpnGateEnabled = ChainProfileFields.enabled(source),
+                customChain = ChainProfileFields.custom(source),
+                proxyChainEnabled = ChainProfileFields.proxy(source),
                 dnsIpv4 = dnsIpv4,
                 dnsIpv6 = dnsIpv6,
                 killSwitch = source.getBoolean("kill_switch"),
                 allowLan = allowLan,
                 bypassCidrs = bypassCidrs,
                 geoDirectCountries = geoDirectCountries,
+                bypassDomains = source.optJSONArray("bypass_domains")?.domainStrings() ?: emptyList(),
                 directDnsMode = directDnsMode,
+                warpDnsMode = warpDnsMode,
+                routingDomainRules = routing.needsDns,
+                routingDirectDomains = routing.directDns,
             )
         }
     }
@@ -157,6 +179,45 @@ internal data class WarpAddressAssignment(
     }
 }
 
+/** Negotiated addresses are separate from the outer WARP identity. */
+internal data class VpnGateNetwork(
+    val ipv4: Inet4Address?,
+    val ipv6: Inet6Address?,
+    val dns: List<InetAddress>,
+    val mtu: Int,
+) {
+    companion object {
+        fun parse(source: JSONObject): VpnGateNetwork {
+            val ipv4 =
+                if (source.isNull("ipv4")) {
+                    null
+                } else {
+                    parseNumericAddress(source.requiredString("ipv4", 64), false) as Inet4Address
+                }
+            val ipv6 =
+                if (source.isNull("ipv6")) {
+                    null
+                } else {
+                    parseNumericAddress(source.requiredString("ipv6", 128), true) as Inet6Address
+                }
+            require(ipv4 != null || ipv6 != null) { "VPN Gate assigned no addresses" }
+            val mtu = source.getInt("mtu")
+            require(mtu in 1280..9000) { "Invalid VPN Gate MTU" }
+            val values = source.getJSONArray("dns_servers")
+            require(values.length() in 0..8) { "Invalid VPN Gate DNS" }
+            val dns =
+                List(values.length()) { index ->
+                    val text = values.getString(index)
+                    parseNumericAddress(text, ':' in text).also { address ->
+                        require(!address.isAnyLocalAddress && !address.isLoopbackAddress && !address.isMulticastAddress)
+                        require(if (address is Inet4Address) ipv4 != null else ipv6 != null)
+                    }
+                }
+            return VpnGateNetwork(ipv4, ipv6, dns, mtu)
+        }
+    }
+}
+
 private fun JSONObject.requiredString(
     name: String,
     maximumLength: Int,
@@ -170,6 +231,15 @@ private fun JSONArray.strings(): List<String> =
     List(length()) { index ->
         val value = getString(index).trim()
         require(value.isNotEmpty() && value.length <= 128) { "Invalid bypass CIDR" }
+        value
+    }
+
+private fun JSONArray.domainStrings(): List<String> =
+    List(length()) { index ->
+        val value = getString(index).trim()
+        val name = value.removeSuffix(".")
+        // Match core's pre-IDNA bound; core validates normalized ASCII names and labels.
+        require(name.isNotEmpty() && name.codePointCount(0, name.length) <= 253) { "Invalid bypass domain" }
         value
     }
 

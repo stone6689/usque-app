@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../core/app_strings.dart';
 import '../core/usque_theme.dart';
 import 'common.dart';
+import 'desktop_shortcuts.dart';
 
 /// A persistent action area outside the form's scrollable content.
 class SaveChangesBar extends StatelessWidget {
@@ -13,11 +15,18 @@ class SaveChangesBar extends StatelessWidget {
     required this.saving,
     required this.onSave,
     this.error,
+    this.validationError,
     this.saved = false,
     this.savedLabel,
     this.idleHint,
     this.statusLabel,
     this.onReconnect,
+    this.saveLabel,
+    this.summary,
+    this.activity,
+    this.saveButtonKey,
+    this.contentWidth = PageFrame.maxContentWidth,
+    this.matchPageGutter = false,
     super.key,
   });
 
@@ -29,13 +38,29 @@ class SaveChangesBar extends StatelessWidget {
   final String? idleHint;
   final String? statusLabel;
   final VoidCallback? onReconnect;
+
+  /// Contextual label for the primary action, such as an explicit reconnect.
+  final String? saveLabel;
+
+  /// What the pending edit will do, shown above the status line.
+  final Widget? summary;
+
+  /// Source-specific preparation progress or error details above the action.
+  final Widget? activity;
+  final Key? saveButtonKey;
+  final double contentWidth;
+  final bool matchPageGutter;
   final String? error;
+
+  /// Current form validation takes precedence over an earlier engine result.
+  final String? validationError;
   final VoidCallback? onSave;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final message =
+        validationError ??
         statusLabel ??
         error ??
         (saving
@@ -45,6 +70,20 @@ class SaveChangesBar extends StatelessWidget {
             : saved
             ? savedLabel ?? strings.get('changes_applied')
             : idleHint ?? strings.get('changes_apply_hint'));
+    final save = saving || (!dirty && error == null) ? null : onSave;
+    return PageShortcut(
+      activator: const SingleActivator(LogicalKeyboardKey.keyS, control: true),
+      onInvoke: save,
+      child: _buildBar(context, theme, message, save),
+    );
+  }
+
+  Widget _buildBar(
+    BuildContext context,
+    ThemeData theme,
+    String message,
+    VoidCallback? onSaveEnabled,
+  ) {
     return Material(
       color: theme.colorScheme.surface,
       child: DecoratedBox(
@@ -56,30 +95,45 @@ class SaveChangesBar extends StatelessWidget {
         child: SafeArea(
           top: false,
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            padding: EdgeInsets.symmetric(
+              horizontal: matchPageGutter
+                  ? MediaQuery.sizeOf(context).width < 600
+                        ? 16
+                        : 32
+                  : 20,
+              vertical: 12,
+            ),
             child: Center(
               heightFactor: 1,
               child: ConstrainedBox(
-                constraints: const BoxConstraints(
-                  maxWidth: PageFrame.maxContentWidth,
-                ),
+                constraints: BoxConstraints(maxWidth: contentWidth),
                 child: LayoutBuilder(
                   builder: (context, constraints) {
-                    final status = Semantics(
+                    final statusText = Semantics(
                       liveRegion: true,
                       child: Text(
                         message,
                         style: theme.textTheme.bodyMedium?.copyWith(
-                          color: error != null
+                          color: validationError != null || error != null
                               ? theme.colorScheme.error
                               : theme.colorScheme.onSurfaceVariant,
                         ),
                       ),
                     );
+                    final status = summary == null
+                        ? statusText
+                        : Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              summary!,
+                              const SizedBox(height: 6),
+                              statusText,
+                            ],
+                          );
                     final saveButton = FilledButton.icon(
-                      onPressed: saving || (!dirty && error == null)
-                          ? null
-                          : onSave,
+                      key: saveButtonKey,
+                      onPressed: onSaveEnabled,
                       icon: saving
                           ? const SizedBox.square(
                               dimension: 18,
@@ -87,7 +141,9 @@ class SaveChangesBar extends StatelessWidget {
                             )
                           : const Icon(LucideIcons.check, size: 18),
                       label: Text(
-                        strings.get(saving ? 'saving_changes' : 'save_changes'),
+                        saving
+                            ? strings.get('saving_changes')
+                            : saveLabel ?? strings.get('save_changes'),
                       ),
                     );
                     final save = onReconnect == null
@@ -107,20 +163,35 @@ class SaveChangesBar extends StatelessWidget {
                               saveButton,
                             ],
                           );
+                    Widget withActivity(Widget controls) => activity == null
+                        ? controls
+                        : Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              activity!,
+                              const SizedBox(height: 8),
+                              controls,
+                            ],
+                          );
                     if (constraints.maxWidth < 520 ||
                         MediaQuery.textScalerOf(context).scale(14) > 21) {
-                      return Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [status, const SizedBox(height: 8), save],
+                      return withActivity(
+                        Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [status, const SizedBox(height: 8), save],
+                        ),
                       );
                     }
-                    return Row(
-                      children: [
-                        Expanded(child: status),
-                        const SizedBox(width: 16),
-                        save,
-                      ],
+                    return withActivity(
+                      Row(
+                        children: [
+                          Expanded(child: status),
+                          const SizedBox(width: 16),
+                          save,
+                        ],
+                      ),
                     );
                   },
                 ),

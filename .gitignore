@@ -27,6 +27,8 @@ go.work.sum
 !.env.example
 
 # Usque specific
+/AGENTS.md
+/.claude/
 config*.json*
 /usque
 usque.exe
@@ -37,7 +39,7 @@ dist/.vscode/
 /target/
 /third_party/ts_netstack_smoltcp_core/target/
 /third_party/quiche-0.29.3/target/
-/.toolchains/
+/.toolchains
 /.wix/
 /dist/
 **/*.rs.bk
@@ -62,6 +64,9 @@ dist/.vscode/
 # IDE, OS and native-tool caches
 /.idea/
 /.vs/
+/.nvimlog
+*.swp
+*.swo
 **/.gradle/
 **/.kotlin/
 **/.cxx/
@@ -80,6 +85,7 @@ Thumbs.db
 **/*.pfx
 **/*.mobileprovision
 **/macos/Flutter/ephemeral/
+**/linux/flutter/ephemeral/
 **/windows/flutter/ephemeral/
 
 # Local diagnostics and coverage

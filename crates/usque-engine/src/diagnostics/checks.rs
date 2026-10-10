@@ -6,8 +6,9 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use usque_core::{
     ConnectionPhase, ConnectionSnapshot, DiagnosticCategory, DiagnosticCheckStatus,
-    DiagnosticFinding, DiagnosticMode, FailureSeverity, FrontendKind, FrontendPhase,
-    KillSwitchState, Transport, TransportFailure, TransportFailureCode, TransportStage,
+    DiagnosticFinding, DiagnosticMode, DiagnosticObservation, DiagnosticObservationAvailability,
+    DiagnosticObservationSource, FailureSeverity, FrontendKind, FrontendPhase, KillSwitchState,
+    Transport, TransportFailure, TransportFailureCode, TransportStage,
 };
 use usque_ipc::agent_v1::{AutomaticRecoveryPhase, PlatformState};
 use usque_transport::{ConnectionEventType, ConnectionTimelineSnapshot};
@@ -27,6 +28,89 @@ pub(crate) struct DiagnosticContext {
     pub direct_dns: usque_core::DirectDnsSettings,
     pub probes: Option<Arc<super::probes::DiagnosticProbeContext>>,
     pub captured_at: tokio::time::Instant,
+}
+
+impl DiagnosticContext {
+    pub(super) fn annotate(&self, mut finding: DiagnosticFinding) -> DiagnosticFinding {
+        use DiagnosticObservationAvailability as Availability;
+        use DiagnosticObservationSource as Source;
+        let source = match finding.check_id.as_str() {
+            "engine.configuration" | "dns.direct_encrypted_configuration" => Source::Config,
+            "engine.event_stream" => Source::Frontend,
+            "transport.h3_path_validation_probe" | "dns.direct_encrypted_reachability" => {
+                Source::ActiveProbe
+            }
+            "protection.kill_switch"
+            | "protection.dns_path"
+            | "protection.route_ownership"
+            | "protection.recovery_journal"
+            | "frontend.system_proxy_state"
+            | "tunnel.routes" => {
+                if self.platform_state.is_some() {
+                    Source::Platform
+                } else {
+                    Source::Runtime
+                }
+            }
+            _ => Source::Runtime,
+        };
+        let availability = if finding.summary_key == "nq_finding_stale" {
+            Availability::Stale
+        } else if finding.status == DiagnosticCheckStatus::Skipped {
+            if finding.dependency_reason.as_deref().is_some_and(|reason| {
+                matches!(reason, "not_applicable" | "not_configured" | "h3_active")
+            }) {
+                Availability::NotApplicable
+            } else {
+                Availability::Unavailable
+            }
+        } else if source == Source::Runtime
+            && !finding.check_id.starts_with("quality.")
+            && finding.failure.is_none()
+            && finding.check_id != "engine.control_channel"
+            && finding.check_id != "tunnel.first_packet"
+        {
+            Availability::Inferred
+        } else if finding.summary_key.ends_with("unknown")
+            || finding.summary_key.ends_with("lease_only")
+        {
+            Availability::Unavailable
+        } else {
+            Availability::Observed
+        };
+        finding.observation = Some(DiagnosticObservation {
+            source,
+            availability,
+            age_milliseconds: if finding.check_id.starts_with("quality.") {
+                self.quality
+                    .sampled_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64
+            } else {
+                self.captured_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64
+            },
+            connection_instance_id: if matches!(
+                source,
+                Source::Runtime | Source::Platform | Source::ActiveProbe
+            ) {
+                self.quality.connection_id.map(|id| id.0)
+            } else {
+                None
+            },
+            network_generation: None,
+        });
+        finding.evidence = finding
+            .sanitized_evidence
+            .iter()
+            .filter_map(|value| usque_core::DiagnosticEvidence::from_legacy(value))
+            .take(16)
+            .collect();
+        finding
+    }
 }
 
 #[async_trait]
@@ -117,6 +201,45 @@ impl PassiveCheck {
     fn evaluate(&self, context: &DiagnosticContext) -> DiagnosticFinding {
         use PassiveCheckKind as Kind;
 
+        if matches!(
+            self.kind,
+            Kind::H3Connect
+                | Kind::H3Datagram
+                | Kind::H2Tcp
+                | Kind::H2Tls
+                | Kind::H2Connect
+                | Kind::EndpointPin
+        ) && !matches!(
+            context.connection.phase,
+            ConnectionPhase::Connected | ConnectionPhase::Degraded
+        ) {
+            if let Some(failure) = &context.connection.failure {
+                let relevant = match self.kind {
+                    Kind::H3Connect => context.connection.transport == Some(Transport::Http3),
+                    Kind::H2Connect => context.connection.transport == Some(Transport::Http2),
+                    Kind::EndpointPin => failure.code == TransportFailureCode::EndpointPinMismatch,
+                    _ => false,
+                };
+                if relevant {
+                    let summary = match self.kind {
+                        Kind::EndpointPin => "diagnostic_endpoint_pin_mismatch",
+                        Kind::H2Connect => "diagnostic_h2_not_tested",
+                        _ => "diagnostic_h3_not_active",
+                    };
+                    let mut result = failed(self, failure.code, failure.stage, summary);
+                    result.failure = Some(failure.clone());
+                    return result;
+                }
+            }
+            let summary = match self.kind {
+                Kind::EndpointPin => "diagnostic_endpoint_pin_not_tested",
+                Kind::H2Tcp | Kind::H2Tls | Kind::H2Connect => "diagnostic_h2_not_tested",
+                Kind::H3Datagram => "diagnostic_h3_datagram_not_tested",
+                _ => "diagnostic_h3_not_tested",
+            };
+            return skipped(self, summary, "no_active_runtime");
+        }
+
         match self.kind {
             Kind::QualityRtt
             | Kind::QualityLoss
@@ -126,7 +249,11 @@ impl PassiveCheck {
             | Kind::EncryptedDnsConfiguration
             | Kind::EncryptedDnsRuntime => super::quality::evaluate(self, self.kind, context),
             Kind::ControlChannel => passed(self, "diagnostic_engine_control_ok", ["responsive"]),
-            Kind::EventStream => passed(self, "diagnostic_event_stream_ok", ["recoverable"]),
+            Kind::EventStream => skipped(
+                self,
+                "diagnostic_event_stream_unknown",
+                "frontend_observation_required",
+            ),
             Kind::Capabilities => passed(self, "diagnostic_capabilities_ok", ["append_only_api"]),
             Kind::Configuration if context.configuration_valid => {
                 passed(self, "diagnostic_configuration_ok", ["schema_valid"])
@@ -195,39 +322,23 @@ impl PassiveCheck {
                     )
                 }
             }
-            Kind::PhysicalNetwork if connected_or_reconnecting(&context.connection) => passed(
+            Kind::PhysicalNetwork if connected_or_reconnecting(&context.connection) => finding(
                 self,
-                "diagnostic_physical_network_present",
-                ["runtime_path"],
+                DiagnosticCheckStatus::Warning,
+                FailureSeverity::Warning,
+                None,
+                FindingContent {
+                    summary: "diagnostic_physical_network_present",
+                    remediation: "none",
+                    evidence: ["runtime_path"],
+                },
             ),
-            Kind::PhysicalNetwork => warning(
+            Kind::PhysicalNetwork => skipped(
                 self,
-                TransportFailureCode::PhysicalNetworkChanged,
-                TransportStage::EndpointResolution,
                 "diagnostic_physical_network_not_observed",
-                "connect_or_run_deep_diagnostics",
-            ),
-            Kind::Ipv4Route if context.connection.ipv4_available => {
-                passed(self, "diagnostic_ipv4_route_available", ["payload_family"])
-            }
-            Kind::Ipv4Route if connected_or_reconnecting(&context.connection) => warning(
-                self,
-                TransportFailureCode::PhysicalIpv4Unavailable,
-                TransportStage::EndpointResolution,
-                "diagnostic_ipv4_route_unavailable",
-                "check_physical_network",
+                "no_active_runtime",
             ),
             Kind::Ipv4Route => skipped(self, "diagnostic_ipv4_route_unknown", "no_active_runtime"),
-            Kind::Ipv6Route if context.connection.ipv6_available => {
-                passed(self, "diagnostic_ipv6_route_available", ["payload_family"])
-            }
-            Kind::Ipv6Route if connected_or_reconnecting(&context.connection) => warning(
-                self,
-                TransportFailureCode::PhysicalIpv6Unavailable,
-                TransportStage::EndpointResolution,
-                "diagnostic_ipv6_route_unavailable",
-                "check_physical_network",
-            ),
             Kind::Ipv6Route => skipped(self, "diagnostic_ipv6_route_unknown", "no_active_runtime"),
             Kind::PhysicalDns => {
                 if context.connection.failure.as_ref().is_some_and(|failure| {
@@ -244,16 +355,15 @@ impl PassiveCheck {
                         TransportStage::EndpointResolution,
                         "diagnostic_physical_dns_unavailable",
                     )
-                } else if connected_or_reconnecting(&context.connection) {
-                    passed(
-                        self,
-                        "diagnostic_physical_dns_available",
-                        ["runtime_started"],
-                    )
                 } else {
                     skipped(self, "diagnostic_physical_dns_unknown", "no_active_runtime")
                 }
             }
+            Kind::NetworkGeneration if context.quality.connection_id.is_none() => skipped(
+                self,
+                "diagnostic_network_generation_unknown",
+                "no_active_runtime",
+            ),
             Kind::NetworkGeneration => passed(
                 self,
                 "diagnostic_network_generation_observed",
@@ -390,11 +500,19 @@ impl PassiveCheck {
                 "diagnostic_address_assignment_unknown",
                 "no_active_tunnel",
             ),
-            Kind::TunnelRoutes if connected_or_reconnecting(&context.connection) => passed(
-                self,
-                "diagnostic_tunnel_routes_consistent",
-                ["family_flags"],
-            ),
+            Kind::TunnelRoutes
+                if context.platform_state.as_ref().is_some_and(|state| {
+                    state.active_tunnel_lease
+                        && state.actual_route_count_known
+                        && state.actual_route_count == state.expected_route_count
+                }) =>
+            {
+                passed(
+                    self,
+                    "diagnostic_tunnel_routes_consistent",
+                    ["agent_read_only_inspection"],
+                )
+            }
             Kind::TunnelRoutes => {
                 skipped(self, "diagnostic_tunnel_routes_unknown", "no_active_tunnel")
             }
@@ -443,17 +561,13 @@ impl PassiveCheck {
             Kind::FirstPacket => {
                 skipped(self, "diagnostic_first_packet_unknown", "no_active_tunnel")
             }
-            Kind::Ipv4Egress if context.connection.ipv4_available => warning(
+            Kind::Ipv4Egress if context.connection.ipv4_available => skipped(
                 self,
-                TransportFailureCode::PhysicalIpv4Unavailable,
-                TransportStage::PacketReceive,
                 "diagnostic_ipv4_egress_requires_external_observer",
                 "run_release_leak_gate",
             ),
-            Kind::Ipv6Egress if context.connection.ipv6_available => warning(
+            Kind::Ipv6Egress if context.connection.ipv6_available => skipped(
                 self,
-                TransportFailureCode::PhysicalIpv6Unavailable,
-                TransportStage::PacketReceive,
                 "diagnostic_ipv6_egress_requires_external_observer",
                 "run_release_leak_gate",
             ),
@@ -594,18 +708,52 @@ impl PassiveCheck {
                 }
                 finding
             }
-            Kind::RecoveryJournal if context.platform_state.is_some() => passed(
-                self,
-                "diagnostic_recovery_journal_consistent",
-                ["agent_read_only_inspection"],
-            ),
-            Kind::RecoveryJournal if context.operating_system == "windows" => warning(
-                self,
-                TransportFailureCode::AgentUnreachable,
-                TransportStage::PlatformRecovery,
-                "diagnostic_recovery_journal_agent_unavailable",
-                "inspect_platform_state",
-            ),
+            Kind::RecoveryJournal
+                if context.platform_state.as_ref().is_some_and(|state| {
+                    matches!(
+                        usque_ipc::agent_v1::AgentPhase::try_from(state.agent_phase),
+                        Ok(usque_ipc::agent_v1::AgentPhase::Clean
+                            | usque_ipc::agent_v1::AgentPhase::Active)
+                    ) && state
+                        .recovery_diagnostics
+                        .as_ref()
+                        .and_then(|diagnostics| diagnostics.current.as_ref())
+                        .is_none_or(|sample| {
+                            matches!(
+                                usque_ipc::agent_v1::RecoverySampleStatus::try_from(sample.status),
+                                Ok(usque_ipc::agent_v1::RecoverySampleStatus::Complete
+                                    | usque_ipc::agent_v1::RecoverySampleStatus::NoReceipt)
+                            )
+                        })
+                }) =>
+            {
+                let mut finding = passed(
+                    self,
+                    "diagnostic_recovery_journal_consistent",
+                    ["agent_read_only_inspection"],
+                );
+                finding
+                    .sanitized_evidence
+                    .extend(automatic_recovery_evidence(
+                        context.platform_state.as_ref().unwrap(),
+                    ));
+                finding
+            }
+            Kind::RecoveryJournal if context.operating_system == "windows" => {
+                let mut finding = warning(
+                    self,
+                    TransportFailureCode::AgentUnreachable,
+                    TransportStage::PlatformRecovery,
+                    "diagnostic_recovery_journal_agent_unavailable",
+                    "inspect_platform_state",
+                );
+                if let Some(state) = &context.platform_state {
+                    finding
+                        .sanitized_evidence
+                        .extend(automatic_recovery_evidence(state));
+                }
+                finding
+            }
             Kind::RecoveryJournal => skipped(
                 self,
                 "diagnostic_recovery_journal_not_supported",
@@ -616,27 +764,48 @@ impl PassiveCheck {
 }
 
 fn automatic_recovery_evidence(state: &PlatformState) -> Vec<String> {
+    let mut evidence = Vec::new();
+    if let Some(diagnostics) = &state.recovery_diagnostics {
+        if let Some(sample) = &diagnostics.current {
+            if let Ok(status) = usque_ipc::agent_v1::RecoverySampleStatus::try_from(sample.status) {
+                evidence.push(format!("recovery_sample_status={}", status as i32));
+            }
+            evidence.push(format!(
+                "recovery_sample_time_ms={}",
+                sample.sampled_at_unix_ms
+            ));
+            evidence.push(format!(
+                "recovery_sample_generation={}",
+                sample.journal_generation
+            ));
+        }
+        evidence.push(format!(
+            "recovery_history_count={}",
+            diagnostics.history.len().min(32)
+        ));
+    }
     let Some(status) = state.automatic_recovery.as_ref() else {
-        return Vec::new();
+        return evidence;
     };
     let Ok(phase) = AutomaticRecoveryPhase::try_from(status.phase) else {
-        return Vec::new();
+        return evidence;
     };
     if phase == AutomaticRecoveryPhase::Unspecified
         || status.attempt_limit == 0
         || status.attempt_limit > 16
         || status.attempts_completed > status.attempt_limit
     {
-        return Vec::new();
+        return evidence;
     }
-    vec![
+    evidence.extend([
         format!("automatic_recovery_phase={}", phase as i32),
         format!(
             "automatic_recovery_attempts_completed={}",
             status.attempts_completed
         ),
         format!("automatic_recovery_attempt_limit={}", status.attempt_limit),
-    ]
+    ]);
+    evidence
 }
 
 #[async_trait]
@@ -673,7 +842,7 @@ impl DiagnosticCheck for PassiveCheck {
         if cancellation.is_cancelled() {
             return cancelled(self);
         }
-        self.evaluate(context)
+        context.annotate(self.evaluate(context))
     }
 }
 
@@ -888,6 +1057,8 @@ fn finding<const N: usize>(
         started_at: Some(Utc::now()),
         duration_milliseconds: None,
         dependency_reason: None,
+        observation: None,
+        evidence: Vec::new(),
     }
 }
 
@@ -896,6 +1067,128 @@ mod tests {
     use usque_core::{FrontendStatus, Statistics};
 
     use super::*;
+
+    #[test]
+    fn platform_and_probe_findings_keep_the_actual_runtime_identity() {
+        let mut context = context_with_unknown_platform_state();
+        let id = uuid::Uuid::new_v4();
+        context.quality.connection_id = Some(usque_transport::ConnectionInstanceId(id));
+        context.platform_state = Some(Default::default());
+        for check_id in [
+            "protection.kill_switch",
+            "dns.direct_encrypted_reachability",
+        ] {
+            let finding = context.annotate(DiagnosticFinding::pending(
+                check_id,
+                DiagnosticCategory::Protection,
+            ));
+            assert_eq!(
+                finding.observation.unwrap().connection_instance_id,
+                Some(id)
+            );
+        }
+        let finding = context.annotate(DiagnosticFinding::pending(
+            "engine.configuration",
+            DiagnosticCategory::LocalComponent,
+        ));
+        assert_eq!(finding.observation.unwrap().connection_instance_id, None);
+    }
+
+    #[tokio::test]
+    async fn inferred_connectivity_never_passes_unobserved_dns_routes_or_event_delivery() {
+        let mut context = context_with_unknown_platform_state();
+        context.connection.ipv4_available = true;
+        context.connection.ipv6_available = true;
+        for kind in [
+            PassiveCheckKind::EventStream,
+            PassiveCheckKind::PhysicalDns,
+            PassiveCheckKind::Ipv4Route,
+            PassiveCheckKind::Ipv6Route,
+            PassiveCheckKind::TunnelRoutes,
+        ] {
+            let finding = check(kind).run(&context, CancellationToken::new()).await;
+            assert_eq!(finding.status, DiagnosticCheckStatus::Skipped);
+            assert!(finding.failure.is_none());
+            assert_eq!(
+                finding.observation.unwrap().availability,
+                DiagnosticObservationAvailability::Unavailable
+            );
+        }
+        for kind in [PassiveCheckKind::Ipv4Egress, PassiveCheckKind::Ipv6Egress] {
+            let finding = check(kind).run(&context, CancellationToken::new()).await;
+            assert_eq!(finding.status, DiagnosticCheckStatus::Skipped);
+            assert!(
+                finding.failure.is_none(),
+                "missing external observation is not an unavailable payload family"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_or_reconnecting_transport_never_claims_a_current_ready_path() {
+        let mut context = context_with_unknown_platform_state();
+        context.connection.transport = Some(Transport::Http3);
+        context.connection.failure = Some(TransportFailure::new(
+            TransportFailureCode::PacketReceiveFailed,
+            TransportStage::PacketReceive,
+        ));
+        for phase in [ConnectionPhase::Error, ConnectionPhase::Reconnecting] {
+            context.connection.phase = phase;
+            let finding = check(PassiveCheckKind::H3Connect)
+                .run(&context, CancellationToken::new())
+                .await;
+            assert_eq!(finding.status, DiagnosticCheckStatus::Failed);
+            assert_eq!(
+                finding.failure.unwrap().code,
+                TransportFailureCode::PacketReceiveFailed
+            );
+            assert_eq!(
+                check(PassiveCheckKind::H3Datagram)
+                    .run(&context, CancellationToken::new())
+                    .await
+                    .status,
+                DiagnosticCheckStatus::Skipped
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_ready_checks_keep_their_own_protocol_and_pin_explanations() {
+        let mut context = context_with_unknown_platform_state();
+        context.connection.phase = ConnectionPhase::Disconnected;
+        let h2 = check(PassiveCheckKind::H2Connect)
+            .run(&context, CancellationToken::new())
+            .await;
+        assert_eq!(h2.summary_key, "diagnostic_h2_not_tested");
+        context.connection.phase = ConnectionPhase::Reconnecting;
+        context.connection.transport = Some(Transport::Http2);
+        context.connection.failure = Some(TransportFailure::new(
+            TransportFailureCode::H2TcpConnectFailed,
+            TransportStage::SocketConnect,
+        ));
+        let h2 = check(PassiveCheckKind::H2Connect)
+            .run(&context, CancellationToken::new())
+            .await;
+        assert_eq!(h2.status, DiagnosticCheckStatus::Failed);
+        assert_eq!(h2.summary_key, "diagnostic_h2_not_tested");
+        assert_eq!(
+            h2.failure.unwrap().code,
+            TransportFailureCode::H2TcpConnectFailed
+        );
+        context.connection.phase = ConnectionPhase::Error;
+        context.connection.failure = Some(TransportFailure::new(
+            TransportFailureCode::EndpointPinMismatch,
+            TransportStage::TlsHandshake,
+        ));
+        let pin = check(PassiveCheckKind::EndpointPin)
+            .run(&context, CancellationToken::new())
+            .await;
+        assert_eq!(pin.summary_key, "diagnostic_endpoint_pin_mismatch");
+        assert_eq!(
+            pin.failure.unwrap().code,
+            TransportFailureCode::EndpointPinMismatch
+        );
+    }
 
     #[tokio::test]
     async fn l4_does_not_claim_connect_ip_negotiation_or_unverified_connect_success() {

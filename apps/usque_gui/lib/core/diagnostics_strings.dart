@@ -1,5 +1,6 @@
 import '../models/diagnostics_models.dart';
 import 'app_strings.dart';
+import 'diagnostics_contract_generated.dart';
 
 String diagnosticStatusLabel(AppStrings strings, DiagnosticCheckStatus status) {
   return strings.get(switch (status) {
@@ -28,20 +29,33 @@ String diagnosticCategoryLabel(
 }
 
 String diagnosticCheckLabel(AppStrings strings, String checkId) {
-  return _catalogOrHumanize(
+  if (!DiagnosticsContract.checkIds.contains(checkId)) {
+    return strings.get('diagnostics');
+  }
+  return _catalogOrFallback(
     strings,
     'diag_check_${checkId.replaceAll('.', '_')}',
-    checkId.split('.').last,
+    strings.get('diagnostics'),
   );
 }
 
 String diagnosticFailureTitle(AppStrings strings, String code) {
-  return _catalogOrHumanize(strings, 'diag_fail_$code', code);
+  if (!DiagnosticsContract.failureCodes.contains(code)) {
+    return strings.get('operation_failed');
+  }
+  return _catalogOrFallback(
+    strings,
+    'diag_fail_$code',
+    strings.get('operation_failed'),
+  );
 }
 
 String diagnosticRemediation(AppStrings strings, String key) {
   if (key == 'none' || key.isEmpty) {
     return strings.get('diag_fix_none');
+  }
+  if (!DiagnosticsContract.remediationKeys.contains(key)) {
+    return strings.get('diag_fix_default');
   }
   final catalogKey = 'diag_fix_$key';
   final value = strings.get(catalogKey);
@@ -52,7 +66,8 @@ String diagnosticRemediation(AppStrings strings, String key) {
 }
 
 String diagnosticFindingSummary(AppStrings strings, DiagnosticFinding finding) {
-  if (finding.summaryKey.startsWith('nq_finding_')) {
+  if (DiagnosticsContract.summaryKeys.contains(finding.summaryKey) &&
+      finding.summaryKey.startsWith('nq_finding_')) {
     final localized = strings.get(finding.summaryKey);
     if (localized != finding.summaryKey) return localized;
   }
@@ -65,6 +80,44 @@ String diagnosticFindingSummary(AppStrings strings, DiagnosticFinding finding) {
     DiagnosticCheckStatus.running => 'diag_finding_running',
     DiagnosticCheckStatus.pending => 'diag_finding_pending',
   });
+}
+
+String diagnosticObservationSourceLabel(
+  AppStrings strings,
+  DiagnosticObservationSource source,
+) => strings.get(switch (source) {
+  DiagnosticObservationSource.config => 'diag_source_config',
+  DiagnosticObservationSource.runtime => 'diag_source_runtime',
+  DiagnosticObservationSource.platform => 'diag_source_platform',
+  DiagnosticObservationSource.activeProbe => 'diag_source_active_probe',
+  DiagnosticObservationSource.frontend => 'diag_source_frontend',
+  DiagnosticObservationSource.unknown => 'diag_unknown',
+});
+
+String diagnosticObservationAvailabilityLabel(
+  AppStrings strings,
+  DiagnosticObservationAvailability availability,
+) => strings.get(switch (availability) {
+  DiagnosticObservationAvailability.observed => 'diag_availability_observed',
+  DiagnosticObservationAvailability.inferred => 'diag_availability_inferred',
+  DiagnosticObservationAvailability.unavailable =>
+    'diag_availability_unavailable',
+  DiagnosticObservationAvailability.stale => 'diag_availability_stale',
+  DiagnosticObservationAvailability.notApplicable =>
+    'diag_availability_not_applicable',
+  DiagnosticObservationAvailability.unknown => 'diag_unknown',
+});
+
+String diagnosticSkipReason(AppStrings strings, DiagnosticFinding finding) {
+  final key = switch (finding.dependencyReason) {
+    'no_active_tunnel' || 'no_transport_handshake' => 'diag_skip_disconnected',
+    'not_configured' => 'diag_skip_disabled',
+    'platform_capability_unavailable' => 'diag_skip_unsupported',
+    'no_application_traffic' => 'diag_skip_traffic',
+    'run_deep_diagnostics' => 'diag_skip_deep',
+    _ => 'diag_finding_skipped',
+  };
+  return strings.get(key);
 }
 
 String diagnosticSessionStateLabel(
@@ -116,40 +169,35 @@ String connectionEventLabel(
       'diag_event_recovery_probe_failed',
     ConnectionTimelineEventType.pathPromoted => 'diag_event_path_promoted',
     ConnectionTimelineEventType.queueSaturated => 'diag_event_queue_saturated',
+    ConnectionTimelineEventType.queueBackpressured =>
+      'diag_event_queue_backpressured',
     ConnectionTimelineEventType.disconnected => 'diag_event_disconnected',
     ConnectionTimelineEventType.failed => 'diag_event_failed',
     ConnectionTimelineEventType.migrationStarted =>
-      'diag_event_recovery_probe_started',
+      'diag_event_migration_started',
     ConnectionTimelineEventType.migrationPathValidated =>
-      'diag_event_recovery_probe_succeeded',
-    ConnectionTimelineEventType.migrationPromoted => 'diag_event_path_promoted',
+      'diag_event_migration_path_validated',
+    ConnectionTimelineEventType.migrationPromoted =>
+      'diag_event_migration_promoted',
     ConnectionTimelineEventType.migrationFailed =>
-      'diag_event_recovery_probe_failed',
-    ConnectionTimelineEventType.pmtuChanged => 'diag_event_path_promoted',
+      'diag_event_migration_failed',
+    ConnectionTimelineEventType.pmtuChanged => 'diag_event_pmtu_changed',
     ConnectionTimelineEventType.pmtuRevalidationStarted =>
-      'diag_event_recovery_probe_started',
+      'diag_event_pmtu_revalidation_started',
     ConnectionTimelineEventType.pmtuRevalidationFailed =>
-      'diag_event_recovery_probe_failed',
+      'diag_event_pmtu_revalidation_failed',
     ConnectionTimelineEventType.directDnsDegraded =>
-      'diag_event_network_changed',
+      'diag_event_direct_dns_degraded',
     ConnectionTimelineEventType.directDnsRecovered =>
-      'diag_event_recovery_probe_succeeded',
-    ConnectionTimelineEventType.unknown => 'diag_event_failed',
+      'diag_event_direct_dns_recovered',
+    ConnectionTimelineEventType.unknown => 'diag_event_unknown',
   });
 }
 
-String _catalogOrHumanize(AppStrings strings, String key, String fallback) {
+String _catalogOrFallback(AppStrings strings, String key, String fallback) {
   final value = strings.get(key);
   if (value == key) {
-    return _humanize(fallback);
+    return fallback;
   }
   return value;
-}
-
-String _humanize(String value) {
-  final words = value.replaceAll(RegExp(r'[_\-.]+'), ' ').trim().toLowerCase();
-  if (words.isEmpty) {
-    return value;
-  }
-  return '${words[0].toUpperCase()}${words.substring(1)}';
 }

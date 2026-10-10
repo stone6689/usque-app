@@ -21,9 +21,16 @@ use crate::socks5::Socks5Frontend;
 use crate::tcp::{ProxyServices, TcpDialer};
 use crate::telemetry::ConnectionTelemetry;
 
-/// One account-bound, TCP-only runtime shared by TUN and local proxy listeners.
+#[cfg(test)]
+#[path = "runtime/direct_dns_tests.rs"]
+mod direct_dns_tests;
+
+#[cfg(test)]
+mod proxy_quality_tests;
+
+/// Account-bound stream frontends, shared by L4 and final HTTP/SOCKS5 exits.
 pub(crate) struct L4Runtime {
-    pub(crate) client: Arc<L4Client>,
+    pub(crate) client: Arc<crate::stream_client::StreamClient>,
     pub(crate) monitor: ManagedTunnelMonitor,
     pub(crate) bridge: Option<TunBridge>,
     pub(crate) assigned_ipv4: Ipv4Addr,
@@ -34,12 +41,34 @@ pub(crate) struct L4Runtime {
     http_spec: Option<FrontendSpec>,
     listeners: Vec<SocketAddr>,
     dns: Arc<StreamDns>,
+    warp_dns_servers: Vec<IpAddr>,
     services: ProxyServices,
     cancellation: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl L4Runtime {
+    pub(crate) fn update_traffic_policy(&self, disable_quic: bool) {
+        self.services
+            .traffic_policy
+            .set_disable_quic(disable_quic || self.client.proxy.is_some());
+    }
+    pub(crate) fn internal_network(&self) -> crate::InternalNetwork {
+        crate::InternalNetwork::for_streams(
+            self.client.clone(),
+            self.client.health.clone(),
+            self.cancellation.clone(),
+        )
+        .with_resolver(
+            Resolver::for_streams(
+                self.dns.clone(),
+                self.warp_dns_servers.clone(),
+                ProxyDnsMode::Remote,
+                self.services.protector.clone(),
+            )
+            .with_warp_dns(self.services.resolver.final_doh()),
+        )
+    }
     pub(crate) async fn start(
         profile: &Profile,
         identity: MasqueTlsIdentity,
@@ -59,20 +88,11 @@ impl L4Runtime {
             return Err(TransportError::InvalidIdentity);
         }
         crate::encrypted_dns::validate_direct_dns_support(&profile.direct_dns)?;
+        crate::encrypted_dns::validate_warp_dns_support(profile)?;
         profile
             .proxy
             .listener_credentials()
             .map_err(|_| TransportError::InvalidIdentity)?;
-        let socks_bound = profile
-            .frontends
-            .socks5
-            .then(|| Socks5Frontend::prebind(profile))
-            .transpose()?;
-        let http_bound = profile
-            .frontends
-            .http
-            .then(|| HttpProxyFrontend::prebind(profile))
-            .transpose()?;
         let cancellation = CancellationToken::new();
         let startup_guard = cancellation.clone().drop_guard();
         let telemetry = ConnectionTelemetry::default();
@@ -85,7 +105,7 @@ impl L4Runtime {
             &cancellation,
         )?;
         if profile.frontends.tunnel
-            && geo_policy.is_enabled()
+            && geo_policy.needs_direct_dns()
             && protector.direct_dns_resolver().is_none()
             && protector.physical_dns_servers().is_empty()
         {
@@ -107,12 +127,62 @@ impl L4Runtime {
         )
         .await
         .map_err(super::transport_error)?;
-        let (quality_rx, sampler) =
-            crate::network_quality::spawn_network_quality_sampler_with_counters(
+        let client = crate::stream_client::StreamClient::l4(client);
+        let runtime = Self::finish(
+            profile,
+            client,
+            (ipv4, ipv6),
+            protector,
+            geo_policy,
+            cancellation,
+            telemetry,
+            None,
+            counters,
+        )
+        .await?;
+        startup_guard.disarm();
+        Ok(runtime)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared frontend construction retains exact runtime ownership"
+    )]
+    async fn finish(
+        profile: &Profile,
+        client: Arc<crate::stream_client::StreamClient>,
+        (ipv4, ipv6): (Ipv4Addr, Ipv6Addr),
+        protector: Arc<dyn SocketProtector>,
+        geo_policy: Arc<GeoDirectPolicy>,
+        cancellation: CancellationToken,
+        telemetry: ConnectionTelemetry,
+        underlay_quality: Option<crate::NetworkQualityTelemetry>,
+        counters: Arc<TrafficCounters>,
+    ) -> Result<Self, TransportError> {
+        let quality = telemetry.network_quality();
+        let socks_bound = profile
+            .frontends
+            .socks5
+            .then(|| Socks5Frontend::prebind(profile))
+            .transpose()?;
+        let http_bound = profile
+            .frontends
+            .http
+            .then(|| HttpProxyFrontend::prebind(profile))
+            .transpose()?;
+        let (quality_rx, sampler) = match underlay_quality {
+            Some(underlay) => crate::network_quality::spawn_external_packet_quality_sampler(
+                quality.clone(),
+                underlay,
+                counters.clone(),
+                cancellation.child_token(),
+            ),
+            None => crate::network_quality::spawn_network_quality_sampler_with_counters(
                 quality.clone(),
                 counters.clone(),
                 cancellation.child_token(),
-            );
+            ),
+        };
         let sampler = tokio_util::task::AbortOnDropHandle::new(sampler);
         let dialer: Arc<dyn TcpDialer> = client.clone();
         let dns = Arc::new(StreamDns::new(
@@ -134,25 +204,99 @@ impl L4Runtime {
                 }
             }
         }));
-        let servers = dns_servers(profile);
+        let servers = client
+            .proxy
+            .as_ref()
+            .filter(|proxy| !proxy.config.dns_servers.is_empty())
+            .map(|proxy| proxy.config.dns_servers.clone())
+            .unwrap_or_else(|| dns_servers(profile));
+        let mut doh = client
+            .proxy
+            .as_ref()
+            .filter(|proxy| proxy.config.uses_doh(profile))
+            .map(|_| {
+                crate::encrypted_dns::FinalDohResolver::new(
+                    dialer.clone(),
+                    protector.clone(),
+                    quality.clone(),
+                    &cancellation,
+                    client.budget.clone(),
+                )
+            })
+            .transpose()
+            .map_err(|error| TransportError::Dns(error.to_string()))?;
+        if client.proxy.is_none() && profile.uses_encrypted_warp_dns() {
+            doh = Some(
+                crate::encrypted_dns::FinalDohResolver::for_warp(
+                    &profile.warp_dns,
+                    Resolver::for_streams(
+                        dns.clone(),
+                        profile.dns_servers.clone(),
+                        ProxyDnsMode::Remote,
+                        protector.clone(),
+                    ),
+                    dialer.clone(),
+                    protector.clone(),
+                    quality.clone(),
+                    &cancellation,
+                    client.budget.clone(),
+                )
+                .map_err(|error| TransportError::Dns(error.to_string()))?,
+            );
+        }
+        if let Some(proxy) = &client.proxy {
+            proxy.status.send_modify(|status| {
+                status.final_dns_transport = Some(if doh.is_some() { "doh" } else { "tcp" }.into())
+            });
+            tracing::info!(
+                dns_transport = if doh.is_some() { "doh" } else { "tcp" },
+                "Final proxy DNS configured"
+            );
+        }
+        let resolver = Resolver::for_streams(
+            dns.clone(),
+            servers,
+            profile.proxy.dns_mode,
+            protector.clone(),
+        );
+        let resolver = if client.proxy.is_some() {
+            resolver.with_doh(doh)
+        } else {
+            resolver.with_warp_dns(doh)
+        };
         let services = ProxyServices {
+            traffic_policy: Arc::new(crate::application_traffic::ApplicationTrafficPolicy::new(
+                profile.disable_quic || client.proxy.is_some(),
+            )),
             admission: Some(Arc::new(crate::tcp::FrontendAdmission::new(
                 client.budget.clone(),
                 super::Limits::platform().active + super::Limits::platform().pending,
             ))),
             dialer,
-            udp: None,
-            resolver: Resolver::for_streams(
-                dns.clone(),
-                servers,
-                profile.proxy.dns_mode,
-                protector.clone(),
-            ),
+            udp: client
+                .proxy
+                .as_ref()
+                .filter(|p| {
+                    p.network.supports_udp()
+                        && p.config.protocol == usque_core::chain_exit::ChainProtocol::Socks5
+                })
+                .map(|p| {
+                    Arc::new(crate::proxy_udp::SocksFactory(p.clone()))
+                        as Arc<dyn crate::proxy_udp::UdpFactory>
+                })
+                .or_else(|| {
+                    (client.proxy.is_some()
+                        && profile.data_plane != usque_core::DataPlaneMode::L4Proxy
+                        && geo_policy.has_direct_routes())
+                    .then(|| {
+                        Arc::new(crate::proxy_udp::DirectOnly)
+                            as Arc<dyn crate::proxy_udp::UdpFactory>
+                    })
+                }),
+            resolver,
             protector,
             geo_policy,
             counters: counters.clone(),
-            ipv4,
-            ipv6,
             cancellation: cancellation.clone(),
             health: client.health.clone(),
         };
@@ -201,12 +345,104 @@ impl L4Runtime {
             http_spec,
             listeners: Vec::new(),
             dns,
+            warp_dns_servers: profile.dns_servers.clone(),
             services,
             cancellation,
             tasks: vec![sampler.detach(), pool_maintenance.detach()],
         };
         runtime.refresh_listeners();
-        startup_guard.disarm();
+        Ok(runtime)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "final proxy startup carries its underlay, credentials and admission deadline"
+    )]
+    pub(crate) async fn start_proxy(
+        profile: &Profile,
+        prepared: &usque_core::vpngate::PreparedProfile,
+        network: crate::InternalNetwork,
+        underlay_quality: crate::NetworkQualityTelemetry,
+        assigned: (Ipv4Addr, Ipv6Addr),
+        protector: Arc<dyn SocketProtector>,
+        geo_policy: Arc<GeoDirectPolicy>,
+        status: Option<tokio::sync::watch::Sender<usque_core::vpngate::GateStatus>>,
+        startup_cancel: &CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, TransportError> {
+        crate::encrypted_dns::validate_direct_dns_support(&profile.direct_dns)?;
+        let cancellation = CancellationToken::new();
+        let guard = cancellation.clone().drop_guard();
+        let telemetry = ConnectionTelemetry::with_features(
+            crate::telemetry::CONNECTION_TIMELINE_CAPACITY,
+            underlay_quality.features(),
+        );
+        let quality = telemetry.network_quality();
+        quality.use_stream_data_plane();
+        let protector = crate::encrypted_dns::configure_direct_dns(
+            &profile.direct_dns,
+            protector,
+            quality.clone(),
+            &cancellation,
+        )?;
+        let counters = Arc::new(TrafficCounters::default());
+        let metrics = Arc::new(super::L4Metrics::default());
+        let budget = Arc::new(super::BufferBudget::new(
+            super::Limits::platform().buffers,
+            metrics.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        let proxy = tokio::select! {
+            _ = startup_cancel.cancelled() => return Err(TransportError::TunnelClosed),
+            result = crate::proxy_exit::ProxyDialer::start(prepared, network.clone(), status, cancellation.clone(), budget.clone(), counters.clone(), deadline) => result.map_err(|e| TransportError::VpnGate(match e {
+                crate::tcp::DialError::Rejected(407) => usque_core::vpngate::GateFailure::Authentication,
+                crate::tcp::DialError::Protocol => usque_core::vpngate::GateFailure::Protocol,
+                crate::tcp::DialError::InvalidTarget => usque_core::vpngate::GateFailure::Configuration,
+                _ => usque_core::vpngate::GateFailure::Transport,
+            }))?,
+        };
+        let client = Arc::new(crate::stream_client::StreamClient {
+            l4: None,
+            proxy: Some(proxy.clone()),
+            budget,
+            metrics,
+            health: network.health(),
+        });
+        // The final exit owns its identity and traffic. Transport observations
+        // remain attached to the selected WARP attempt, including H2/L4 limits.
+        let path = network.health_snapshot().path();
+        quality.begin_connection(path.transport, path.endpoint_family);
+        let mut runtime = Self::finish(
+            profile,
+            client,
+            assigned,
+            protector,
+            geo_policy,
+            cancellation,
+            telemetry,
+            Some(underlay_quality),
+            counters,
+        )
+        .await?;
+        let mut health = network.health();
+        let generation = network.session_generation();
+        runtime.tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = proxy.cancellation.cancelled() => break,
+                    changed = health.changed() => if changed.is_err() { break; },
+                    _ = tick.tick() => {},
+                }
+                if !matches!(*health.borrow(), RuntimeHealth::Connected { .. })
+                    || generation != network.session_generation()
+                {
+                    proxy.fail(usque_core::vpngate::GateFailure::Transport);
+                    break;
+                }
+            }
+        }));
+        guard.disarm();
         Ok(runtime)
     }
 
@@ -214,10 +450,24 @@ impl L4Runtime {
         let mut services = self.services.clone();
         services.resolver = Resolver::for_streams(
             self.dns.clone(),
-            dns_servers(profile),
+            self.client
+                .proxy
+                .as_ref()
+                .filter(|proxy| !proxy.config.dns_servers.is_empty())
+                .map(|proxy| proxy.config.dns_servers.clone())
+                .unwrap_or_else(|| dns_servers(profile)),
             profile.proxy.dns_mode,
             services.protector.clone(),
         );
+        services.resolver = if self.client.proxy.is_some() {
+            services
+                .resolver
+                .with_doh(self.services.resolver.final_doh())
+        } else {
+            services
+                .resolver
+                .with_warp_dns(self.services.resolver.final_doh())
+        };
         services
     }
 
@@ -408,6 +658,48 @@ impl L4Runtime {
         }
         self.cancellation.cancel();
         self.client.cancel();
+    }
+    pub(crate) fn quiesce_frontends(&mut self) {
+        if let Some(frontend) = self.socks5.as_mut() {
+            frontend.cancel_immediately();
+        }
+        if let Some(frontend) = self.http.as_mut() {
+            frontend.cancel_immediately();
+        }
+        if let Some(bridge) = &self.bridge {
+            bridge.cancel();
+        }
+        self.listeners.clear();
+    }
+    pub(crate) async fn suspend_frontends(&mut self) {
+        self.quiesce_frontends();
+        if let Some(mut frontend) = self.socks5.take() {
+            frontend.shutdown().await;
+        }
+        if let Some(mut frontend) = self.http.take() {
+            frontend.shutdown().await;
+        }
+        if let Some(mut bridge) = self.bridge.take() {
+            bridge.shutdown().await;
+        }
+        self.socks5_spec = None;
+        self.http_spec = None;
+    }
+    pub(crate) async fn prepare_tun(&mut self, profile: &Profile) -> Result<(), TransportError> {
+        if profile.frontends.tunnel && self.bridge.is_none() {
+            self.bridge = Some(
+                TunBridge::start(
+                    profile,
+                    self.services_for(profile),
+                    self.dns.clone(),
+                    self.client.budget.clone(),
+                    self.client.metrics.clone(),
+                    self.monitor.network_quality_telemetry(),
+                )
+                .await?,
+            );
+        }
+        Ok(())
     }
     pub(crate) async fn shutdown(&mut self) {
         self.cancel_immediately();

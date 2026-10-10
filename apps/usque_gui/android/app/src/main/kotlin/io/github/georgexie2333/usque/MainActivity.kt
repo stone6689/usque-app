@@ -66,8 +66,80 @@ class MainActivity : FlutterFragmentActivity() {
     private val profileConfigPath by lazy {
         File(noBackupFilesDir, "usque_config/profiles-v2.json").absolutePath
     }
-    private val pendingVpnConnection = VpnPermissionRequestQueue()
+    private val initialIdentityStateExecutor = Executors.newSingleThreadExecutor()
+    private val permissionCoordinator: OnboardingPermissionCoordinator =
+        OnboardingPermissionCoordinator(
+            object : OnboardingPermissionCoordinator.Host {
+                override fun vpnGranted(): Boolean = VpnService.prepare(this@MainActivity) == null
+
+                override fun notificationState(): String {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return "notRequired"
+                    if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) ==
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        return "granted"
+                    }
+                    return if (getSharedPreferences("usque_ui_permissions", MODE_PRIVATE)
+                            .getBoolean("notification_requested", false)
+                    ) {
+                        "notGranted"
+                    } else {
+                        "notRequested"
+                    }
+                }
+
+                override fun launchVpn() {
+                    val permissionIntent = VpnService.prepare(this@MainActivity)
+                    if (permissionIntent == null) {
+                        permissionCoordinator.finishVpn(true)
+                    } else {
+                        vpnPermissionLauncher.launch(permissionIntent)
+                    }
+                }
+
+                override fun launchNotification() {
+                    val preferences = getSharedPreferences("usque_ui_permissions", MODE_PRIVATE)
+                    preferences.edit { putBoolean("notification_requested", true) }
+                    try {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    } catch (error: Exception) {
+                        preferences.edit { putBoolean("notification_requested", false) }
+                        throw error
+                    }
+                }
+            },
+        )
     private var pendingDiagnosticsResult: MethodChannel.Result? = null
+    private var pendingChainFileResult: MethodChannel.Result? = null
+    private val chainFilePicker =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            val result = pendingChainFileResult
+            if (result != null) {
+                if (uris.size > ChainConfigurationFiles.MAX_FILES) {
+                    pendingChainFileResult = null
+                    result.error("CHAIN_FILE_COUNT_LIMIT", "Select at most 128 files.", null)
+                } else {
+                    try {
+                        identityExecutor.execute {
+                            val files = uris.map { ChainConfigurationFiles.read(contentResolver, it) }
+                            runOnUiThread {
+                                try {
+                                    if (!isDestroyed && pendingChainFileResult === result) {
+                                        pendingChainFileResult = null
+                                        result.success(files)
+                                    }
+                                } finally {
+                                    ChainConfigurationFiles.clear(files)
+                                }
+                            }
+                        }
+                    } catch (_: RejectedExecutionException) {
+                        pendingChainFileResult = null
+                        result.error("CHAIN_FILE_READ_FAILED", "Unable to read configuration files.", null)
+                    }
+                }
+            }
+        }
     private var pendingDiagnosticsPayload: AndroidEngineMethodHandler.DiagnosticExportPayload? = null
     private var pendingWarpSecretResult: MethodChannel.Result? = null
     private var pendingWarpSecretProfileId: String? = null
@@ -85,7 +157,7 @@ class MainActivity : FlutterFragmentActivity() {
 
     private val vpnPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { activityResult ->
-            finishVpnPermissionRequest(activityResult.resultCode == Activity.RESULT_OK)
+            permissionCoordinator.finishVpn(activityResult.resultCode == Activity.RESULT_OK)
         }
 
     private val warpSecretDestinationLauncher =
@@ -95,7 +167,7 @@ class MainActivity : FlutterFragmentActivity() {
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-            // Notification permission never gates VPN or proxy connectivity.
+            permissionCoordinator.finishNotification()
         }
 
     private val updatePermissionLauncher =
@@ -109,7 +181,19 @@ class MainActivity : FlutterFragmentActivity() {
                 code: String,
                 message: String,
             ) {
-                pendingVpnConnection.cancel(code, message)
+                permissionCoordinator.cancelConnection(code, message)
+            }
+
+            override fun getOnboardingPermissions(result: MethodChannel.Result) {
+                try {
+                    result.success(permissionCoordinator.status())
+                } catch (_: Exception) {
+                    result.error("VPN_PERMISSION_LAUNCH_FAILED", "Android could not verify permissions.", null)
+                }
+            }
+
+            override fun prepareOnboardingPermissions(result: MethodChannel.Result) {
+                permissionCoordinator.prepare(result)
             }
 
             override fun connectAfterValidation(
@@ -160,11 +244,7 @@ class MainActivity : FlutterFragmentActivity() {
             }
 
             override fun platformPreferences(): Map<String, Any?> {
-                val preferences =
-                    createDeviceProtectedStorageContext().getSharedPreferences(
-                        UsqueVpnService.RECOVERY_PREFERENCES,
-                        MODE_PRIVATE,
-                    )
+                val preferences = AndroidPolicyStore.startup(this@MainActivity)
                 return mapOf(
                     "start_on_boot" to
                         preferences.getBoolean(UsqueVpnService.START_ON_BOOT, false),
@@ -173,8 +253,8 @@ class MainActivity : FlutterFragmentActivity() {
             }
 
             override fun setStartOnBoot(enabled: Boolean) {
-                createDeviceProtectedStorageContext()
-                    .getSharedPreferences(UsqueVpnService.RECOVERY_PREFERENCES, MODE_PRIVATE)
+                AndroidPolicyStore
+                    .startup(this@MainActivity)
                     .edit { putBoolean(UsqueVpnService.START_ON_BOOT, enabled) }
             }
 
@@ -201,7 +281,7 @@ class MainActivity : FlutterFragmentActivity() {
                     .save(
                         this@MainActivity,
                         PerAppProxySettings(enabled = enabled, packageNames = packageNames),
-                    ).toMap()
+                    ).toMap() + mapOf("revision" to PerAppProxyStore.preferences(this@MainActivity).revision())
 
             override fun getUpdateCacheDirectory(): String {
                 updateInstaller.prepareCache()
@@ -244,6 +324,7 @@ class MainActivity : FlutterFragmentActivity() {
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        permissionCoordinator.restoreOutstandingDialog(savedInstanceState?.getString("usque_permission_dialog"))
         // FlutterFragmentActivity may invoke configureFlutterEngine during
         // super.onCreate; wire control + method handlers first.
         ensureEngineComponents()
@@ -253,6 +334,11 @@ class MainActivity : FlutterFragmentActivity() {
         AndroidMaintenance.cleanupLegacyUpdateState(this)
         updateInstaller.prepareCache(recoverAbandonedOperation = true)
         handleIncomingIntent(intent)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("usque_permission_dialog", permissionCoordinator.outstandingDialog())
+        super.onSaveInstanceState(outState)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -335,6 +421,7 @@ class MainActivity : FlutterFragmentActivity() {
                 identityStore = AndroidEngineMethodHandler.SecureIdentityStoreAdapter(identityStore),
                 identityExecutor = identityExecutor,
                 diagnosticsExecutor = diagnosticsExecutor,
+                initialIdentityStateExecutor = initialIdentityStateExecutor,
                 mainScheduler = VpnControlClient.HandlerMainScheduler(android.os.Handler(mainLooper)),
                 controlClient = controlClient,
                 activityCommands = activityCommands,
@@ -351,7 +438,19 @@ class MainActivity : FlutterFragmentActivity() {
         ensureEngineComponents()
         engineMethodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
         engineMethodChannel?.setMethodCallHandler { call, result ->
-            if (call.method == "updatePlatformLocale") {
+            if (call.method == "readChainConfigurations") {
+                if (pendingChainFileResult != null) {
+                    result.error("CHAIN_FILE_BUSY", "A file picker is already open.", null)
+                } else {
+                    pendingChainFileResult = result
+                    try {
+                        chainFilePicker.launch(arrayOf("*/*"))
+                    } catch (_: Exception) {
+                        pendingChainFileResult = null
+                        result.error("CHAIN_FILE_UNAVAILABLE", "Paste the configuration text instead.", null)
+                    }
+                }
+            } else if (call.method == "updatePlatformLocale") {
                 updatePlatformLocale(call.argument<String>("catalog_id"), result)
             } else {
                 methodHandler.handle(call, result)
@@ -407,13 +506,20 @@ class MainActivity : FlutterFragmentActivity() {
         super.onStart()
         ensureEngineComponents()
         controlClient.bind()
+        controlClient.setUiVisible(true)
+    }
+
+    override fun onStop() {
+        if (::controlClient.isInitialized) {
+            controlClient.setUiVisible(false)
+        }
+        super.onStop()
     }
 
     override fun onDestroy() {
-        pendingVpnConnection.cancel(
-            "VPN_PERMISSION_CANCELLED",
-            "The Android UI closed before VPN permission was granted.",
-        )
+        pendingChainFileResult?.success(null)
+        pendingChainFileResult = null
+        permissionCoordinator.destroy()
         pendingDiagnosticsResult?.error(
             "DIAGNOSTICS_CANCELLED",
             "The Android UI closed before the diagnostic bundle was saved.",
@@ -438,6 +544,7 @@ class MainActivity : FlutterFragmentActivity() {
         updateInstallExecutor.shutdownNow()
         diagnosticsExecutor.shutdownNow()
         identityExecutor.shutdownNow()
+        initialIdentityStateExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -706,7 +813,7 @@ class MainActivity : FlutterFragmentActivity() {
         val payload = pendingDiagnosticsPayload
         pendingDiagnosticsResult = null
         pendingDiagnosticsPayload = null
-        if (payload == null) {
+        if (payload == null || !methodHandler.matchesExportCapture(payload)) {
             result.error(
                 "DIAGNOSTICS_SESSION_MISMATCH",
                 "The diagnostic data selected for export is no longer available.",
@@ -730,16 +837,18 @@ class MainActivity : FlutterFragmentActivity() {
         val mainHandler = android.os.Handler(mainLooper)
         identityExecutor.execute {
             try {
+                check(methodHandler.matchesExportCapture(payload)) { "The diagnostic capture was invalidated." }
                 AndroidMaintenance.writeDiagnostics(
                     this,
                     destination,
                     payload.snapshot,
                     payload.diagnosticSession,
                     payload.connectionTimeline,
+                    payload.logSnapshot,
                 )
-                mainHandler.post { result.success(destination.toString()) }
+                runOnUiThread { result.success(destination.toString()) }
             } catch (error: Exception) {
-                mainHandler.post {
+                runOnUiThread {
                     result.error(
                         "DIAGNOSTICS_EXPORT_FAILED",
                         "Android could not write the diagnostic bundle.",
@@ -835,9 +944,9 @@ class MainActivity : FlutterFragmentActivity() {
                     output.write(secret)
                     output.flush()
                 }
-                mainHandler.post { result.success(destination.toString()) }
+                runOnUiThread { result.success(destination.toString()) }
             } catch (error: Exception) {
-                mainHandler.post {
+                runOnUiThread {
                     result.error(
                         "SENSITIVE_OUTPUT_FAILED",
                         "Android could not save the WARP Secret.",
@@ -855,89 +964,9 @@ class MainActivity : FlutterFragmentActivity() {
         mode: String,
         result: MethodChannel.Result,
     ) {
-        maybeRequestNotificationPermission()
-        if (pendingVpnConnection.hasPending) {
-            result.error(
-                "VPN_PERMISSION_IN_PROGRESS",
-                "Another VPN permission request is already in progress.",
-                null,
-            )
-            return
+        permissionCoordinator.connect(result, mode == "vpn") {
+            startNetworkService(profileJson, mode, result)
         }
-        if (mode == "vpn") {
-            val permissionIntent =
-                try {
-                    VpnService.prepare(this)
-                } catch (error: Exception) {
-                    result.error(
-                        "VPN_PERMISSION_LAUNCH_FAILED",
-                        "Android could not prepare the VPN permission request.",
-                        error.javaClass.simpleName,
-                    )
-                    return
-                }
-            if (permissionIntent != null) {
-                check(pendingVpnConnection.offer(profileJson, result))
-                try {
-                    vpnPermissionLauncher.launch(permissionIntent)
-                } catch (error: Exception) {
-                    val pending = pendingVpnConnection.take()
-                    pending?.result?.error(
-                        "VPN_PERMISSION_LAUNCH_FAILED",
-                        "Android could not open the VPN permission dialog.",
-                        error.javaClass.simpleName,
-                    )
-                }
-                return
-            }
-        }
-        startNetworkService(profileJson, mode, result)
-    }
-
-    private fun maybeRequestNotificationPermission() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
-        if (
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            return
-        }
-        val preferences = getSharedPreferences("usque_ui_permissions", MODE_PRIVATE)
-        if (preferences.getBoolean("notification_requested", false)) return
-        preferences.edit { putBoolean("notification_requested", true) }
-        runCatching { notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) }
-    }
-
-    private fun finishVpnPermissionRequest(granted: Boolean) {
-        val pending = pendingVpnConnection.take() ?: return
-        if (!granted) {
-            pending.result.error(
-                "VPN_PERMISSION_DENIED",
-                "VPN permission was not granted.",
-                null,
-            )
-            return
-        }
-        val permissionStillRequired =
-            try {
-                VpnService.prepare(this) != null
-            } catch (error: Exception) {
-                pending.result.error(
-                    "VPN_PERMISSION_LAUNCH_FAILED",
-                    "Android could not verify VPN permission.",
-                    error.javaClass.simpleName,
-                )
-                return
-            }
-        if (permissionStillRequired) {
-            pending.result.error(
-                "VPN_PERMISSION_DENIED",
-                "Android did not grant VPN permission.",
-                null,
-            )
-            return
-        }
-        startNetworkService(pending.profileJson, "vpn", pending.result)
     }
 
     private fun startNetworkService(

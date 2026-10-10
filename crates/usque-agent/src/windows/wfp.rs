@@ -51,6 +51,12 @@ use windows_sys::{
 
 use crate::{journal::MutationReceipt, plan::ValidatedTunnelPlan};
 
+mod replacement;
+pub use replacement::{
+    acquire_replacement_control_permit, apply_replacement_guard, plan_replacement_guard,
+    replacement_guard_present, restore_replacement_guard,
+};
+
 const PROVIDER_NAME: &str = "Usque Kill Switch";
 const PROVIDER_DESCRIPTION: &str =
     "Persistent fail-closed policy for the active Usque VPN operation";
@@ -62,9 +68,43 @@ const MAX_FILTERS: usize = 256;
 // remove Usque's persistent WFP policy even when the recovery journal is
 // missing or corrupt. Legacy random-key receipts remain recoverable through
 // `restore_kill_switch`.
-const PROVIDER_KEY: Uuid = Uuid::from_u128(0x6d70fda5_3fa2_4c36_a86c_88650b58f013);
-const SUBLAYER_KEY: Uuid = Uuid::from_u128(0xc93b7042_7b1e_4ab5_96ba_96b4539b67ec);
+const PROVIDER_KEY: Uuid = crate::journal::WFP_PROVIDER_KEY;
+const SUBLAYER_KEY: Uuid = crate::journal::WFP_SUBLAYER_KEY;
 const FILTER_KEY_BASE: u128 = 0x39ce51c7_ba9d_42f4_ae00_000000000000;
+
+pub fn plan_metadata() -> MutationReceipt {
+    MutationReceipt::WfpMetadata {
+        provider_key: PROVIDER_KEY,
+        sublayer_key: SUBLAYER_KEY,
+    }
+}
+
+pub fn apply_metadata(receipt: MutationReceipt) -> Result<MutationReceipt, WfpError> {
+    let MutationReceipt::WfpMetadata {
+        provider_key,
+        sublayer_key,
+    } = &receipt
+    else {
+        return Err(WfpError::ReceiptKind);
+    };
+    let engine = WfpEngine::open()?;
+    let transaction = WfpTransaction::begin(&engine)?;
+    add_provider(&engine, *provider_key)?;
+    add_sublayer(&engine, *provider_key, *sublayer_key)?;
+    transaction.commit()?;
+    Ok(receipt)
+}
+
+pub fn restore_metadata(receipt: &MutationReceipt) -> Result<(), WfpError> {
+    let MutationReceipt::WfpMetadata {
+        provider_key,
+        sublayer_key,
+    } = receipt
+    else {
+        return Err(WfpError::ReceiptKind);
+    };
+    remove_resources(*provider_key, *sublayer_key, std::iter::empty())
+}
 
 pub fn plan_kill_switch(
     plan: &ValidatedTunnelPlan,
@@ -145,7 +185,7 @@ pub fn restore_kill_switch(receipt: &MutationReceipt) -> Result<(), WfpError> {
 
 /// Read-only startup verification. Do not recreate missing persistent policy
 /// while presenting an old transaction as a live tunnel.
-pub fn kill_switch_present(receipt: &MutationReceipt) -> Result<bool, WfpError> {
+pub fn policy_present(receipt: &MutationReceipt, persistent: bool) -> Result<bool, WfpError> {
     let MutationReceipt::KillSwitch {
         provider_key,
         sublayer_key,
@@ -171,19 +211,25 @@ pub fn kill_switch_present(receipt: &MutationReceipt) -> Result<bool, WfpError> 
         let Some(filter) = filter else {
             return Ok(false);
         };
-        if !filter.matches(*provider_key, *sublayer_key) {
+        if !filter.matches(*provider_key, *sublayer_key, persistent) {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// Removes every resource that a current Usque build can create without
-/// consulting the journal. This is intentionally bounded and targets only
-/// stable Usque GUIDs; it is safe to run before MSI recovery and when journal
-/// validation fails.
+/// Removes the ordinary-operation namespace without consulting its journal.
+/// Journal validation failure must not implicitly remove independent retained
+/// replacement protection.
 pub fn emergency_remove_kill_switch() -> Result<(), WfpError> {
     remove_resources(PROVIDER_KEY, SUBLAYER_KEY, (0..MAX_FILTERS).map(filter_key))
+}
+
+/// Only explicit administrative recovery removes both protection namespaces.
+pub fn emergency_remove_all_protection() -> Result<(), WfpError> {
+    let normal = emergency_remove_kill_switch();
+    let replacement = replacement::remove_replacement_resources();
+    normal.and(replacement)
 }
 
 fn filter_key(index: usize) -> Uuid {
@@ -275,7 +321,7 @@ fn build_rules(
     }
     let exclusions = effective_exclusions(plan)?;
     let mut rules = Vec::new();
-    if plan.assigned_ipv4.is_some() {
+    if plan.assigned_ipv4.is_some() || plan.vpn_chain {
         add_family_rules(
             &mut rules,
             AddressFamily::V4,
@@ -284,7 +330,7 @@ fn build_rules(
             &exclusions,
         );
     }
-    if plan.assigned_ipv6.is_some() {
+    if plan.assigned_ipv6.is_some() || plan.vpn_chain {
         add_family_rules(
             &mut rules,
             AddressFamily::V6,
@@ -306,6 +352,9 @@ fn bootstrap_endpoints(
 ) -> impl Iterator<Item = (SocketAddr, u8, &'static str)> + '_ {
     plan.endpoint_candidates
         .iter()
+        // Automatic data endpoints are authorized only by their exact,
+        // generation-scoped dynamic lease, including observation seed hosts.
+        .filter(|_| plan.automatic_endpoint_policy.is_none())
         .flat_map(|endpoint| {
             [
                 (*endpoint, IPPROTO_UDP as u8, "Engine H3 endpoint"),
@@ -320,6 +369,9 @@ fn bootstrap_endpoints(
             )
         }))
         .filter(|(endpoint, _, _)| {
+            if plan.vpn_chain {
+                return true;
+            }
             if endpoint.is_ipv4() {
                 plan.assigned_ipv4.is_some()
             } else {
@@ -378,6 +430,17 @@ fn add_family_rules(
         ));
     }
 
+    add_link_control_rules(rules, family);
+    rules.push(FilterRule {
+        name: format!("Block all {family:?} physical traffic"),
+        family,
+        action: RuleAction::Block,
+        weight: BLOCK_WEIGHT,
+        conditions: Vec::new(),
+    });
+}
+
+fn add_link_control_rules(rules: &mut Vec<FilterRule>, family: AddressFamily) {
     match family {
         AddressFamily::V4 => rules.push(permit(
             family,
@@ -412,13 +475,6 @@ fn add_family_rules(
             }
         }
     }
-    rules.push(FilterRule {
-        name: format!("Block all {family:?} physical traffic"),
-        family,
-        action: RuleAction::Block,
-        weight: BLOCK_WEIGHT,
-        conditions: Vec::new(),
-    });
 }
 
 fn permit(family: AddressFamily, name: &str, conditions: Vec<ConditionSpec>) -> FilterRule {
@@ -564,7 +620,71 @@ fn add_filter(
 /// the filter even when the Engine pipe disappears or the Agent is terminated.
 pub struct DynamicPermit {
     engine: WfpEngine,
-    filter_key: Uuid,
+    filter_keys: Vec<Uuid>,
+}
+
+/// A connection-scoped blocking policy when persistent Kill Switch is off.
+/// Dropping the owning Agent session removes the filters. The journal owns
+/// provider/sublayer cleanup, including recovery after an Agent process exit.
+pub struct SessionGuard {
+    _engine: WfpEngine,
+}
+// SAFETY: The handle is exclusively owned and has no shared mutation API.
+unsafe impl Send for SessionGuard {}
+// SAFETY: Shared access cannot touch the handle; Drop requires exclusivity.
+unsafe impl Sync for SessionGuard {}
+
+pub fn apply_session_guard(
+    mut receipt: MutationReceipt,
+    plan: &ValidatedTunnelPlan,
+    interface_luid: u64,
+    engine_path: &Path,
+) -> Result<(MutationReceipt, SessionGuard), WfpError> {
+    if !plan.vpn_chain || plan.kill_switch || !engine_path.is_absolute() {
+        return Err(WfpError::EnginePath);
+    }
+    let MutationReceipt::KillSwitch {
+        provider_key,
+        sublayer_key,
+        filter_keys,
+        filter_ids,
+    } = &mut receipt
+    else {
+        return Err(WfpError::ReceiptKind);
+    };
+    let rules = build_rules(plan, interface_luid)?;
+    if rules.len() != filter_keys.len() {
+        return Err(WfpError::FilterKeyCount {
+            expected: rules.len(),
+            actual: filter_keys.len(),
+        });
+    }
+    // Persistent metadata permits exact dynamic direct-egress leases to share
+    // this sublayer. Only the filters are removed on dynamic-session close.
+    let metadata = WfpEngine::open()?;
+    let transaction = WfpTransaction::begin(&metadata)?;
+    add_provider(&metadata, *provider_key)?;
+    add_sublayer(&metadata, *provider_key, *sublayer_key)?;
+    transaction.commit()?;
+    let engine = WfpEngine::open_dynamic()?;
+    let app_id = ApplicationId::from_path(engine_path)?;
+    let transaction = WfpTransaction::begin(&engine)?;
+    let mut ids = Vec::with_capacity(rules.len());
+    for (index, (rule, key)) in rules.iter().zip(filter_keys.iter()).enumerate() {
+        ids.push(add_filter(
+            &engine,
+            *provider_key,
+            *sublayer_key,
+            *key,
+            index,
+            rule,
+            app_id.as_ptr(),
+            0,
+        )?);
+    }
+    transaction.commit()?;
+    *filter_ids = ids;
+    Ok((receipt, SessionGuard { _engine: engine }))
 }
 
 // SAFETY: the session handle is owned exclusively by this value and no method
@@ -578,10 +698,12 @@ impl Drop for DynamicPermit {
     fn drop(&mut self) {
         // Best-effort eager cleanup. Dynamic-session close below is the
         // authoritative crash-safe cleanup path.
-        // SAFETY: the engine session remains open for this synchronous call,
-        // and the temporary GUID is valid for the duration of the call.
-        unsafe {
-            FwpmFilterDeleteByKey0(self.engine.0, &guid_from_uuid(self.filter_key));
+        for key in &self.filter_keys {
+            // SAFETY: each key belongs to this live dynamic session; a
+            // replacement mirror may already have been removed at handoff.
+            unsafe {
+                FwpmFilterDeleteByKey0(self.engine.0, &guid_from_uuid(*key));
+            }
         }
     }
 }
@@ -612,7 +734,10 @@ pub fn acquire_dynamic_permit(
         application_id.as_ptr(),
         0,
     )?;
-    Ok(DynamicPermit { engine, filter_key })
+    Ok(DynamicPermit {
+        engine,
+        filter_keys: vec![filter_key],
+    })
 }
 
 fn dynamic_direct_rule(
@@ -929,7 +1054,7 @@ impl WfpFilterAllocation {
         NonNull::new(filter).map(Self)
     }
 
-    fn matches(&self, provider_key: Uuid, sublayer_key: Uuid) -> bool {
+    fn matches(&self, provider_key: Uuid, sublayer_key: Uuid, persistent: bool) -> bool {
         // SAFETY: this guard is constructed only from the non-null allocation
         // returned by FwpmFilterGetByKey0 and keeps it alive for this borrow.
         let filter = unsafe { self.0.as_ref() };
@@ -939,7 +1064,7 @@ impl WfpFilterAllocation {
         // SAFETY: providerKey is owned by the live filter allocation and is
         // valid until this guard calls the matching FwpmFreeMemory0.
         let actual_provider_key = unsafe { *actual_provider_key.as_ref() };
-        filter.flags & FWPM_FILTER_FLAG_PERSISTENT != 0
+        (filter.flags & FWPM_FILTER_FLAG_PERSISTENT != 0) == persistent
             && uuid_from_guid(filter.subLayerKey) == sublayer_key
             && uuid_from_guid(actual_provider_key) == provider_key
     }
@@ -1060,6 +1185,14 @@ pub enum WfpError {
     UnsafeDynamicTarget,
     #[error("invalid built-in network prefix: {0}")]
     StaticNetwork(&'static str),
+    #[error("replacement guard plan or resource identity is invalid")]
+    ReplacementGuard,
+    #[error("replacement guard has too many filters or control permits")]
+    ReplacementCapacity,
+    #[error("replacement guard is not installed for both address families")]
+    ReplacementNotPresent,
+    #[error("WFP returned an invalid filter enumeration")]
+    FilterEnumeration,
 }
 
 #[cfg(test)]
@@ -1071,12 +1204,15 @@ mod tests {
 
     use super::*;
 
-    fn plan(endpoint: IpAddr, allow_lan: bool) -> ValidatedTunnelPlan {
+    pub(super) fn plan(endpoint: IpAddr, allow_lan: bool) -> ValidatedTunnelPlan {
         let endpoint = match endpoint {
             IpAddr::V4(address) => (address, 443).into(),
             IpAddr::V6(address) => SocketAddrV6::new(address, 443, 0, 0).into(),
         };
         ValidatedTunnelPlan {
+            vpn_chain: false,
+            defer_network_configuration: false,
+            automatic_endpoint_policy: None,
             profile_id: Uuid::new_v4(),
             endpoint,
             endpoint_candidates: vec![endpoint],
@@ -1226,6 +1362,51 @@ mod tests {
         );
         assert!(dynamic_direct_rule(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 17, 42).is_err());
         assert!(dynamic_direct_rule(remote, 1, 42).is_err());
+    }
+
+    #[test]
+    fn automatic_data_permits_are_volatile_and_metadata_cleanup_keys_match() {
+        let endpoint: SocketAddr = "162.159.199.2:443".parse().unwrap();
+        let mut plan = plan(endpoint.ip(), false);
+        plan.automatic_endpoint_policy = Some(usque_core::AutomaticEndpointPolicy {
+            pool: usque_core::EndpointPool::WarpPlus,
+            port: 443,
+            ipv4: true,
+            ipv6: true,
+            tcp: true,
+            udp: true,
+        });
+        assert!(!is_bootstrap_endpoint(&plan, endpoint, IPPROTO_TCP as u8));
+        assert!(!is_bootstrap_endpoint(&plan, endpoint, IPPROTO_UDP as u8));
+        for control in &plan.control_api_candidates {
+            assert!(is_bootstrap_endpoint(&plan, *control, IPPROTO_TCP as u8));
+        }
+        let rules = build_rules(&plan, 42).unwrap();
+        assert!(rules.len() <= MAX_FILTERS);
+        assert!(rules.iter().all(|rule| {
+            !rule
+                .conditions
+                .contains(&ConditionSpec::RemoteNetwork(host_network(endpoint.ip())))
+        }));
+        let MutationReceipt::WfpMetadata {
+            provider_key,
+            sublayer_key,
+        } = plan_metadata()
+        else {
+            panic!("metadata receipt");
+        };
+        let MutationReceipt::KillSwitch {
+            provider_key: filter_provider,
+            sublayer_key: filter_sublayer,
+            ..
+        } = plan_kill_switch(&plan, 42).unwrap()
+        else {
+            panic!("filter receipt");
+        };
+        assert_eq!(
+            (provider_key, sublayer_key),
+            (filter_provider, filter_sublayer)
+        );
     }
 
     #[test]

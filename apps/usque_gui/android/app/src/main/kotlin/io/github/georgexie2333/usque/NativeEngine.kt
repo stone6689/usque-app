@@ -3,6 +3,8 @@ package io.github.georgexie2333.usque
 import java.io.File
 
 internal object NativeEngine {
+    private external fun nativeInitializeChainCrypto(codec: ChainProfileCipher): Boolean
+
     fun networkSettings(
         path: String,
         request: String,
@@ -16,7 +18,7 @@ internal object NativeEngine {
     private val libraryLoaded: Boolean =
         try {
             System.loadLibrary("usque_android")
-            true
+            nativeInitializeChainCrypto(ChainProfileCipher)
         } catch (_: UnsatisfiedLinkError) {
             false
         }
@@ -165,6 +167,20 @@ internal object NativeEngine {
         return nativeSnapshot()
     }
 
+    fun vpnGate(
+        configPath: String,
+        request: String,
+        secret: ByteArray,
+        service: UsqueVpnService,
+    ): String? = if (libraryLoaded) nativeVpnGate(configPath, request, secret, service) else null
+
+    private external fun nativeVpnGate(
+        configPath: String,
+        request: String,
+        secret: ByteArray,
+        service: UsqueVpnService,
+    ): String?
+
     fun registerConsumerWarp(locale: String): ByteArray? {
         if (!libraryLoaded) return null
         return nativeRegisterConsumerWarp(locale)
@@ -205,22 +221,31 @@ internal object NativeEngine {
         return nativeApplyProfileCommand(configPath, requestJson)
     }
 
-    fun reconfigure(profileJson: String): Int {
+    fun reconfigure(
+        profileJson: String,
+        proxyPassword: ByteArray,
+    ): Int {
         if (!libraryLoaded) return ERROR_NOT_LINKED
-        return nativeReconfigure(profileJson)
+        return nativeReconfigure(profileJson, proxyPassword)
     }
 
     fun attachTun(
         tunFileDescriptor: Int,
         profileJson: String,
+        proxyPassword: ByteArray,
     ): Int {
         if (!libraryLoaded) return ERROR_NOT_LINKED
-        return nativeAttachTun(tunFileDescriptor, profileJson)
+        return nativeAttachTun(tunFileDescriptor, profileJson, proxyPassword)
     }
 
     fun detachTun(): Int {
         if (!libraryLoaded) return ERROR_NOT_LINKED
         return nativeDetachTun()
+    }
+
+    fun rejectFinalNetwork(): Int {
+        if (!libraryLoaded) return ERROR_NOT_LINKED
+        return nativeRejectFinalNetwork()
     }
 
     private external fun nativeIsReady(): Boolean
@@ -278,14 +303,20 @@ internal object NativeEngine {
         requestJson: String,
     ): String?
 
-    private external fun nativeReconfigure(profileJson: String): Int
+    private external fun nativeReconfigure(
+        profileJson: String,
+        proxyPassword: ByteArray,
+    ): Int
 
     private external fun nativeAttachTun(
         tunFileDescriptor: Int,
         profileJson: String,
+        proxyPassword: ByteArray,
     ): Int
 
     private external fun nativeDetachTun(): Int
+
+    private external fun nativeRejectFinalNetwork(): Int
 
     const val OK = 0
     const val RECONFIGURE_NEED_COLD = 1
